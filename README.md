@@ -4,8 +4,16 @@
 named profiles. Each profile points Claude Code at a provider + model setup via
 environment variables — no changes to Claude Code itself.
 
-Switch between Anthropic and third-party providers (MiniMax, GLM, DeepSeek, Kimi, or your
-own custom endpoint) without ever mixing credentials or history.
+Switch between Anthropic-compatible providers (MiniMax, GLM, DeepSeek, Kimi, custom) and
+OpenAI-compatible backends (OpenAI, OpenRouter, Ollama, vLLM, LM Studio, Sakana) — the
+latter through a small Rust translator `ccx` builds for you — without ever mixing
+credentials or history.
+
+![ccx running Claude Code under four profiles at once, each answering "which model are you using?" with a different model](images/ccx.png)
+
+*One question, four providers: `ccx claude` (Opus 4.8), `ccx openrouter` (Qwen3-Coder),
+`ccx fugu` (Sakana Fugu), and `ccx glm` (GLM-5.2) — the same Claude Code, a different model
+behind each.*
 
 ## Features
 
