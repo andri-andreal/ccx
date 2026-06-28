@@ -1,0 +1,26 @@
+[package]
+name = "ccx-router"
+version = "0.1.0"
+edition = "2021"
+description = "Local Anthropic Messages API -> OpenAI Chat Completions translator for ccx"
+license = "MIT"
+
+[lib]
+name = "ccx_router"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ccx-router"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures = "0.3"
+bytes = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

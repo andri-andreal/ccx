@@ -1,0 +1,23 @@
+---
+import { REPO_URL } from '../consts';
+---
+<header class="sticky top-0 z-30 border-b border-border/70 bg-base/85 backdrop-blur">
+  <nav class="mx-auto flex max-w-4xl items-center justify-between px-5 py-3">
+    <a href="/" class="flex items-center gap-1.5 font-mono text-lg font-bold tracking-tight">
+      <span class="t-prompt">$</span><span>ccx</span><span class="cursor">&nbsp;</span>
+    </a>
+    <div class="flex items-center gap-5 font-mono text-sm text-muted">
+      <a href="/#features" class="hover:text-fg">features</a>
+      <a href="/#providers" class="hidden hover:text-fg sm:inline">providers</a>
+      <a href="/docs/installation/" class="hover:text-fg">docs</a>
+      <a
+        href={REPO_URL}
+        target="_blank"
+        rel="noreferrer"
+        class="rounded-md border border-border bg-surface px-3 py-1.5 font-medium text-fg hover:border-accent/60"
+      >
+        ★ github
+      </a>
+    </div>
+  </nav>
+</header>

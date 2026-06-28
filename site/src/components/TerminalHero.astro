@@ -1,0 +1,127 @@
+---
+import { REPO_URL } from '../consts';
+---
+<section class="mx-auto max-w-3xl px-5 pb-10 pt-16 sm:pt-20">
+  <div class="mb-7 text-center">
+    <span class="inline-flex items-center gap-2 rounded-full border border-border bg-surface px-3 py-1 font-mono text-xs text-muted">
+      <span class="t-prompt">●</span> one terminal, every Claude provider
+    </span>
+    <h1 class="mx-auto mt-5 max-w-2xl text-3xl font-extrabold tracking-tight sm:text-[2.6rem] sm:leading-[1.1]">
+      Switch <span class="t-prompt">Claude Code</span> between providers
+      <span class="t-blue">without leaving the shell</span>.
+    </h1>
+  </div>
+
+  <!-- Terminal window -->
+  <div class="term">
+    <div class="term__bar">
+      <span class="term__dot"></span>
+      <span class="term__dot"></span>
+      <span class="term__dot"></span>
+      <span class="term__title">ccx — ~/projects</span>
+    </div>
+    <div class="term__body">
+      <!-- Static transcript (no-JS / reduced-motion). Replaced by the animation when allowed. -->
+      <pre id="term-static" class="whitespace-pre-wrap break-words"><span class="t-prompt">$</span> ccx new
+<span class="t-amber">Profile name:</span> m3
+<span class="t-amber">Provider [claude/minimax/glm/deepseek/kimi/custom]:</span> minimax
+<span class="t-amber">Model [MiniMax-M3]:</span> <span class="t-muted">↵</span>
+<span class="t-amber">API token (input hidden):</span> <span class="t-muted">••••••••</span>
+<span class="t-ok">✓</span> created profile <span class="t-blue">'m3'</span>
+<span class="t-prompt">$</span> ccx m3
+<span class="t-muted">◇</span> Claude Code → <span class="t-blue">api.minimax.io</span>  ·  isolated config
+<span class="t-ok">✓</span> ready — Opus plans · Sonnet executes
+<span class="t-prompt">$</span> <span class="cursor">&nbsp;</span></pre>
+
+      <pre id="term-anim" class="hidden whitespace-pre-wrap break-words" aria-hidden="true"></pre>
+    </div>
+  </div>
+
+  <div class="mt-7 flex items-center justify-center gap-3">
+    <a
+      href="/docs/installation/"
+      class="rounded-lg bg-accent px-5 py-2.5 font-semibold text-[#06231f] transition hover:brightness-110"
+    >
+      Get started
+    </a>
+    <a
+      href={REPO_URL}
+      target="_blank"
+      rel="noreferrer"
+      class="rounded-lg border border-border bg-surface px-5 py-2.5 font-semibold text-fg transition hover:border-accent/60"
+    >
+      ★ GitHub
+    </a>
+  </div>
+</section>
+
+<script>
+  type Step =
+    | { kind: 'cmd'; text: string }
+    | { kind: 'input'; label: string; value: string }
+    | { kind: 'out'; html: string };
+
+  const steps: Step[] = [
+    { kind: 'cmd', text: 'ccx new' },
+    { kind: 'input', label: 'Profile name: ', value: 'm3' },
+    { kind: 'input', label: 'Provider [claude/minimax/glm/deepseek/kimi/custom]: ', value: 'minimax' },
+    { kind: 'input', label: 'Model [MiniMax-M3]: ', value: '↵' },
+    { kind: 'input', label: 'API token (input hidden): ', value: '••••••••' },
+    { kind: 'out', html: `<span class="t-ok">✓</span> created profile <span class="t-blue">'m3'</span>` },
+    { kind: 'cmd', text: 'ccx m3' },
+    { kind: 'out', html: `<span class="t-muted">◇</span> Claude Code → <span class="t-blue">api.minimax.io</span>  ·  isolated config` },
+    { kind: 'out', html: `<span class="t-ok">✓</span> ready — Opus plans · Sonnet executes` },
+  ];
+
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const stat = document.getElementById('term-static');
+  const anim = document.getElementById('term-anim');
+
+  if (!reduce && stat && anim) {
+    stat.classList.add('hidden');
+    anim.classList.remove('hidden');
+
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+    const cursor = '<span class="cursor">&nbsp;</span>';
+    let html = '';
+    const render = (tail = '') => (anim.innerHTML = html + tail + cursor);
+
+    const type = async (text: string, cls = '', speed = 38) => {
+      let buf = '';
+      for (const ch of text) {
+        buf += ch;
+        const open = cls ? `<span class="${cls}">` : '';
+        const close = cls ? '</span>' : '';
+        render(open + buf + close);
+        await sleep(speed + Math.random() * 30);
+      }
+      html += (cls ? `<span class="${cls}">${text}</span>` : text);
+    };
+
+    (async () => {
+      await sleep(400);
+      for (const step of steps) {
+        if (step.kind === 'cmd') {
+          html += '<span class="t-prompt">$</span> ';
+          render();
+          await sleep(160);
+          await type(step.text);
+          html += '\n';
+        } else if (step.kind === 'input') {
+          html += `<span class="t-amber">${step.label.trimEnd()}</span> `;
+          render();
+          await sleep(260);
+          await type(step.value, 'text-fg', 55);
+          html += '\n';
+        } else {
+          await sleep(220);
+          html += step.html + '\n';
+        }
+        render();
+        await sleep(280);
+      }
+      html += '<span class="t-prompt">$</span> ';
+      render();
+    })();
+  }
+</script>

@@ -1,0 +1,44 @@
+---
+import Terminal from './Terminal.astro';
+
+const rows = [
+  { name: 'claude', provider: 'anthropic', endpoint: '(your login)', model: 'opusplan' },
+  { name: 'minimax', provider: 'minimax', endpoint: 'api.minimax.io/anthropic', model: 'MiniMax-M3' },
+  { name: 'glm', provider: 'glm', endpoint: 'api.z.ai/api/anthropic', model: 'GLM-4.6' },
+  { name: 'deepseek', provider: 'deepseek', endpoint: 'api.deepseek.com/anthropic', model: 'deepseek-chat' },
+  { name: 'kimi', provider: 'kimi', endpoint: 'api.moonshot.ai/anthropic', model: 'kimi-k2' },
+  { name: 'custom', provider: 'custom', endpoint: 'any /v1/messages', model: '— your choice —' },
+  { name: 'local', provider: 'ollama', endpoint: 'localhost:11434/v1 ✦', model: 'qwen2.5-coder' },
+  { name: 'orr', provider: 'openrouter', endpoint: 'openrouter.ai/api/v1 ✦', model: 'qwen3-coder' },
+];
+const pad = (s: string, n: number) => s.padEnd(n);
+
+const header = `<span class="t-muted">${pad('NAME', 10)}${pad('PROVIDER', 11)}${pad('ENDPOINT', 30)}MODEL</span>`;
+const body = rows
+  .map(
+    (r) =>
+      `<span class="t-prompt">${pad(r.name, 10)}</span>` +
+      `<span class="text-fg">${pad(r.provider, 11)}</span>` +
+      `<span class="t-blue">${pad(r.endpoint, 30)}</span>` +
+      `<span class="t-amber">${r.model}</span>`,
+  )
+  .join('\n');
+const listing = `${header}\n${body}`;
+---
+<section id="providers" class="mx-auto max-w-4xl px-5 py-16">
+  <h2 class="font-mono text-sm text-muted">
+    <span class="t-prompt">$</span> ccx list
+  </h2>
+  <p class="mt-2 max-w-2xl text-sm text-muted">
+    Any provider with an <span class="t-accent font-mono">Anthropic-compatible</span> endpoint works
+    directly. <span class="t-accent font-mono">OpenAI-compatible</span> backends — OpenAI, OpenRouter,
+    and local models (Ollama, vLLM, LM Studio) — work too, via a local router <code>ccx</code> manages
+    for you. See <a href="/docs/providers/" class="text-accent hover:text-blue">providers</a>.
+  </p>
+
+  <div class="mt-6">
+    <Terminal title="ccx list">
+      <pre class="overflow-x-auto text-[0.82rem] leading-relaxed" set:html={listing}></pre>
+    </Terminal>
+  </div>
+</section>

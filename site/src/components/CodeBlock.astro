@@ -1,0 +1,37 @@
+---
+interface Props {
+  code: string;
+  /** Optional caption shown above the block. */
+  label?: string;
+}
+const { code, label } = Astro.props;
+---
+<div class="relative">
+  {label && <div class="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted">{label}</div>}
+  <div class="group relative overflow-hidden rounded-xl border border-border bg-surface">
+    <button
+      class="copy-btn absolute right-2 top-2 rounded-md border border-border bg-surface-2 px-2 py-1 text-xs text-muted opacity-0 transition hover:text-fg group-hover:opacity-100"
+      data-code={code}
+      aria-label="Copy to clipboard"
+      type="button"
+    >
+      Copy
+    </button>
+    <pre class="overflow-x-auto p-4 font-mono text-sm leading-relaxed"><code>{code}</code></pre>
+  </div>
+</div>
+
+<script>
+  // Event delegation: works for every CodeBlock on the page.
+  document.addEventListener('click', (e) => {
+    const target = e.target as HTMLElement;
+    const btn = target.closest<HTMLButtonElement>('.copy-btn');
+    if (!btn) return;
+    const code = btn.dataset.code ?? '';
+    navigator.clipboard.writeText(code).then(() => {
+      const prev = btn.textContent;
+      btn.textContent = 'Copied';
+      setTimeout(() => (btn.textContent = prev), 1200);
+    });
+  });
+</script>

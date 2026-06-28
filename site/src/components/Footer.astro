@@ -1,0 +1,15 @@
+---
+import { REPO_URL } from '../consts';
+---
+<footer class="mt-20 border-t border-border/70">
+  <div class="mx-auto flex max-w-4xl flex-col items-center justify-between gap-3 px-5 py-8 font-mono text-sm text-muted sm:flex-row">
+    <p>
+      <span class="t-prompt">$</span> ccx — <span class="t-amber">MIT</span> licensed
+    </p>
+    <div class="flex items-center gap-5">
+      <a href="/docs/installation/" class="hover:text-fg">docs</a>
+      <a href={REPO_URL} target="_blank" rel="noreferrer" class="hover:text-fg">github</a>
+      <a href={`${REPO_URL}/blob/main/LICENSE`} target="_blank" rel="noreferrer" class="hover:text-fg">license</a>
+    </div>
+  </div>
+</footer>

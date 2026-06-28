@@ -1,0 +1,12 @@
+---
+import Docs from '../../layouts/Docs.astro';
+import { DOCS_NAV } from '../../consts';
+---
+<Docs frontmatter={{ title: 'Documentation' }}>
+  <p>Everything you need to run Claude Code under named provider profiles.</p>
+  <ul>
+    {DOCS_NAV.map((i) => (
+      <li><a href={i.href}>{i.label}</a></li>
+    ))}
+  </ul>
+</Docs>

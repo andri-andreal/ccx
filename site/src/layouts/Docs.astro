@@ -1,0 +1,46 @@
+---
+import Base from './Base.astro';
+import { DOCS_NAV } from '../consts';
+
+interface Props {
+  frontmatter: { title: string; description?: string };
+}
+const { frontmatter } = Astro.props;
+const current = Astro.url.pathname;
+---
+<Base title={`${frontmatter.title} — ccx docs`} description={frontmatter.description}>
+  <div class="mx-auto grid max-w-4xl gap-10 px-5 py-12 md:grid-cols-[15rem_1fr]">
+    <aside class="md:sticky md:top-20 md:self-start">
+      <div class="rounded-xl border border-border bg-surface p-3 font-mono text-sm">
+        <div class="px-2 pb-2 text-xs text-muted">
+          <span class="t-prompt">~</span>/ccx/docs
+        </div>
+        <nav class="flex flex-col">
+          {
+            DOCS_NAV.map((item) => {
+              const active = current === item.href;
+              return (
+                <a
+                  href={item.href}
+                  class={`rounded-md px-2 py-1.5 ${
+                    active
+                      ? 'bg-surface-2 text-accent'
+                      : 'text-muted hover:bg-surface-2 hover:text-fg'
+                  }`}
+                >
+                  <span class={active ? 't-prompt' : 'text-border'}>{active ? '▸' : '·'}</span>
+                  {' '}{item.label}
+                </a>
+              );
+            })
+          }
+        </nav>
+      </div>
+    </aside>
+
+    <article class="prose min-w-0 max-w-none">
+      <h1>{frontmatter.title}</h1>
+      <slot />
+    </article>
+  </div>
+</Base>

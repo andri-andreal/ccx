@@ -1,0 +1,18 @@
+---
+interface Props {
+  title?: string;
+  class?: string;
+}
+const { title = 'ccx', class: cls = '' } = Astro.props;
+---
+<div class={`term ${cls}`}>
+  <div class="term__bar">
+    <span class="term__dot"></span>
+    <span class="term__dot"></span>
+    <span class="term__dot"></span>
+    <span class="term__title">{title}</span>
+  </div>
+  <div class="term__body">
+    <slot />
+  </div>
+</div>

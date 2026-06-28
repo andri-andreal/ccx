@@ -1,0 +1,9 @@
+services:
+  site:
+    build: .
+    image: ccx-site
+    container_name: ccx-site
+    ports:
+      # host 8473 -> container 80 (8473 is uncommon to avoid clashes)
+      - "8473:80"
+    restart: unless-stopped

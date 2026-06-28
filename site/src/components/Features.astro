@@ -1,0 +1,27 @@
+---
+import { FEATURES } from '../consts';
+
+const fmt = (s: string) =>
+  s.replace(/`([^`]+)`/g, '<code class="t-accent">$1</code>');
+---
+<section id="features" class="mx-auto max-w-4xl px-5 py-16">
+  <h2 class="font-mono text-sm text-muted">
+    <span class="t-prompt">$</span> ccx --features
+  </h2>
+  <div class="mt-6 grid gap-px overflow-hidden rounded-xl border border-border bg-border sm:grid-cols-2">
+    {
+      FEATURES.map((f) => (
+        <div class="bg-surface p-5 transition hover:bg-surface-2">
+          <div class="font-mono text-sm">
+            <span class="t-ok">✓</span>{' '}
+            <span class="font-semibold text-fg">{f.title}</span>
+          </div>
+          <p
+            class="mt-2 pl-[1.4ch] font-mono text-[0.82rem] leading-relaxed text-muted"
+            set:html={fmt(f.body)}
+          />
+        </div>
+      ))
+    }
+  </div>
+</section>

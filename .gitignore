@@ -1,0 +1,20 @@
+# Rust / Cargo build output
+target/
+**/target/
+
+# Node
+node_modules/
+dist/
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local env / secrets
+*.env
+!providers/*.tmpl
+
+# Logs
+*.log
