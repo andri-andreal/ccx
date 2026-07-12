@@ -32,6 +32,399 @@ kv_get() { # file key -> value (first match)
   awk -F= -v k="$2" '$1==k{sub(/^[^=]*=/,""); print; exit}' "$1"
 }
 
+print_provider_names() { # list provider template names, user templates overriding bundled ones
+  local -a preferred=(claude minimax glm deepseek kimi openai openrouter ollama vllm lmstudio sakana custom-oai)
+  local seen="" n dir t base
+  for n in "${preferred[@]}"; do
+    if [ -n "$(template_file "$n")" ]; then
+      printf '%s\n' "$n"
+      seen="$seen $n "
+    fi
+  done
+  for dir in "$CCX_HOME/providers" "$SCRIPT_DIR/../providers"; do
+    [ -d "$dir" ] || continue
+    for t in "$dir"/*.tmpl; do
+      [ -e "$t" ] || continue
+      base="$(basename "$t" .tmpl)"
+      case " $seen " in *" $base "*) ;; *) printf '%s\n' "$base"; seen="$seen $base " ;; esac
+    done
+  done
+}
+
+tui_select() { # interactive arrow-key selector; sets tui_selected (0-based index)
+  # Usage: tui_select "header" "item1" "item2" ...
+  # Global: tui_subtitles[] — optional per-item description (parallel to args)
+  local header="$1"; shift
+  local -a items=("$@")
+  local count="${#items[@]}"
+  [ "$count" -gt 0 ] || { tui_selected=-1; return 1; }
+
+  local i cur=0
+
+  # --- layout precompute -------------------------------------------------
+  # Terminal width bounds the box; fall back to 80 columns when unknown.
+  local cols; cols="$(tput cols 2>/dev/null || printf '80')"
+  case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
+
+  # Classify rows: a '│' marks a non-selectable group header, everything else is
+  # a provider/model row with an optional dim subtitle. Names of subtitled rows
+  # share one column width so their subtitles line up.
+  local -a it_hdr=() it_name=() it_sub=()
+  local j name_w=0 body_w=0 bl
+  for ((j = 0; j < count; j++)); do
+    if [[ "${items[$j]}" == *│* ]]; then
+      it_hdr[$j]=1; it_name[$j]="${items[$j]#│ }"; it_sub[$j]=""
+    else
+      it_hdr[$j]=0; it_name[$j]="${items[$j]}"; it_sub[$j]="${tui_subtitles[$j]:-}"
+      [ -n "${it_sub[$j]}" ] && [ "${#it_name[$j]}" -gt "$name_w" ] && name_w="${#it_name[$j]}"
+    fi
+  done
+  for ((j = 0; j < count; j++)); do
+    if [ -n "${it_sub[$j]}" ]; then bl=$((name_w + 2 + ${#it_sub[$j]})); else bl="${#it_name[$j]}"; fi
+    [ "$bl" -gt "$body_w" ] && body_w="$bl"
+  done
+
+  local title="${header%:}"
+  local hint='↑↓ move · ⏎ select · q cancel'
+  # Interior width = 3-col marker gutter + widest body + 1-col right margin,
+  # widened if the title or hint embedded in the borders needs more room, then
+  # clamped to the terminal.
+  local inner=$((3 + body_w + 1))
+  [ $(( ${#title} + 4 )) -gt "$inner" ] && inner=$(( ${#title} + 4 ))
+  [ $(( ${#hint} + 4 ))  -gt "$inner" ] && inner=$(( ${#hint} + 4 ))
+  local max_inner=$((cols - 2))
+  [ "$max_inner" -ge 12 ] && [ "$inner" -gt "$max_inner" ] && inner="$max_inner"
+
+  # Dim borders/subtitles; reverse-cyan bar marks the selected row (adapts to any
+  # light/dark theme since it swaps the terminal's own colors).
+  local R=$'\033[0m' DIM=$'\033[2m' BRD=$'\033[2m' SEL=$'\033[7;36;1m'
+
+  tui_dashes() { local s; printf -v s '%*s' "$1" ''; printf '%s' "${s// /─}"; }
+
+  tui_line() { # $1 = item index — print one bordered interior line + CRLF
+    local nm="${it_name[$1]}" sb="${it_sub[$1]}" hdr="${it_hdr[$1]}"
+    local plain avail dlen pad sp
+    if [ "$hdr" = 1 ] || [ -z "$sb" ]; then plain="$nm"
+    else printf -v plain '%-*s  %s' "$name_w" "$nm" "$sb"; fi
+    avail=$((inner - 3))
+    if [ "${#plain}" -gt "$avail" ]; then plain="${plain:0:$((avail - 1))}…"; sb=""; fi
+    dlen="${#plain}"; pad=$((avail - dlen)); [ "$pad" -lt 0 ] && pad=0
+    printf -v sp '%*s' "$pad" ''
+    if [ "$1" -eq "$cur" ] && [ "$hdr" != 1 ]; then
+      printf '%s│%s%s ▸ %s%s%s%s│%s\r\n' "$BRD" "$R" "$SEL" "$plain" "$sp" "$R" "$BRD" "$R"
+    elif [ "$hdr" = 1 ]; then
+      printf '%s│%s   %s%s%s%s%s│%s\r\n' "$BRD" "$R" "$DIM" "$plain" "$R" "$sp" "$BRD" "$R"
+    elif [ -n "$sb" ]; then
+      printf '%s│%s   %-*s  %s%s%s%s%s│%s\r\n' "$BRD" "$R" "$name_w" "$nm" "$DIM" "$sb" "$R" "$sp" "$BRD" "$R"
+    else
+      printf '%s│%s   %s%s%s│%s\r\n' "$BRD" "$R" "$plain" "$sp" "$BRD" "$R"
+    fi
+  }
+
+  tui_pad_line() { printf '%s│%s%*s%s│%s\r\n' "$BRD" "$R" "$inner" '' "$BRD" "$R"; }
+
+  tui_draw() { # full box top-to-bottom; cursor ends on the blank line below it
+    printf '%s╭─ %s%s%s %s╮%s\r\n' "$BRD" "$R" "$title" "$BRD" "$(tui_dashes $((inner - 3 - ${#title})))" "$R"
+    tui_pad_line
+    for ((j = 0; j < count; j++)); do tui_line "$j"; done
+    tui_pad_line
+    printf '%s╰─ %s %s╯%s\r\n' "$BRD" "$hint" "$(tui_dashes $((inner - 3 - ${#hint})))" "$R"
+  }
+
+  tui_redraw() { # repaint only the item rows in place
+    printf '\r\033[%dA' "$((count + 2))"   # up to the first item row
+    for ((j = 0; j < count; j++)); do tui_line "$j"; done
+    printf '\033[2B\r'                       # back down to the blank line below the box
+  }
+
+  printf '\n'
+  tui_draw
+
+  if [ ! -t 0 ] || ! command -v stty >/dev/null 2>&1; then
+    printf '\n'
+    tui_selected=-1; return 1
+  fi
+
+  local saved_stty; saved_stty="$(stty -g)"
+  stty raw -echo isig min 0 time 1 2>/dev/null || { printf '\n'; tui_selected=-1; return 1; }
+  trap 'stty "$saved_stty" 2>/dev/null; trap - INT TERM' INT TERM
+
+  local key ok=0
+  while true; do
+    IFS= read -rsn1 key || { ok=-1; break; }
+    case "$key" in
+      $'\x1b')
+        local c1 c2; IFS= read -rsn1 -t 0.1 c1; IFS= read -rsn1 -t 0.1 c2
+        if [ "$c1$c2" = "[A" ]; then
+          local ni=$((cur - 1))
+          while [ "$ni" -ge 0 ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni - 1)); done
+          [ "$ni" -ge 0 ] && { cur=$ni; tui_redraw; }
+        elif [ "$c1$c2" = "[B" ]; then
+          local ni=$((cur + 1))
+          while [ "$ni" -lt "$count" ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni + 1)); done
+          [ "$ni" -lt "$count" ] && { cur=$ni; tui_redraw; }
+        fi
+        ;;
+      '') ok=1; break ;;
+      q|Q) ok=-1; break ;;
+    esac
+  done
+
+  stty "$saved_stty" 2>/dev/null
+  trap - INT TERM
+
+  # The cursor rests on the blank line just below the box; clear it so the next
+  # prompt starts cleanly there.
+  printf '\r\033[2K'
+
+  if [ "$ok" -eq 1 ]; then tui_selected="$cur"; return 0
+  else tui_selected=-1; return 1; fi
+}
+
+choose_provider() { # set caller's $provider from interactive menu or typed name
+  local -a providers=() t_items=() t_subs=() t_sel=()
+  local p tf router model i ans custom_idx
+  while IFS= read -r p; do providers+=("$p"); done < <(print_provider_names)
+
+  tui_subtitles=()
+  t_items+=("│ Anthropic-compatible")
+  t_subs+=("")
+  for p in "${providers[@]}"; do
+    tf="$(template_file "$p")"
+    router="$(kv_get "$tf" CCX_ROUTER)"
+    [ -z "$router" ] || continue
+    model="$(kv_get "$tf" ANTHROPIC_MODEL)"
+    t_items+=("$p")
+    t_subs+=("${model:+($model)}")
+  done
+  t_items+=("│ OpenAI-compatible (via ccx-router)")
+  t_subs+=("")
+  for p in "${providers[@]}"; do
+    tf="$(template_file "$p")"
+    router="$(kv_get "$tf" CCX_ROUTER)"
+    [ -n "$router" ] || continue
+    model="$(kv_get "$tf" ANTHROPIC_MODEL)"
+    t_items+=("$p")
+    t_subs+=("${model:+($model)}")
+  done
+  t_items+=("Custom / type manually")
+  t_subs+=("")
+  tui_subtitles=("${t_subs[@]}")
+
+  if [ -t 0 ] && tui_select "Choose provider:" "${t_items[@]}"; then
+    local chosen="${t_items[$tui_selected]}"
+    if [ "$chosen" = "Custom / type manually" ]; then
+      printf 'Provider name: '; read -r provider || true
+    else
+      provider="$chosen"
+    fi
+  else
+    # Fallback: numbered menu
+    local -a menu=()
+    printf 'Choose provider (or type a provider name):\n'
+    printf 'Anthropic-compatible:\n'
+    for p in "${providers[@]}"; do
+      tf="$(template_file "$p")"
+      router="$(kv_get "$tf" CCX_ROUTER)"
+      [ -z "$router" ] || continue
+      model="$(kv_get "$tf" ANTHROPIC_MODEL)"
+      menu+=("$p")
+      printf '  %2d) %-12s %s\n' "${#menu[@]}" "$p" "${model:+($model)}"
+    done
+    printf 'OpenAI-compatible (via ccx-router):\n'
+    for p in "${providers[@]}"; do
+      tf="$(template_file "$p")"
+      router="$(kv_get "$tf" CCX_ROUTER)"
+      [ -n "$router" ] || continue
+      model="$(kv_get "$tf" ANTHROPIC_MODEL)"
+      menu+=("$p")
+      printf '  %2d) %-12s %s\n' "${#menu[@]}" "$p" "${model:+($model)}"
+    done
+    custom_idx=$((${#menu[@]} + 1))
+    printf '  %2d) Custom / type manually\n' "$custom_idx"
+    printf 'Provider [1]: '
+    read -r ans || true
+    if [ -z "$ans" ]; then ans=1; fi
+    case "$ans" in
+      *[!0-9]*) provider="$ans" ;;
+      *)
+        if [ "$ans" -ge 1 ] && [ "$ans" -le "${#menu[@]}" ]; then
+          provider="${menu[$((ans - 1))]}"
+        elif [ "$ans" -eq "$custom_idx" ]; then
+          printf 'Provider name: '
+          read -r provider || true
+        else
+          die "invalid provider choice: $ans"
+        fi
+        ;;
+    esac
+  fi
+}
+
+fetch_models() { # url mode token — print model ids (one per line); nonzero on failure
+  local url="$1" mode="$2" tok="$3" body
+  command -v curl >/dev/null 2>&1 || return 1
+  local -a hdr=()
+  if [ "$mode" = "anthropic" ]; then
+    hdr=(-H 'anthropic-version: 2023-06-01')
+    [ -n "$tok" ] && hdr+=(-H "x-api-key: $tok")
+  else
+    [ -n "$tok" ] && hdr=(-H "Authorization: Bearer $tok")
+  fi
+  # -f fails on HTTP >=400 (e.g. 401 without a key) so we cleanly fall back.
+  body="$(curl -fsS --max-time 12 "${hdr[@]}" "$url" 2>/dev/null)" || return 1
+  [ -n "$body" ] || return 1
+  # Both OpenAI- and Anthropic-shaped responses list ids under .data[].id.
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$body" | jq -r '.data[]?.id // empty' 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$body" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+for m in (d.get("data") or []):
+    if isinstance(m,dict) and m.get("id"): print(m["id"])' 2>/dev/null
+  else
+    printf '%s' "$body" | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+      | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/'
+  fi
+}
+
+tui_filter_select() { # type-to-filter picker; sets tui_selected (0-based into args)
+  # Usage: tui_filter_select "header" item1 item2 ...
+  local header="${1%:}"; shift
+  local -a items=("$@")
+  local count="${#items[@]}"
+  [ "$count" -gt 0 ] || { tui_selected=-1; return 1; }
+  if [ ! -t 0 ] || ! command -v stty >/dev/null 2>&1; then tui_selected=-1; return 1; fi
+
+  # Lowercased copies for case-insensitive matching (bash ${x,,} — no subprocess).
+  local i
+  local -a lc=()
+  for ((i = 0; i < count; i++)); do lc[$i]="${items[$i],,}"; done
+
+  local cols; cols="$(tput cols 2>/dev/null || printf '80')"
+  case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
+
+  local vis=$count; [ "$vis" -gt 12 ] && vis=12   # fixed viewport height per call
+  local hint='↑↓ move · ⏎ select · type to filter · esc cancel'
+  local body_w=0
+  for ((i = 0; i < count; i++)); do [ "${#items[$i]}" -gt "$body_w" ] && body_w="${#items[$i]}"; done
+  local inner=$((3 + body_w + 1))
+  [ $(( ${#header} + 4 )) -gt "$inner" ] && inner=$(( ${#header} + 4 ))
+  [ $(( ${#hint} + 4 ))   -gt "$inner" ] && inner=$(( ${#hint} + 4 ))
+  local max_inner=$((cols - 2))
+  [ "$max_inner" -ge 20 ] && [ "$inner" -gt "$max_inner" ] && inner="$max_inner"
+
+  local R=$'\033[0m' DIM=$'\033[2m' BRD=$'\033[2m' SEL=$'\033[7;36;1m' CY=$'\033[36m' CUR=$'\033[7m \033[0m'
+  local H=$((vis + 4))   # lines fs_draw emits: top + query + vis rows + count + bottom
+  local query="" cur=0 top=0
+  local -a filt=()
+
+  fs_filter() {   # rebuild filt[] from query; reset cursor/scroll
+    filt=(); local k lq="${query,,}"
+    for ((k = 0; k < count; k++)); do
+      if [ -z "$lq" ]; then filt+=("$k"); else case "${lc[$k]}" in *"$lq"*) filt+=("$k") ;; esac; fi
+    done
+    cur=0; top=0
+  }
+  fs_pad()  { local s; printf -v s '%*s' "$1" ''; printf '%s' "$s"; }
+  fs_dash() { local s; printf -v s '%*s' "$1" ''; printf '%s' "${s// /─}"; }
+
+  fs_row() {   # $1 = filtered position; print one bordered row + CRLF
+    local fp="$1" idx txt avail pad sp
+    if [ "$fp" -ge "${#filt[@]}" ]; then printf '%s│%s%*s%s│%s\r\n' "$BRD" "$R" "$inner" '' "$BRD" "$R"; return; fi
+    idx="${filt[$fp]}"; txt="${items[$idx]}"; avail=$((inner - 3))
+    if [ "${#txt}" -gt "$avail" ]; then txt="${txt:0:$((avail - 1))}…"; fi
+    pad=$((avail - ${#txt})); [ "$pad" -lt 0 ] && pad=0
+    printf -v sp '%*s' "$pad" ''
+    if [ "$fp" -eq "$cur" ]; then
+      printf '%s│%s%s ▸ %s%s%s%s│%s\r\n' "$BRD" "$R" "$SEL" "$txt" "$sp" "$R" "$BRD" "$R"
+    else
+      printf '%s│%s   %s%s%s│%s\r\n' "$BRD" "$R" "$txt" "$sp" "$BRD" "$R"
+    fi
+  }
+
+  fs_draw() {
+    printf '%s╭─ %s%s%s %s╮%s\r\n' "$BRD" "$R" "$header" "$BRD" "$(fs_dash $((inner - 3 - ${#header})))" "$R"
+    local qavail=$((inner - 4)) qshow="$query"
+    [ "${#qshow}" -gt "$qavail" ] && qshow="…${qshow: -$((qavail - 1))}"
+    printf '%s│%s %s›%s %s%s%s%s│%s\r\n' "$BRD" "$R" "$CY" "$R" "$qshow" "$CUR" "$(fs_pad $((inner - 4 - ${#qshow})))" "$BRD" "$R"
+    local v; for ((v = 0; v < vis; v++)); do fs_row $((top + v)); done
+    local info
+    if [ "${#filt[@]}" -eq 0 ]; then info="no match"
+    elif [ "${#filt[@]}" -eq "$count" ]; then info="$((cur + 1))/$count"
+    else info="$((cur + 1))/${#filt[@]} of $count"; fi
+    printf '%s│%s   %s%s%s%s%s│%s\r\n' "$BRD" "$R" "$DIM" "$info" "$R" "$(fs_pad $((inner - 3 - ${#info})))" "$BRD" "$R"
+    printf '%s╰─ %s %s╯%s\r\n' "$BRD" "$hint" "$(fs_dash $((inner - 3 - ${#hint})))" "$R"
+  }
+  fs_redraw() { printf '\r\033[%dA' "$H"; fs_draw; }
+
+  fs_filter
+  printf '\n'
+  for ((i = 0; i < H; i++)); do printf '\n'; done
+  printf '\r\033[%dA' "$H"
+  fs_draw
+
+  local saved_stty; saved_stty="$(stty -g)"
+  stty raw -echo isig min 0 time 1 2>/dev/null || { tui_selected=-1; return 1; }
+  trap 'stty "$saved_stty" 2>/dev/null; trap - INT TERM' INT TERM
+
+  local key c1 c2 ok=0
+  while true; do
+    IFS= read -rsn1 key || { ok=-1; break; }
+    case "$key" in
+      $'\x1b')
+        IFS= read -rsn1 -t 0.1 c1
+        if [ "$c1" = '[' ] || [ "$c1" = 'O' ]; then
+          IFS= read -rsn1 -t 0.1 c2
+          case "$c2" in
+            A) if [ "$cur" -gt 0 ]; then cur=$((cur - 1)); [ "$cur" -lt "$top" ] && top="$cur"; fs_redraw; fi ;;
+            B) if [ "$cur" -lt $(( ${#filt[@]} - 1 )) ]; then cur=$((cur + 1)); [ "$cur" -ge $((top + vis)) ] && top=$((cur - vis + 1)); fs_redraw; fi ;;
+          esac
+        else
+          ok=-1; break   # bare ESC cancels
+        fi
+        ;;
+      '' | $'\n' | $'\r') ok=1; break ;;
+      $'\x7f' | $'\x08') if [ -n "$query" ]; then query="${query%?}"; fs_filter; fs_redraw; fi ;;
+      [[:print:]]) query="$query$key"; fs_filter; fs_redraw ;;
+    esac
+  done
+
+  stty "$saved_stty" 2>/dev/null
+  trap - INT TERM
+  printf '\r\033[2K'
+
+  if [ "$ok" -eq 1 ] && [ "${#filt[@]}" -gt 0 ]; then tui_selected="${filt[$cur]}"; return 0; fi
+  tui_selected=-1; return 1
+}
+
+choose_model() { # set caller's $model. Args: provider default_model models_url mode token
+  local provider="$1" default_model="$2" url="$3" mode="$4" tok="$5"
+  local -a fetched=() items=()
+  local m chosen
+  if [ -t 0 ] && [ -n "$url" ] && command -v curl >/dev/null 2>&1; then
+    printf 'ccx: fetching model list …\n' >&2
+    while IFS= read -r m; do [ -n "$m" ] && fetched+=("$m"); done < <(fetch_models "$url" "$mode" "$tok")
+  fi
+  if [ -t 0 ] && [ "${#fetched[@]}" -gt 0 ]; then
+    [ -n "$default_model" ] && items+=("$default_model")
+    for m in "${fetched[@]}"; do [ "$m" = "$default_model" ] || items+=("$m"); done
+    items+=("Custom / type manually")
+    if tui_filter_select "Choose model for $provider" "${items[@]}"; then
+      chosen="${items[$tui_selected]}"
+      if [ "$chosen" = "Custom / type manually" ]; then printf 'Custom model: '; read -r model || true
+      else model="$chosen"; fi
+      [ -n "$model" ] || model="$default_model"
+      return
+    fi
+  fi
+  # Fallback: template default + manual entry (also the non-curl / offline path).
+  if [ -n "$default_model" ]; then printf 'Model [%s]: ' "$default_model"; else printf 'Model: '; fi
+  local ans=""; read -r ans || true
+  if [ -n "$ans" ]; then model="$ans"; else model="$default_model"; fi
+}
+
 mask_token() {
   local t="$1"
   if [ "${#t}" -le 8 ]; then printf '****'; else printf '%s…%s' "${t:0:3}" "${t: -4}"; fi
@@ -128,7 +521,8 @@ cmd_new() {
   [ -n "$name" ] || { printf 'Profile name: '; read -r name; }
   printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]+$' || die "invalid name: $name"
   [ -e "$(profile_dir "$name")" ] && die "profile already exists: $name"
-  [ -n "$provider" ] || { printf 'Provider [claude/minimax/glm/deepseek/kimi/openai/openrouter/ollama/vllm/lmstudio/sakana/custom]: '; read -r provider; }
+  [ -n "$provider" ] || choose_provider
+  [ -n "$provider" ] || die "provider is required"
 
   local tf has_opus="" has_sonnet="" has_haiku=""
   tf="$(template_file "$provider")"
@@ -144,13 +538,16 @@ cmd_new() {
   fi
   [ -n "$isolate" ] || isolate=true
 
-  # Pick the model interactively unless given with --model or running non-interactively (-y).
-  if [ -z "$model_set" ] && [ -z "$yes" ]; then
-    if [ -n "$model" ]; then printf 'Model [%s]: ' "$model"; else printf 'Model: '; fi
-    local ans=""; read -r ans || true
-    [ -n "$ans" ] && model="$ans"
+  # A custom provider (no template) has no endpoint baked in — ask for it so the
+  # profile is usable, and so its model list can be fetched. (custom-oai covers
+  # the OpenAI-compatible case through the upstream-URL prompt below instead.)
+  if [ -z "$tf" ] && [ -z "$router" ] && [ -z "$base_url" ] && [ -z "$yes" ]; then
+    printf 'Base URL (Anthropic-compatible endpoint): '
+    local bu=""; read -r bu || true
+    [ -n "$bu" ] && base_url="$bu"
   fi
 
+  # --- credentials first, so the live model list can be queried from the API ---
   if [ -n "$router" ]; then
     # Confirm/enter the upstream endpoint (template default shown in brackets).
     if [ -z "$yes" ]; then
@@ -158,12 +555,6 @@ cmd_new() {
       local au=""; read -r au || true
       [ -n "$au" ] && upstream_url="$au"
     fi
-    # Router profile: ccx-router passes the model through, so fill every slot
-    # with the chosen model (unless overridden) — exactly like a single-model
-    # Anthropic profile, so /model opus|sonnet|haiku keep working.
-    [ -n "$m_opus" ]   || m_opus="$model"
-    [ -n "$m_sonnet" ] || m_sonnet="$model"
-    [ -n "$m_haiku" ]  || m_haiku="$model"
     # Upstream key: prompt (hidden) only when interactive, missing, and the
     # endpoint is remote — local servers (Ollama/vLLM/LM Studio) need no key.
     if [ -z "$upstream_key" ] && [ -z "$yes" ]; then
@@ -173,15 +564,46 @@ cmd_new() {
       esac
     fi
   else
+    if [ "$provider" != "claude" ] && [ -z "$token" ]; then
+      printf 'API token (input hidden): '; read -rs token; printf '\n'
+    fi
+  fi
+
+  # Pick the model interactively unless given with --model or running with -y.
+  # choose_model fetches the provider's live /models list when it can, then falls
+  # back to the template default + manual entry. Models URL priority:
+  # explicit CCX_MODELS_URL > router upstream/models > Anthropic base/v1/models.
+  if [ -z "$model_set" ] && [ -z "$yes" ]; then
+    local m_url="" m_mode="" m_tok="" models_url_tmpl="" models_auth_tmpl=""
+    if [ -n "$tf" ]; then
+      models_url_tmpl="$(kv_get "$tf" CCX_MODELS_URL)"
+      models_auth_tmpl="$(kv_get "$tf" CCX_MODELS_AUTH)"   # 'bearer' or 'anthropic'
+    fi
+    if   [ -n "$models_url_tmpl" ];                  then m_url="$models_url_tmpl"
+    elif [ -n "$router" ] && [ -n "$upstream_url" ]; then m_url="${upstream_url%/}/models"
+    elif [ -n "$base_url" ];                         then m_url="${base_url%/}/v1/models"
+    fi
+    # Auth style: router upstreams use Bearer; Anthropic bases use x-api-key.
+    # A template may override via CCX_MODELS_AUTH when its list endpoint differs
+    # (e.g. kimi lists through Moonshot's OpenAI /v1/models, which wants Bearer).
+    if [ -n "$router" ]; then m_mode="openai"; m_tok="$upstream_key"; else m_mode="anthropic"; m_tok="$token"; fi
+    [ -n "$models_auth_tmpl" ] && m_mode="$models_auth_tmpl"
+    choose_model "$provider" "$model" "$m_url" "$m_mode" "$m_tok"
+  fi
+
+  # --- model slot mapping (after the model is chosen) ---
+  if [ -n "$router" ]; then
+    # Router profile: ccx-router passes the model through, so fill every slot
+    # with the chosen model (unless overridden) so /model opus|sonnet|haiku work.
+    [ -n "$m_opus" ]   || m_opus="$model"
+    [ -n "$m_sonnet" ] || m_sonnet="$model"
+    [ -n "$m_haiku" ]  || m_haiku="$model"
+  else
     # Single-model profile: each slot the template defines follows the chosen
     # model, unless explicitly overridden with --opus/--sonnet/--haiku.
     if [ -z "$m_opus" ]   && [ -n "$has_opus" ];   then m_opus="$model";   fi
     if [ -z "$m_sonnet" ] && [ -n "$has_sonnet" ]; then m_sonnet="$model"; fi
     if [ -z "$m_haiku" ]  && [ -n "$has_haiku" ];  then m_haiku="$model";  fi
-
-    if [ "$provider" != "claude" ] && [ -z "$token" ]; then
-      printf 'API token (input hidden): '; read -rs token; printf '\n'
-    fi
   fi
 
   local pdir penv
