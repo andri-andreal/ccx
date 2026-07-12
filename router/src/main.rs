@@ -39,6 +39,10 @@ fn parse_args() -> Result<Config, String> {
 
 #[tokio::main]
 async fn main() {
+    if env::args().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!("ccx-router {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let cfg = match parse_args() {
         Ok(c) => c,
         Err(e) => {

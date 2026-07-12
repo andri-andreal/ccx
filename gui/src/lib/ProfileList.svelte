@@ -25,6 +25,12 @@
     message = `Removed ${name}`;
     onrefresh?.();
   }
+
+  // A router profile whose upstream is loopback is a local server (Ollama/vLLM/LM Studio).
+  const isLocal = (p) =>
+    !!p.router && /(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/.test(p.upstreamUrl ?? "");
+  const kindLabel = (p) => (!p.router ? "Direct" : isLocal(p) ? "Local" : "Via ccx-router");
+  const kindClass = (p) => (!p.router ? "direct" : isLocal(p) ? "local" : "router");
 </script>
 
 <header>
@@ -46,11 +52,16 @@
         <div class="row">
           <strong>{p.name}</strong>
           <span class="badge">{p.provider}</span>
+          <span class="kind {kindClass(p)}">{kindLabel(p)}</span>
           {#if p.isolate}<span class="iso">⊘ isolated</span>{:else}<span class="iso shared">shared</span>{/if}
           <span class="model">{p.model ?? ""}</span>
         </div>
         <div class="sub">
-          {p.baseUrl ?? "(anthropic login)"}{#if p.hasToken} · token {p.tokenMasked}{/if}
+          {#if p.router}
+            ↳ {p.upstreamUrl ?? "(no upstream URL)"}{#if p.hasUpstreamKey} · key {p.upstreamKeyMasked}{/if}
+          {:else}
+            {p.baseUrl ?? "(anthropic login)"}{#if p.hasToken} · token {p.tokenMasked}{/if}
+          {/if}
         </div>
         <div class="actions">
           <button onclick={() => launch(p.name)}>▶ Launch</button>
@@ -70,6 +81,10 @@
   .card { border: 1px solid #3a3a3a; border-radius: 8px; padding: 12px; background: #1e1e1e; }
   .row { display: flex; gap: 10px; align-items: center; }
   .badge { background: #2d4; color: #062; border-radius: 4px; padding: 0 6px; font-size: 12px; }
+  .kind { border-radius: 4px; padding: 0 6px; font-size: 11px; }
+  .kind.direct { background: #2b3a55; color: #9cf; }
+  .kind.router { background: #3a2b55; color: #c9f; }
+  .kind.local  { background: #2b553a; color: #9fc; }
   .iso { font-size: 12px; color: #e90; }
   .iso.shared { color: #888; }
   .model { margin-left: auto; color: #9cf; }
