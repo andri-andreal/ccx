@@ -19,22 +19,32 @@ ccx rm <name>                # delete a profile
 
 ## Creating a profile
 
-`ccx new` walks you through name, provider, model, and token:
+`ccx new` is an interactive wizard: pick a provider from an arrow-key list, then a
+model. Where the provider exposes one, the wizard **fetches the live model list**
+from its API (`/v1/models`) and gives you a type-to-filter picker; otherwise it
+offers the template default or lets you type a model. It then asks for whatever the
+provider needs — an API token (direct providers), or an upstream URL + optional key
+(OpenAI-compatible providers).
 
-```text
-Profile name: m2
-Provider [claude/minimax/glm/deepseek/kimi/custom]: minimax
-Model [MiniMax-M3]: MiniMax-M2
-API token (input hidden): ****
-```
-
-The **model** you pick — interactively or with `--model` — fills every model slot
-(Opus / Sonnet / Haiku) so each profile is cleanly single-model. Pass flags to skip
-the wizard:
+The **model** you pick fills every model slot (Opus / Sonnet / Haiku) so each profile
+is cleanly single-model. Skip the wizard entirely with flags:
 
 ```bash
 ccx new --name m2 --provider minimax --model MiniMax-M2 --token <key> --yes
 ```
+
+## Provider types
+
+Every profile launches with the same `ccx <name>` command, but there are three paths:
+
+- **Direct (Anthropic-compatible)** — `claude`, `minimax`, `glm`, `deepseek`, `kimi`,
+  or a custom Anthropic endpoint. Claude Code talks to the provider directly via
+  `ANTHROPIC_BASE_URL` + token.
+- **OpenAI-compatible (via ccx-router)** — `openai`, `openrouter`, `sakana`,
+  `custom-oai`. On launch, ccx starts the bundled `ccx-router` translator to bridge
+  the Anthropic ⇄ OpenAI formats. See [Providers](/docs/providers/).
+- **Local (via ccx-router)** — `ollama`, `vllm`, `lmstudio`. Same router path, but the
+  upstream is a local server and no API key is needed — start the server first.
 
 ## How it works
 

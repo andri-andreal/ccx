@@ -39,8 +39,16 @@ pub fn to_anthropic(resp: &ChatResponse, model: &str) -> MessagesResponse {
         stop_reason: Some(stop_reason),
         stop_sequence: None,
         usage: AnthropicUsage {
-            input_tokens: resp.usage.as_ref().and_then(|u| u.prompt_tokens).unwrap_or(0),
-            output_tokens: resp.usage.as_ref().and_then(|u| u.completion_tokens).unwrap_or(0),
+            input_tokens: resp
+                .usage
+                .as_ref()
+                .and_then(|u| u.prompt_tokens)
+                .unwrap_or(0),
+            output_tokens: resp
+                .usage
+                .as_ref()
+                .and_then(|u| u.completion_tokens)
+                .unwrap_or(0),
         },
     }
 }
@@ -66,7 +74,9 @@ mod tests {
 
     #[test]
     fn text_only_response() {
-        let resp = parse(r#"{"id":"cmpl-1","choices":[{"message":{"content":"hi there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#);
+        let resp = parse(
+            r#"{"id":"cmpl-1","choices":[{"message":{"content":"hi there"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#,
+        );
         let out = to_anthropic(&resp, "qwen");
         assert_eq!(out.id, "cmpl-1");
         assert_eq!(out.model, "qwen");
@@ -80,7 +90,9 @@ mod tests {
 
     #[test]
     fn tool_call_response_maps_to_tool_use() {
-        let resp = parse(r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#);
+        let resp = parse(
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
         let out = to_anthropic(&resp, "m");
         assert_eq!(out.stop_reason.as_deref(), Some("tool_use"));
         let v = serde_json::to_value(&out.content).unwrap();
@@ -92,7 +104,9 @@ mod tests {
 
     #[test]
     fn mixed_text_and_tool_call() {
-        let resp = parse(r#"{"choices":[{"message":{"content":"let me read it","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#);
+        let resp = parse(
+            r#"{"choices":[{"message":{"content":"let me read it","tool_calls":[{"id":"c1","type":"function","function":{"name":"read","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
         let out = to_anthropic(&resp, "m");
         let v = serde_json::to_value(&out.content).unwrap();
         assert_eq!(v[0]["type"], "text");
@@ -102,14 +116,17 @@ mod tests {
 
     #[test]
     fn length_finish_maps_to_max_tokens() {
-        let resp = parse(r#"{"choices":[{"message":{"content":"truncated"},"finish_reason":"length"}]}"#);
+        let resp =
+            parse(r#"{"choices":[{"message":{"content":"truncated"},"finish_reason":"length"}]}"#);
         let out = to_anthropic(&resp, "m");
         assert_eq!(out.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]
     fn bad_tool_arguments_fall_back_to_empty_object() {
-        let resp = parse(r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"not json"}}]},"finish_reason":"tool_calls"}]}"#);
+        let resp = parse(
+            r#"{"choices":[{"message":{"tool_calls":[{"id":"c1","type":"function","function":{"name":"x","arguments":"not json"}}]},"finish_reason":"tool_calls"}]}"#,
+        );
         let out = to_anthropic(&resp, "m");
         let v = serde_json::to_value(&out.content).unwrap();
         assert_eq!(v[0]["input"], json!({}));

@@ -306,7 +306,11 @@ mod tests {
     fn openai_request_skips_none_fields() {
         let req = ChatRequest {
             model: "m".into(),
-            messages: vec![OpenAiMessage { role: "user".into(), content: Some(MessageContent::Text("hi".into())), ..Default::default() }],
+            messages: vec![OpenAiMessage {
+                role: "user".into(),
+                content: Some(MessageContent::Text("hi".into())),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let s = serde_json::to_string(&req).unwrap();

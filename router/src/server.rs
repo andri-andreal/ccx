@@ -17,7 +17,7 @@ use serde_json::json;
 
 use crate::translate;
 use crate::translate::stream::StreamTranslator;
-use crate::types::{ChatChunk, ChatResponse, MessagesRequest, StringOrBlocks, ContentBlock};
+use crate::types::{ChatChunk, ChatResponse, ContentBlock, MessagesRequest, StringOrBlocks};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -176,7 +176,9 @@ fn text_len(s: &StringOrBlocks) -> usize {
             .iter()
             .map(|b| match b {
                 ContentBlock::Text { text } => text.len(),
-                ContentBlock::ToolResult { content: Some(c), .. } => text_len(c),
+                ContentBlock::ToolResult {
+                    content: Some(c), ..
+                } => text_len(c),
                 _ => 0,
             })
             .sum(),

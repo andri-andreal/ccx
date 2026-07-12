@@ -1,12 +1,6 @@
 //! End-to-end: ccx-router app forwarding to a mock OpenAI-compatible upstream.
 
-use axum::{
-    body::Bytes,
-    http::header,
-    response::IntoResponse,
-    routing::post,
-    Json, Router,
-};
+use axum::{body::Bytes, http::header, response::IntoResponse, routing::post, Json, Router};
 use ccx_router::server::{app, AppState};
 use serde_json::{json, Value};
 

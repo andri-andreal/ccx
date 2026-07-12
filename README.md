@@ -22,6 +22,8 @@ behind each.*
   so logins and history never bleed into your Anthropic account.
 - **No patching** — Claude Code runs unmodified; everything is driven by env vars.
 - **Editable provider defaults** — endpoints and model IDs live in simple template files.
+- **Live model discovery** — the `ccx new` wizard fetches each provider's model list
+  from its API (`/v1/models`) and offers a type-to-filter picker; falls back to typing.
 - **CLI + desktop GUI** — manage profiles from the terminal or a [Tauri](https://tauri.app) app.
 
 ## Supported providers
@@ -53,7 +55,8 @@ for you): `openai` · `openrouter` · `ollama` · `vllm` · `lmstudio` · `sakan
 ## Use
 
 ```bash
-ccx new                      # create a profile (interactive wizard; prompts for upstream URL/key on OpenAI-compatible providers)
+ccx new                      # create a profile (interactive wizard: provider picker, live model list, upstream URL/key on OpenAI-compatible providers)
+ccx --version                # print ccx, ccx-router, and detected claude versions
 ccx list                     # list profiles  (alias: ls)
 ccx claude                   # Anthropic login; Opus plans, Sonnet executes (opusplan)
 ccx claude --model haiku     # extra args are passed straight to claude
@@ -160,14 +163,17 @@ Shipped — see [OpenAI-compatible providers](#openai-compatible-providers-via-a
       interleave) + an integration test against a mock upstream; bash dry-run and
       live-lifecycle tests.
 
+Also shipped since:
+
+- [x] GUI: provider picker + router/upstream fields in the create/edit form, with a
+      per-profile Direct / Via ccx-router / Local badge and the upstream URL shown.
+- [x] Wizard fetches each provider's live model list (`/v1/models`) with a
+      type-to-filter picker; falls back to the template default / manual entry.
+- [x] `ccx --version` (ccx + ccx-router + detected claude).
+
 Remaining:
 
-- [ ] GUI: provider picker + router fields in the create/edit form.
 - [ ] Prebuilt `ccx-router` binaries so Rust isn't required to install.
-
-Remaining:
-
-- [ ] GUI: provider picker + router fields in the create/edit form.
 - [ ] OpenRouter provider pinning (`provider.only/order`) to avoid non-tool endpoints.
 
 ## License

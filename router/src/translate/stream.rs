@@ -23,7 +23,10 @@ pub struct SseEvent {
 
 impl SseEvent {
     fn new(event: &str, data: Value) -> Self {
-        SseEvent { event: event.into(), data }
+        SseEvent {
+            event: event.into(),
+            data,
+        }
     }
     /// Wire format for an SSE stream.
     pub fn to_wire(&self) -> String {
@@ -183,7 +186,10 @@ impl StreamTranslator {
             "message_delta",
             json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":null},"usage":{"output_tokens":self.output_tokens}}),
         ));
-        out.push(SseEvent::new("message_stop", json!({"type":"message_stop"})));
+        out.push(SseEvent::new(
+            "message_stop",
+            json!({"type":"message_stop"}),
+        ));
         out
     }
 }
@@ -260,10 +266,16 @@ mod tests {
                 "message_stop",
             ]
         );
-        let start = events.iter().find(|e| e.event == "content_block_start").unwrap();
+        let start = events
+            .iter()
+            .find(|e| e.event == "content_block_start")
+            .unwrap();
         assert_eq!(start.data["content_block"]["type"], "tool_use");
         assert_eq!(start.data["content_block"]["name"], "read");
-        let deltas: Vec<&SseEvent> = events.iter().filter(|e| e.event == "content_block_delta").collect();
+        let deltas: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event == "content_block_delta")
+            .collect();
         assert_eq!(deltas[0].data["delta"]["type"], "input_json_delta");
         assert_eq!(deltas[0].data["delta"]["partial_json"], "{\"path\":");
         let md = events.iter().find(|e| e.event == "message_delta").unwrap();
@@ -285,8 +297,14 @@ mod tests {
         );
         // Expect three blocks at indices 0 (text), 1 (tool), 2 (text), each
         // opened and closed, never overlapping.
-        let starts: Vec<&SseEvent> = events.iter().filter(|e| e.event == "content_block_start").collect();
-        let stops: Vec<&SseEvent> = events.iter().filter(|e| e.event == "content_block_stop").collect();
+        let starts: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event == "content_block_start")
+            .collect();
+        let stops: Vec<&SseEvent> = events
+            .iter()
+            .filter(|e| e.event == "content_block_stop")
+            .collect();
         assert_eq!(starts.len(), 3, "three blocks opened");
         assert_eq!(stops.len(), 3, "three blocks closed");
         assert_eq!(starts[0].data["index"], 0);
@@ -331,6 +349,9 @@ mod tests {
     #[test]
     fn wire_format_has_event_and_data_lines() {
         let ev = SseEvent::new("message_stop", json!({"type":"message_stop"}));
-        assert_eq!(ev.to_wire(), "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n");
+        assert_eq!(
+            ev.to_wire(),
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
     }
 }

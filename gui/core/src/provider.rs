@@ -21,7 +21,15 @@ pub struct ProviderTemplate {
     pub upstream_url: Option<String>,
 }
 
-fn t(name: &str, isolate: bool, base: Option<&str>, model: Option<&str>, opus: Option<&str>, sonnet: Option<&str>, haiku: Option<&str>) -> ProviderTemplate {
+fn t(
+    name: &str,
+    isolate: bool,
+    base: Option<&str>,
+    model: Option<&str>,
+    opus: Option<&str>,
+    sonnet: Option<&str>,
+    haiku: Option<&str>,
+) -> ProviderTemplate {
     ProviderTemplate {
         name: name.into(),
         isolate,
@@ -49,13 +57,53 @@ fn r(name: &str, upstream: Option<&str>, model: Option<&str>) -> ProviderTemplat
 pub fn builtins() -> Vec<ProviderTemplate> {
     vec![
         t("claude", false, None, Some("opusplan"), None, None, None),
-        t("minimax", true, Some("https://api.minimax.io/anthropic"), Some("MiniMax-M2"), Some("MiniMax-M2"), Some("MiniMax-M2"), Some("MiniMax-M2")),
-        t("glm", true, Some("https://api.z.ai/api/anthropic"), Some("glm-4.6"), Some("glm-4.6"), Some("glm-4.6"), Some("glm-4.5-air")),
-        t("deepseek", true, Some("https://api.deepseek.com/anthropic"), Some("deepseek-chat"), Some("deepseek-reasoner"), Some("deepseek-chat"), Some("deepseek-chat")),
-        t("kimi", true, Some("https://api.moonshot.ai/anthropic"), Some("kimi-k2-0905-preview"), Some("kimi-k2-0905-preview"), Some("kimi-k2-0905-preview"), Some("kimi-k2-turbo-preview")),
+        t(
+            "minimax",
+            true,
+            Some("https://api.minimax.io/anthropic"),
+            Some("MiniMax-M2"),
+            Some("MiniMax-M2"),
+            Some("MiniMax-M2"),
+            Some("MiniMax-M2"),
+        ),
+        t(
+            "glm",
+            true,
+            Some("https://api.z.ai/api/anthropic"),
+            Some("glm-4.6"),
+            Some("glm-4.6"),
+            Some("glm-4.6"),
+            Some("glm-4.5-air"),
+        ),
+        t(
+            "deepseek",
+            true,
+            Some("https://api.deepseek.com/anthropic"),
+            Some("deepseek-chat"),
+            Some("deepseek-reasoner"),
+            Some("deepseek-chat"),
+            Some("deepseek-chat"),
+        ),
+        t(
+            "kimi",
+            true,
+            Some("https://api.moonshot.ai/anthropic"),
+            Some("kimi-k2-0905-preview"),
+            Some("kimi-k2-0905-preview"),
+            Some("kimi-k2-0905-preview"),
+            Some("kimi-k2-turbo-preview"),
+        ),
         r("openai", Some("https://api.openai.com/v1"), Some("gpt-4o")),
-        r("openrouter", Some("https://openrouter.ai/api/v1"), Some("qwen/qwen3-coder")),
-        r("ollama", Some("http://localhost:11434/v1"), Some("qwen2.5-coder:32b")),
+        r(
+            "openrouter",
+            Some("https://openrouter.ai/api/v1"),
+            Some("qwen/qwen3-coder"),
+        ),
+        r(
+            "ollama",
+            Some("http://localhost:11434/v1"),
+            Some("qwen2.5-coder:32b"),
+        ),
         r("vllm", Some("http://localhost:8000/v1"), None),
         r("lmstudio", Some("http://localhost:1234/v1"), None),
         r("sakana", Some("https://api.sakana.ai/v1"), Some("fugu")),
@@ -64,7 +112,10 @@ pub fn builtins() -> Vec<ProviderTemplate> {
 }
 
 fn parse_template(name: &str, content: &str) -> ProviderTemplate {
-    let mut tpl = ProviderTemplate { name: name.into(), ..Default::default() };
+    let mut tpl = ProviderTemplate {
+        name: name.into(),
+        ..Default::default()
+    };
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -129,21 +180,41 @@ mod tests {
             assert!(names.contains(&want), "missing {want}");
         }
         let glm = b.iter().find(|t| t.name == "glm").unwrap();
-        assert_eq!(glm.base_url.as_deref(), Some("https://api.z.ai/api/anthropic"));
+        assert_eq!(
+            glm.base_url.as_deref(),
+            Some("https://api.z.ai/api/anthropic")
+        );
         assert_eq!(glm.haiku.as_deref(), Some("glm-4.5-air"));
-        assert_eq!(b.iter().find(|t| t.name == "claude").unwrap().model.as_deref(), Some("opusplan"));
+        assert_eq!(
+            b.iter()
+                .find(|t| t.name == "claude")
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("opusplan")
+        );
     }
 
     #[test]
     fn builtins_include_openai_compatible_router_providers() {
         let b = builtins();
         let names: Vec<&str> = b.iter().map(|t| t.name.as_str()).collect();
-        for want in ["openai", "openrouter", "ollama", "vllm", "lmstudio", "custom-oai"] {
+        for want in [
+            "openai",
+            "openrouter",
+            "ollama",
+            "vllm",
+            "lmstudio",
+            "custom-oai",
+        ] {
             assert!(names.contains(&want), "missing {want}");
         }
         let ollama = b.iter().find(|t| t.name == "ollama").unwrap();
         assert_eq!(ollama.router.as_deref(), Some("builtin"));
-        assert_eq!(ollama.upstream_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(
+            ollama.upstream_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         // anthropic providers carry no router marker
         assert_eq!(b.iter().find(|t| t.name == "glm").unwrap().router, None);
     }
@@ -155,7 +226,10 @@ mod tests {
             "CCX_ROUTER=builtin\nCCX_ISOLATE=true\nCCX_UPSTREAM_BASE_URL=http://localhost:11434/v1\nANTHROPIC_MODEL=qwen2.5-coder:7b\n",
         );
         assert_eq!(tpl.router.as_deref(), Some("builtin"));
-        assert_eq!(tpl.upstream_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(
+            tpl.upstream_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
         assert_eq!(tpl.model.as_deref(), Some("qwen2.5-coder:7b"));
     }
 
@@ -168,7 +242,10 @@ mod tests {
         fs::write(pdir.join("glm.tmpl"), "CCX_ISOLATE=true\nANTHROPIC_BASE_URL=https://custom.example/anthropic\nANTHROPIC_MODEL=glm-9\n").unwrap();
         let list = list_providers(home);
         let glm = list.iter().find(|t| t.name == "glm").unwrap();
-        assert_eq!(glm.base_url.as_deref(), Some("https://custom.example/anthropic"));
+        assert_eq!(
+            glm.base_url.as_deref(),
+            Some("https://custom.example/anthropic")
+        );
         assert_eq!(glm.model.as_deref(), Some("glm-9"));
         assert!(list.iter().any(|t| t.name == "minimax"));
     }

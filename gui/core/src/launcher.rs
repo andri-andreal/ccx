@@ -25,12 +25,24 @@ fn known_terminals() -> Vec<(&'static str, Vec<&'static str>)> {
 
 pub fn build_env(p: &Profile, home: &Path) -> Vec<(String, String)> {
     let mut e = Vec::new();
-    if let Some(v) = &p.base_url { e.push(("ANTHROPIC_BASE_URL".into(), v.clone())); }
-    if let Some(v) = &p.token { e.push(("ANTHROPIC_AUTH_TOKEN".into(), v.clone())); }
-    if let Some(v) = &p.model { e.push(("ANTHROPIC_MODEL".into(), v.clone())); }
-    if let Some(v) = &p.opus { e.push(("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), v.clone())); }
-    if let Some(v) = &p.sonnet { e.push(("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), v.clone())); }
-    if let Some(v) = &p.haiku { e.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), v.clone())); }
+    if let Some(v) = &p.base_url {
+        e.push(("ANTHROPIC_BASE_URL".into(), v.clone()));
+    }
+    if let Some(v) = &p.token {
+        e.push(("ANTHROPIC_AUTH_TOKEN".into(), v.clone()));
+    }
+    if let Some(v) = &p.model {
+        e.push(("ANTHROPIC_MODEL".into(), v.clone()));
+    }
+    if let Some(v) = &p.opus {
+        e.push(("ANTHROPIC_DEFAULT_OPUS_MODEL".into(), v.clone()));
+    }
+    if let Some(v) = &p.sonnet {
+        e.push(("ANTHROPIC_DEFAULT_SONNET_MODEL".into(), v.clone()));
+    }
+    if let Some(v) = &p.haiku {
+        e.push(("ANTHROPIC_DEFAULT_HAIKU_MODEL".into(), v.clone()));
+    }
     if p.isolate {
         let h = config::profile_dir(home, &p.name).join("home");
         e.push(("CLAUDE_CONFIG_DIR".into(), h.to_string_lossy().to_string()));
@@ -38,7 +50,10 @@ pub fn build_env(p: &Profile, home: &Path) -> Vec<(String, String)> {
     e
 }
 
-pub fn detect_terminal(term_env: Option<&str>, available: impl Fn(&str) -> bool) -> Option<TerminalSpec> {
+pub fn detect_terminal(
+    term_env: Option<&str>,
+    available: impl Fn(&str) -> bool,
+) -> Option<TerminalSpec> {
     let table = known_terminals();
     if let Some(t) = term_env.filter(|s| !s.is_empty()) {
         if available(t) {
@@ -47,12 +62,18 @@ pub fn detect_terminal(term_env: Option<&str>, available: impl Fn(&str) -> bool)
                 .find(|(b, _)| *b == t)
                 .map(|(_, a)| a.iter().map(|s| s.to_string()).collect())
                 .unwrap_or_else(|| vec!["-e".to_string()]);
-            return Some(TerminalSpec { bin: t.to_string(), exec_args: args });
+            return Some(TerminalSpec {
+                bin: t.to_string(),
+                exec_args: args,
+            });
         }
     }
     for (b, a) in table {
         if available(b) {
-            return Some(TerminalSpec { bin: b.to_string(), exec_args: a.iter().map(|s| s.to_string()).collect() });
+            return Some(TerminalSpec {
+                bin: b.to_string(),
+                exec_args: a.iter().map(|s| s.to_string()).collect(),
+            });
         }
     }
     None
@@ -134,7 +155,10 @@ mod tests {
     fn build_env_includes_keys_and_isolation() {
         let home = Path::new("/c");
         let e = build_env(&prof(true), home);
-        assert!(e.contains(&("ANTHROPIC_BASE_URL".into(), "https://api.minimax.io/anthropic".into())));
+        assert!(e.contains(&(
+            "ANTHROPIC_BASE_URL".into(),
+            "https://api.minimax.io/anthropic".into()
+        )));
         assert!(e.contains(&("ANTHROPIC_AUTH_TOKEN".into(), "sk-1".into())));
         assert!(e.contains(&("CLAUDE_CONFIG_DIR".into(), "/c/profiles/mm/home".into())));
     }

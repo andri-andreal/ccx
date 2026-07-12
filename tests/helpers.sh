@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # tests/helpers.sh — dependency-free assertions
 TESTS_RUN=0
 TESTS_FAIL=0

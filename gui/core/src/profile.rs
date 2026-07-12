@@ -26,7 +26,10 @@ pub struct Profile {
 
 impl Profile {
     pub fn from_env_str(name: &str, content: &str) -> Profile {
-        let mut p = Profile { name: name.to_string(), ..Default::default() };
+        let mut p = Profile {
+            name: name.to_string(),
+            ..Default::default()
+        };
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -66,18 +69,39 @@ impl Profile {
         if self.is_router() {
             // Router-specific keys (CCX_* — never exported to claude). The model
             // is written via the shared ANTHROPIC_* slots below.
-            s.push_str(&format!("CCX_ROUTER={}\n", self.router.as_deref().unwrap_or("builtin")));
-            if let Some(v) = &self.upstream_url { s.push_str(&format!("CCX_UPSTREAM_BASE_URL={}\n", v)); }
-            if let Some(v) = &self.upstream_key { if !v.is_empty() { s.push_str(&format!("CCX_UPSTREAM_API_KEY={}\n", v)); } }
+            s.push_str(&format!(
+                "CCX_ROUTER={}\n",
+                self.router.as_deref().unwrap_or("builtin")
+            ));
+            if let Some(v) = &self.upstream_url {
+                s.push_str(&format!("CCX_UPSTREAM_BASE_URL={}\n", v));
+            }
+            if let Some(v) = &self.upstream_key {
+                if !v.is_empty() {
+                    s.push_str(&format!("CCX_UPSTREAM_API_KEY={}\n", v));
+                }
+            }
         } else {
-            if let Some(v) = &self.base_url { s.push_str(&format!("ANTHROPIC_BASE_URL={}\n", v)); }
-            if let Some(v) = &self.token { s.push_str(&format!("ANTHROPIC_AUTH_TOKEN={}\n", v)); }
+            if let Some(v) = &self.base_url {
+                s.push_str(&format!("ANTHROPIC_BASE_URL={}\n", v));
+            }
+            if let Some(v) = &self.token {
+                s.push_str(&format!("ANTHROPIC_AUTH_TOKEN={}\n", v));
+            }
         }
         // Model + slot mapping is shared by both kinds.
-        if let Some(v) = &self.model { s.push_str(&format!("ANTHROPIC_MODEL={}\n", v)); }
-        if let Some(v) = &self.opus { s.push_str(&format!("ANTHROPIC_DEFAULT_OPUS_MODEL={}\n", v)); }
-        if let Some(v) = &self.sonnet { s.push_str(&format!("ANTHROPIC_DEFAULT_SONNET_MODEL={}\n", v)); }
-        if let Some(v) = &self.haiku { s.push_str(&format!("ANTHROPIC_DEFAULT_HAIKU_MODEL={}\n", v)); }
+        if let Some(v) = &self.model {
+            s.push_str(&format!("ANTHROPIC_MODEL={}\n", v));
+        }
+        if let Some(v) = &self.opus {
+            s.push_str(&format!("ANTHROPIC_DEFAULT_OPUS_MODEL={}\n", v));
+        }
+        if let Some(v) = &self.sonnet {
+            s.push_str(&format!("ANTHROPIC_DEFAULT_SONNET_MODEL={}\n", v));
+        }
+        if let Some(v) = &self.haiku {
+            s.push_str(&format!("ANTHROPIC_DEFAULT_HAIKU_MODEL={}\n", v));
+        }
         s
     }
 }
@@ -191,7 +215,7 @@ mod tests {
     fn parse_ignores_comments_and_blanks() {
         let p = Profile::from_env_str("work", "# ccx profile: work\n\nCCX_PROVIDER=claude\nCCX_ISOLATE=false\nANTHROPIC_MODEL=opusplan\n");
         assert_eq!(p.provider, "claude");
-        assert_eq!(p.isolate, false);
+        assert!(!p.isolate);
         assert_eq!(p.model.as_deref(), Some("opusplan"));
         assert_eq!(p.token, None);
     }
@@ -249,7 +273,10 @@ mod tests {
         create(home, &router_sample()).unwrap();
         let dir = crate::config::profile_dir(home, "local");
         assert!(dir.join("home").is_dir(), "isolated home created");
-        assert!(!dir.join("router").exists(), "no router dir for builtin translator");
+        assert!(
+            !dir.join("router").exists(),
+            "no router dir for builtin translator"
+        );
     }
 
     use std::os::unix::fs::PermissionsExt;
@@ -266,7 +293,10 @@ mod tests {
         let envp = crate::config::profile_env_path(home, "mm");
         assert!(envp.exists());
         assert_eq!(mode(&envp), 0o600);
-        assert_eq!(mode(&crate::config::profile_dir(home, "mm").join("home")), 0o700);
+        assert_eq!(
+            mode(&crate::config::profile_dir(home, "mm").join("home")),
+            0o700
+        );
     }
 
     #[test]
@@ -282,7 +312,10 @@ mod tests {
         assert_eq!(p.token.as_deref(), Some("sk-test-123456789"));
         p.model = Some("MiniMax-M2-Plus".into());
         update(home, &p).unwrap();
-        assert_eq!(get(home, "mm").unwrap().model.as_deref(), Some("MiniMax-M2-Plus"));
+        assert_eq!(
+            get(home, "mm").unwrap().model.as_deref(),
+            Some("MiniMax-M2-Plus")
+        );
 
         delete(home, "mm").unwrap();
         assert!(list(home).is_empty());
