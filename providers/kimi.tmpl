@@ -1,5 +1,9 @@
 CCX_ISOLATE=true
 ANTHROPIC_BASE_URL=https://api.moonshot.ai/anthropic
+# Moonshot's Anthropic gateway has no /v1/models; list via the OpenAI endpoint
+# (Bearer auth), while the launch endpoint above stays Anthropic-style.
+CCX_MODELS_URL=https://api.moonshot.ai/v1/models
+CCX_MODELS_AUTH=bearer
 ANTHROPIC_MODEL=kimi-k2-0905-preview
 ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-k2-0905-preview
 ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-k2-0905-preview
