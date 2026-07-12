@@ -34,13 +34,20 @@ mod tests {
 
     fn resolver<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |k: &str| {
-            pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| v.to_string())
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
         }
     }
 
     #[test]
     fn ccx_home_prefers_ccx_home() {
-        let get = resolver(&[("CCX_HOME", "/tmp/x"), ("XDG_CONFIG_HOME", "/home/u/.config"), ("HOME", "/home/u")]);
+        let get = resolver(&[
+            ("CCX_HOME", "/tmp/x"),
+            ("XDG_CONFIG_HOME", "/home/u/.config"),
+            ("HOME", "/home/u"),
+        ]);
         assert_eq!(ccx_home_from(get), PathBuf::from("/tmp/x"));
     }
 
@@ -59,7 +66,10 @@ mod tests {
     #[test]
     fn path_helpers_compose() {
         let h = PathBuf::from("/c");
-        assert_eq!(profile_env_path(&h, "mm"), PathBuf::from("/c/profiles/mm/profile.env"));
+        assert_eq!(
+            profile_env_path(&h, "mm"),
+            PathBuf::from("/c/profiles/mm/profile.env")
+        );
         assert_eq!(providers_dir(&h), PathBuf::from("/c/providers"));
     }
 }

@@ -219,8 +219,9 @@ assert_contains "$(cat "$lq2")" "ANTHROPIC_DEFAULT_SONNET_MODEL=base-model" "son
 
 # --- OAI Task 2b: interactive wizard (model + upstream URL prompts) ---
 assert_eq "$([ -f "$REPO/providers/sakana.tmpl" ] && echo y)" "y" "sakana template exists"
-# sakana: name+provider via flags; model + URL keep template defaults (empty input), key typed
-out="$(printf '\n\nmykey\n' | "$CCX" new --name sk --provider sakana 2>&1)"; rc=$?
+# sakana: name+provider via flags. Prompt order is upstream URL, then key, then
+# model — keep the URL default, type the key, keep the model default.
+out="$(printf '\nmykey\n' | "$CCX" new --name sk --provider sakana 2>&1)"; rc=$?
 assert_exit "$rc" 0 "interactive sakana exits 0"
 assert_contains "$out" "Model [fugu]" "wizard offers model default"
 assert_contains "$out" "Upstream base URL [https://api.sakana.ai/v1]" "wizard offers upstream default"
@@ -229,8 +230,8 @@ assert_contains "$(cat "$sk")" "CCX_ROUTER=builtin" "sakana is a router profile"
 assert_contains "$(cat "$sk")" "CCX_UPSTREAM_BASE_URL=https://api.sakana.ai/v1" "sakana upstream default kept"
 assert_contains "$(cat "$sk")" "ANTHROPIC_MODEL=fugu" "sakana model default kept"
 assert_contains "$(cat "$sk")" "CCX_UPSTREAM_API_KEY=mykey" "sakana key from prompt"
-# custom-oai: no template defaults — model and URL are typed in
-out="$(printf 'gpt-4o\nhttps://api.example.com/v1\nk\n' | "$CCX" new --name c1 --provider custom-oai 2>&1)"; rc=$?
+# custom-oai: no template defaults — type upstream URL, key, then model (in order).
+out="$(printf 'https://api.example.com/v1\nk\ngpt-4o\n' | "$CCX" new --name c1 --provider custom-oai 2>&1)"; rc=$?
 assert_exit "$rc" 0 "interactive custom-oai exits 0"
 c1="$CCX_HOME/profiles/c1/profile.env"
 assert_contains "$(cat "$c1")" "CCX_UPSTREAM_BASE_URL=https://api.example.com/v1" "typed upstream url"
@@ -300,5 +301,20 @@ assert_exit "$rc" 0 "show router exits 0"
 assert_contains "$out" "CCX_UPSTREAM_BASE_URL=https://openrouter.ai" "show prints upstream url"
 assert_contains "$out" "CCX_UPSTREAM_API_KEY=sk-…6789" "upstream key masked in show"
 assert_not_contains "$out" "sk-or-abc123456789" "raw upstream key hidden"
+
+# --- Safety: profile-name validation rejects traversal/odd names on every command ---
+for bad in "../evil" "a/b" "." ".." "with space" "semi;colon"; do
+  CCX_YES=1 "$CCX" rm "$bad" >/dev/null 2>&1; assert_exit "$?" 1 "rm rejects bad name: $bad"
+  "$CCX" show "$bad" >/dev/null 2>&1;         assert_exit "$?" 1 "show rejects bad name: $bad"
+  "$CCX" edit "$bad" >/dev/null 2>&1;         assert_exit "$?" 1 "edit rejects bad name: $bad"
+  "$CCX" new --name "$bad" --provider claude -y >/dev/null 2>&1; assert_exit "$?" 1 "new rejects bad name: $bad"
+done
+out="$("$CCX" show "../../etc/passwd" 2>&1)"; assert_contains "$out" "invalid profile name" "show gives a clear error for a bad name"
+
+# --- ccx --version ---
+out="$("$CCX" --version 2>&1)"; rc=$?
+assert_exit "$rc" 0 "--version exits 0"
+assert_contains "$out" "ccx 0.1.0" "--version prints ccx version"
+assert_contains "$out" "claude:" "--version reports claude detection"
 
 finish

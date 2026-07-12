@@ -32,7 +32,11 @@ vLLM / LM Studio, …) can't be used directly. `ccx` now ships its own translato
       interleave) + an integration test against a mock upstream; bash dry-run and
       live-lifecycle tests.
 
+- [x] GUI: provider picker + router/upstream fields in the create/edit form, with a
+      per-profile Direct / Via ccx-router / Local badge and the upstream URL shown.
+- [x] Wizard fetches each provider's live model list (`/v1/models`) with a
+      type-to-filter picker; falls back to the template default / manual entry.
+
 ### Remaining
 
-- [ ] GUI: provider picker + router fields in the create/edit form.
 - [ ] Prebuilt `ccx-router` binaries so Rust isn't required to install.

@@ -4,6 +4,7 @@ set -euo pipefail
 CCX_HOME="${CCX_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccx}"
 CCX_CLAUDE_BIN="${CCX_CLAUDE_BIN:-claude}"
 CCX_ROUTER_BIN="${CCX_ROUTER_BIN:-ccx-router}"
+CCX_VERSION="0.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 die() { printf 'ccx: %s\n' "$1" >&2; exit "${2:-1}"; }
@@ -19,6 +20,11 @@ resolve_router_bin() { # print the ccx-router binary path, or fail
 profiles_dir() { printf '%s/profiles' "$CCX_HOME"; }
 profile_dir()  { printf '%s/profiles/%s' "$CCX_HOME" "$1"; }
 profile_env()  { printf '%s/profiles/%s/profile.env' "$CCX_HOME" "$1"; }
+
+valid_profile_name() { # a safe profile name: no slashes/dots/spaces, so the path
+  # can't escape the profiles dir (guards run/show/edit/rm against traversal).
+  printf '%s' "${1:-}" | grep -qE '^[A-Za-z0-9_-]+$'
+}
 
 template_file() { # echo template path for a provider, or nothing
   if [ -f "$CCX_HOME/providers/$1.tmpl" ]; then
@@ -60,6 +66,10 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   [ "$count" -gt 0 ] || { tui_selected=-1; return 1; }
 
   local i cur=0
+  # Start on the first selectable row — group headers (containing '│') are not
+  # selectable, so landing the cursor on one lets Enter create an invalid profile.
+  while [ "$cur" -lt "$count" ] && [[ "${items[$cur]}" == *│* ]]; do cur=$((cur + 1)); done
+  [ "$cur" -lt "$count" ] || cur=0
 
   # --- layout precompute -------------------------------------------------
   # Terminal width bounds the box; fall back to 80 columns when unknown.
@@ -519,7 +529,7 @@ cmd_new() {
   done
 
   [ -n "$name" ] || { printf 'Profile name: '; read -r name; }
-  printf '%s' "$name" | grep -qE '^[A-Za-z0-9_-]+$' || die "invalid name: $name"
+  valid_profile_name "$name" || die "invalid name: $name"
   [ -e "$(profile_dir "$name")" ] && die "profile already exists: $name"
   [ -n "$provider" ] || choose_provider
   [ -n "$provider" ] || die "provider is required"
@@ -699,6 +709,7 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
 cmd_run() {
   local name="${1:-}"
   [ -n "$name" ] || { cmd_help; exit 0; }
+  valid_profile_name "$name" || die "invalid profile name: $name"
   shift || true
   local penv; penv="$(profile_env "$name")"
   if [ ! -f "$penv" ]; then
@@ -760,6 +771,7 @@ cmd_run() {
 
 cmd_show() {
   local name="${1:-}"; [ -n "$name" ] || die "show: profile name required"
+  valid_profile_name "$name" || die "invalid profile name: $name"
   local penv; penv="$(profile_env "$name")"
   [ -f "$penv" ] || die "unknown profile: $name"
   while IFS= read -r line || [ -n "$line" ]; do
@@ -773,6 +785,7 @@ cmd_show() {
 
 cmd_edit() {
   local name="${1:-}"; [ -n "$name" ] || die "edit: profile name required"
+  valid_profile_name "$name" || die "invalid profile name: $name"
   local penv; penv="$(profile_env "$name")"
   [ -f "$penv" ] || die "unknown profile: $name"
   "${EDITOR:-vi}" "$penv"
@@ -781,6 +794,7 @@ cmd_edit() {
 
 cmd_rm() {
   local name="${1:-}"; [ -n "$name" ] || die "rm: profile name required"
+  valid_profile_name "$name" || die "invalid profile name: $name"
   local pdir; pdir="$(profile_dir "$name")"
   [ -d "$pdir" ] || die "unknown profile: $name"
   if [ "${CCX_YES:-}" != "1" ]; then
@@ -792,10 +806,29 @@ cmd_rm() {
   printf 'Removed profile "%s".\n' "$name"
 }
 
+cmd_version() {
+  printf 'ccx %s\n' "$CCX_VERSION"
+  local bin rv
+  if bin="$(resolve_router_bin 2>/dev/null)" && [ -n "$bin" ]; then
+    # `|| rv=""` so an old router without --version (exit 2) doesn't trip set -e.
+    rv="$("$bin" --version 2>/dev/null | head -1)" || rv=""
+    [ -n "$rv" ] && printf '%s\n' "$rv" || printf 'ccx-router: found (%s)\n' "$bin"
+  else
+    printf 'ccx-router: not found\n'
+  fi
+  if command -v "$CCX_CLAUDE_BIN" >/dev/null 2>&1; then
+    local cv; cv="$("$CCX_CLAUDE_BIN" --version 2>/dev/null | head -1)" || cv=""
+    printf 'claude: %s\n' "${cv:-found}"
+  else
+    printf 'claude: not found\n'
+  fi
+}
+
 main() {
   local cmd="${1:-help}"
   case "$cmd" in
     help | -h | --help) cmd_help ;;
+    version | --version | -V) cmd_version ;;
     list | ls) cmd_list ;;
     new) shift; cmd_new "$@" ;;
     show) shift; cmd_show "$@" ;;

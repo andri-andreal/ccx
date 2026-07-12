@@ -58,7 +58,10 @@ impl From<Profile> for ProfileView {
 
 #[tauri::command]
 fn list_profiles() -> Vec<ProfileView> {
-    profile::list(&home()).into_iter().map(ProfileView::from).collect()
+    profile::list(&home())
+        .into_iter()
+        .map(ProfileView::from)
+        .collect()
 }
 
 #[tauri::command]
@@ -125,8 +128,11 @@ fn set_settings(settings: GuiSettings) -> Result<(), String> {
 
 #[tauri::command]
 fn detect_terminal() -> Option<String> {
-    launcher::detect_terminal(std::env::var("TERMINAL").ok().as_deref(), launcher::is_in_path)
-        .map(|t| t.bin)
+    launcher::detect_terminal(
+        std::env::var("TERMINAL").ok().as_deref(),
+        launcher::is_in_path,
+    )
+    .map(|t| t.bin)
 }
 
 fn main() {

@@ -70,8 +70,16 @@ fn translate_message(m: &AnthropicMessage, out: &mut Vec<OpenAiMessage>) {
         }
         out.push(OpenAiMessage {
             role: "assistant".into(),
-            content: if text.is_empty() { None } else { Some(MessageContent::Text(text)) },
-            tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
+            content: if text.is_empty() {
+                None
+            } else {
+                Some(MessageContent::Text(text))
+            },
+            tool_calls: if tool_calls.is_empty() {
+                None
+            } else {
+                Some(tool_calls)
+            },
             ..Default::default()
         });
         return;
@@ -84,7 +92,11 @@ fn translate_message(m: &AnthropicMessage, out: &mut Vec<OpenAiMessage>) {
     let mut has_image = false;
     for b in blocks {
         match b {
-            ContentBlock::ToolResult { tool_use_id, content, .. } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
                 out.push(OpenAiMessage {
                     role: "tool".into(),
                     content: Some(MessageContent::Text(
@@ -171,7 +183,9 @@ mod tests {
 
     #[test]
     fn plain_text_turn() {
-        let req = parse(r#"{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}"#);
+        let req = parse(
+            r#"{"model":"m","max_tokens":100,"messages":[{"role":"user","content":"hello"}]}"#,
+        );
         let out = to_openai(&req);
         assert_eq!(out.model, "m");
         assert_eq!(out.max_tokens, Some(100));
@@ -183,7 +197,9 @@ mod tests {
 
     #[test]
     fn system_prepended() {
-        let req = parse(r#"{"model":"m","system":"be terse","messages":[{"role":"user","content":"hi"}]}"#);
+        let req = parse(
+            r#"{"model":"m","system":"be terse","messages":[{"role":"user","content":"hi"}]}"#,
+        );
         let out = to_openai(&req);
         assert_eq!(out.messages[0].role, "system");
         assert_eq!(out.messages[1].role, "user");
@@ -191,12 +207,14 @@ mod tests {
 
     #[test]
     fn assistant_tool_use_becomes_tool_calls() {
-        let req = parse(r#"{"model":"m","messages":[
+        let req = parse(
+            r#"{"model":"m","messages":[
             {"role":"assistant","content":[
                 {"type":"text","text":"checking"},
                 {"type":"tool_use","id":"t1","name":"read","input":{"path":"a.txt"}}
             ]}
-        ]}"#);
+        ]}"#,
+        );
         let out = to_openai(&req);
         assert_eq!(out.messages.len(), 1);
         let msg = &out.messages[0];
@@ -209,27 +227,37 @@ mod tests {
 
     #[test]
     fn tool_result_becomes_separate_tool_message() {
-        let req = parse(r#"{"model":"m","messages":[
+        let req = parse(
+            r#"{"model":"m","messages":[
             {"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"t1","content":"file body"},
                 {"type":"text","text":"now what?"}
             ]}
-        ]}"#);
+        ]}"#,
+        );
         let out = to_openai(&req);
         // one tool message + one user message
         assert_eq!(out.messages.len(), 2);
         assert_eq!(out.messages[0].role, "tool");
         assert_eq!(out.messages[0].tool_call_id.as_deref(), Some("t1"));
-        assert_eq!(serde_json::to_value(&out.messages[0].content).unwrap(), json!("file body"));
+        assert_eq!(
+            serde_json::to_value(&out.messages[0].content).unwrap(),
+            json!("file body")
+        );
         assert_eq!(out.messages[1].role, "user");
-        assert_eq!(serde_json::to_value(&out.messages[1].content).unwrap(), json!("now what?"));
+        assert_eq!(
+            serde_json::to_value(&out.messages[1].content).unwrap(),
+            json!("now what?")
+        );
     }
 
     #[test]
     fn tools_and_tool_choice_translated() {
-        let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
+        let req = parse(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],
             "tools":[{"name":"read","description":"read a file","input_schema":{"type":"object"}}],
-            "tool_choice":{"type":"any"}}"#);
+            "tool_choice":{"type":"any"}}"#,
+        );
         let out = to_openai(&req);
         let tools = out.tools.as_ref().unwrap();
         assert_eq!(tools[0].kind, "function");
@@ -239,12 +267,14 @@ mod tests {
 
     #[test]
     fn image_block_becomes_image_url_part() {
-        let req = parse(r#"{"model":"m","messages":[
+        let req = parse(
+            r#"{"model":"m","messages":[
             {"role":"user","content":[
                 {"type":"text","text":"look"},
                 {"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
             ]}
-        ]}"#);
+        ]}"#,
+        );
         let out = to_openai(&req);
         assert_eq!(out.messages.len(), 1);
         let v = serde_json::to_value(&out.messages[0].content).unwrap();
@@ -255,7 +285,9 @@ mod tests {
 
     #[test]
     fn stop_sequences_mapped_to_stop() {
-        let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stop_sequences":["X"],"stream":true}"#);
+        let req = parse(
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stop_sequences":["X"],"stream":true}"#,
+        );
         let out = to_openai(&req);
         assert_eq!(out.stop, Some(vec!["X".to_string()]));
         assert_eq!(out.stream, Some(true));

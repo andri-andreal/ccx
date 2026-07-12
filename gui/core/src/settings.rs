@@ -38,7 +38,9 @@ mod tests {
     #[test]
     fn save_then_load_round_trips() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = GuiSettings { terminal_override: Some(vec!["alacritty".into(), "-e".into()]) };
+        let s = GuiSettings {
+            terminal_override: Some(vec!["alacritty".into(), "-e".into()]),
+        };
         save(tmp.path(), &s).unwrap();
         assert_eq!(load(tmp.path()), s);
     }
