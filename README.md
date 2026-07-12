@@ -1,49 +1,75 @@
-# ccx — Claude Code profile/provider switcher
+# ccx - Claude Code profile/provider switcher
 
 `ccx` launches the [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI under
 named profiles. Each profile points Claude Code at a provider + model setup via
-environment variables — no changes to Claude Code itself.
+environment variables, no changes to Claude Code itself.
 
 Switch between Anthropic-compatible providers (MiniMax, GLM, DeepSeek, Kimi, custom) and
-OpenAI-compatible backends (OpenAI, OpenRouter, Ollama, vLLM, LM Studio, Sakana) — the
-latter through a small Rust translator `ccx` builds for you — without ever mixing
+OpenAI-compatible backends (OpenAI, OpenRouter, Ollama, vLLM, LM Studio, Sakana), the
+latter through a small Rust translator `ccx` builds for you, without ever mixing
 credentials or history.
 
 ![ccx running Claude Code under four profiles at once, each answering "which model are you using?" with a different model](images/ccx.png)
 
 *One question, four providers: `ccx claude` (Opus 4.8), `ccx openrouter` (Qwen3-Coder),
-`ccx fugu` (Sakana Fugu), and `ccx glm` (GLM-5.2) — the same Claude Code, a different model
+`ccx fugu` (Sakana Fugu), and `ccx glm` (GLM-5.2), the same Claude Code, a different model
 behind each.*
 
 ## Features
 
-- **Named profiles** — one command per provider/model combo: `ccx glm`, `ccx claude`, …
-- **Isolated credentials** — third-party profiles each get their own `CLAUDE_CONFIG_DIR`,
+- **Named profiles** - one command per provider/model combo: `ccx glm`, `ccx claude`, …
+- **Isolated credentials** - third-party profiles each get their own `CLAUDE_CONFIG_DIR`,
   so logins and history never bleed into your Anthropic account.
-- **No patching** — Claude Code runs unmodified; everything is driven by env vars.
-- **Editable provider defaults** — endpoints and model IDs live in simple template files.
-- **Live model discovery** — the `ccx new` wizard fetches each provider's model list
+- **No patching** - Claude Code runs unmodified; everything is driven by env vars.
+- **Editable provider defaults** - endpoints and model IDs live in simple template files.
+- **Live model discovery** - the `ccx new` wizard fetches each provider's model list
   from its API (`/v1/models`) and offers a type-to-filter picker; falls back to typing.
-- **CLI + desktop GUI** — manage profiles from the terminal or a [Tauri](https://tauri.app) app.
+- **CLI + desktop GUI** - manage profiles from the terminal or a [Tauri](https://tauri.app) app.
 
 ## Supported providers
 
 **Anthropic-compatible** (direct, no router): `claude` (Anthropic) · `minimax` · `glm` · `deepseek` · `kimi` · `custom`
 
 **OpenAI-compatible** (via `ccx-router`, a small translator `ccx` builds and runs
-for you): `openai` · `openrouter` · `ollama` · `vllm` · `lmstudio` · `sakana` · `custom-oai`
-— see [OpenAI-compatible providers](#openai-compatible-providers-via-a-local-router).
+for you): `openai` · `openrouter` · `ollama` · `vllm` · `lmstudio` · `sakana` · `custom-oai`.
+See [OpenAI-compatible providers](#openai-compatible-providers-via-a-local-router).
 
 ## Prerequisites
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`
-  — `ccx` runs the `claude` binary (override with `CCX_CLAUDE_BIN`).
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH`.
+  `ccx` runs the `claude` binary (override with `CCX_CLAUDE_BIN`).
 - Bash (the `ccx` CLI is a Bash script).
 - For **OpenAI-compatible** providers only: Rust + cargo, to build the bundled
   `ccx-router` translator (`./install.sh` builds it; or
   `cargo build --release --manifest-path router/Cargo.toml`). Override the binary
   path with `CCX_ROUTER_BIN` if needed. Anthropic providers need none of this.
 - For the desktop GUI: Rust + cargo and Node + npm (see [`gui/README.md`](gui/README.md)).
+
+### Installing Rust
+
+If you don't have Rust installed, use [rustup](https://rustup.rs) (the official installer):
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Follow the on-screen prompts (the defaults are fine), then reload your shell:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+Verify the installation:
+
+```bash
+rustc --version
+cargo --version
+```
+
+> **Note:** Rust is only needed if you want to use OpenAI-compatible providers
+> (which require building `ccx-router`) or the desktop GUI. If you only use
+> Anthropic-compatible providers (`claude`, `minimax`, `glm`, `deepseek`, `kimi`),
+> Rust is not required.
 
 ## Install
 
@@ -73,7 +99,7 @@ ccx rm <name>                # remove a profile  (aliases: remove, delete)
   (`~/.config/ccx/profiles/<name>/home`), so credentials and history never mix.
 - The `claude` profile uses your normal Anthropic login and `~/.claude`
   (plugins/skills intact) and defaults to `ANTHROPIC_MODEL=opusplan`.
-- Provider defaults are in `~/.config/ccx/providers/*.tmpl` — edit them to update
+- Provider defaults are in `~/.config/ccx/providers/*.tmpl`. Edit them to update
   endpoints or model IDs (these can change over time).
 
 ## Desktop GUI
@@ -97,16 +123,16 @@ bash tests/test_ccx.sh
 
 Claude Code speaks the Anthropic Messages API (`/v1/messages`). Providers that
 **only** offer the OpenAI Chat Completions format (OpenAI, OpenRouter, and local
-servers like Ollama / vLLM / LM Studio) can't be used directly — so for these
+servers like Ollama / vLLM / LM Studio) can't be used directly, so for these
 `ccx` runs **`ccx-router`**, a small translator bundled in this repo
 ([`router/`](router)), that converts Anthropic ⇄ OpenAI (streaming and tool
-calls included). It's a single Rust binary `ccx` builds and owns — no external
+calls included). It's a single Rust binary `ccx` builds and owns, no external
 service. On launch `ccx` picks a free port, starts `ccx-router` against your
 upstream, points Claude Code at it, and kills it on exit.
 
 ```bash
 # Interactive: `ccx new` walks you through it (prompts for the model, upstream
-# URL, and API key — templates pre-fill sensible defaults). Or use flags:
+# URL, and API key. Templates pre-fill sensible defaults. Or use flags:
 
 # Local model with Ollama (no API key needed):
 ccx new --provider ollama --name local --model qwen2.5-coder:32b
@@ -130,7 +156,7 @@ every slot and `--opus` / `--sonnet` / `--haiku` override individual slots (so
 
 ### Known gaps
 
-- **The model must support tool use.** Text-only models fail — Claude Code's
+- **The model must support tool use.** Text-only models fail. Claude Code's
   edits, git, and bash all go through tool calls. Pick a tool-capable model
   (e.g. `qwen2.5-coder` for local).
 - **No prompt caching**, and usage reporting is best-effort (token counts are an
@@ -143,9 +169,9 @@ every slot and `--opus` / `--sonnet` / `--haiku` override individual slots (so
 
 ### OpenAI-compatible providers via a local translator
 
-Shipped — see [OpenAI-compatible providers](#openai-compatible-providers-via-a-local-router):
+Shipped. See [OpenAI-compatible providers](#openai-compatible-providers-via-a-local-router):
 
-- [x] Self-built translator `ccx-router` (Rust, single binary) — no third-party
+- [x] Self-built translator `ccx-router` (Rust, single binary), no third-party
       running service. Translates Anthropic ⇄ OpenAI: requests, non-streaming and
       streaming responses, and tool-call round-trips (with correct interleaved
       text/tool_use block handling).
