@@ -13,7 +13,31 @@
     "windows": [
       { "label": "main", "title": "ccx", "width": 900, "height": 640 }
     ],
-    "security": { "csp": null }
+    "security": {
+      "csp": {
+        "default-src": "'self'",
+        "connect-src": "ipc: http://ipc.localhost",
+        "font-src": "'self'",
+        "img-src": "'self' data:",
+        "style-src": "'self'",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self' http://localhost:5173",
+        "connect-src": "ipc: http://ipc.localhost http://localhost:5173 ws://localhost:5173",
+        "font-src": "'self' http://localhost:5173",
+        "img-src": "'self' data: http://localhost:5173",
+        "script-src": "'self' 'unsafe-eval' http://localhost:5173",
+        "style-src": "'self' 'unsafe-inline' http://localhost:5173",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "form-action": "'none'",
+        "frame-ancestors": "'none'"
+      }
+    }
   },
   "bundle": {
     "active": true,

@@ -9,6 +9,7 @@ use serde_json::Value;
 // ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MessagesRequest {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -19,6 +20,13 @@ pub struct MessagesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// OpenAI Chat Completions has no portable equivalent. It is accepted by
+    /// serde so that validation can return a useful error instead of silently
+    /// discarding it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
@@ -26,6 +34,19 @@ pub struct MessagesRequest {
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<AnthropicToolChoice>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<AnthropicMetadata>,
+    /// Extended-thinking blocks cannot be represented losslessly by the
+    /// generic Chat Completions protocol. See request validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnthropicMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -36,21 +57,27 @@ pub enum StringOrBlocks {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnthropicMessage {
     pub role: String,
     pub content: StringOrBlocks,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     ToolUse {
         id: String,
         name: String,
         input: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     ToolResult {
         tool_use_id: String,
@@ -58,13 +85,18 @@ pub enum ContentBlock {
         content: Option<StringOrBlocks>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
     Image {
         source: ImageSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<Value>,
     },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub kind: String, // "base64"
@@ -73,19 +105,36 @@ pub struct ImageSource {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AnthropicTool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AnthropicToolChoice {
-    Auto,
-    Any,
-    Tool { name: String },
+    Auto {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Any {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    Tool {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        disable_parallel_tool_use: Option<bool>,
+    },
+    None,
 }
 
 /// Anthropic response we send back to Claude Code (non-streaming).
@@ -112,6 +161,21 @@ pub struct AnthropicUsage {
 // OpenAI (what we send upstream / receive back)
 // ----------------------------------------------------------------------------
 
+/// OpenRouter routing controls, sent as the `provider` object on a Chat
+/// Completions body. Configured per upstream, so a pinned OpenRouter endpoint
+/// and a plain Ollama fallback in the same chain never see each other's
+/// settings. Every field is optional and skipped when unset, so an unpinned
+/// upstream produces exactly the body shape it produced before this existed.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderPinning {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub only: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_parameters: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChatRequest {
     pub model: String,
@@ -121,13 +185,30 @@ pub struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<OpenAiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Set by the server per upstream, never by request translation, so an
+    /// unpinned upstream sends the exact body shape it always has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderPinning>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -187,6 +268,8 @@ pub struct OpenAiFunction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 // --- OpenAI responses (non-streaming) ---
@@ -295,7 +378,10 @@ mod tests {
         let req: MessagesRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.model, "qwen2.5-coder:32b");
         assert_eq!(req.messages.len(), 3);
-        assert!(matches!(req.tool_choice, Some(AnthropicToolChoice::Auto)));
+        assert!(matches!(
+            req.tool_choice,
+            Some(AnthropicToolChoice::Auto { .. })
+        ));
         match &req.messages[1].content {
             StringOrBlocks::Blocks(b) => assert_eq!(b.len(), 2),
             _ => panic!("expected blocks"),

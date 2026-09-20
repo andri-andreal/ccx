@@ -15,6 +15,12 @@ out="$("$CCX" help 2>&1)"; rc=$?
 assert_exit "$rc" 0 "help exits 0"
 assert_contains "$out" "Usage: ccx" "help shows usage"
 assert_contains "$out" "new" "help lists new"
+assert_contains "$out" "doctor" "help lists doctor"
+assert_contains "$out" "certify" "help lists certify"
+
+out="$("$CCX" new --help 2>&1)"; rc=$?
+assert_exit "$rc" 0 "new help exits 0"
+assert_contains "$out" "--token-stdin" "new help documents secret-safe stdin"
 
 out="$("$CCX" 2>&1)"; rc=$?
 assert_exit "$rc" 0 "no-arg shows help"
@@ -43,6 +49,12 @@ assert_contains "$(cat "$gpenv")" "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthr
 assert_contains "$(cat "$gpenv")" "ANTHROPIC_AUTH_TOKEN=sk-test-123456789" "glm token written"
 assert_contains "$(cat "$gpenv")" "CCX_ISOLATE=true" "glm isolated by default"
 assert_mode "$CCX_HOME/profiles/myglm/home" 700 "glm home dir is 700"
+
+printf '%s\n' 'stdin-secret-123456789' | \
+  "$CCX" new --name stdin-key --provider minimax --model MiniMax-M3 --token-stdin --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "new accepts token from stdin"
+assert_contains "$(cat "$CCX_HOME/profiles/stdin-key/profile.env")" \
+  "ANTHROPIC_AUTH_TOKEN=stdin-secret-123456789" "stdin token is stored"
 
 # duplicate name rejected
 "$CCX" new --name myglm --provider glm --token x --yes >/dev/null 2>&1; rc=$?
@@ -125,7 +137,8 @@ assert_contains "$out" "warning" "warns on loose permissions"
 
 # --- Task 10: install ---
 FAKE_HOME="$(mktemp -d)"
-out="$(HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" bash "$REPO/install.sh" 2>&1)"; rc=$?
+out="$(HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" CCX_HOME="$FAKE_HOME/.config/ccx" \
+  CCX_ROUTER_INSTALL=skip bash "$REPO/install.sh" 2>&1)"; rc=$?
 assert_exit "$rc" 0 "install exits 0"
 assert_eq "$([ -L "$FAKE_HOME/.local/bin/ccx" ] && echo y || echo n)" "y" "ccx symlinked into ~/.local/bin"
 assert_eq "$([ -f "$FAKE_HOME/.config/ccx/providers/glm.tmpl" ] && echo y || echo n)" "y" "templates copied"
@@ -209,6 +222,50 @@ assert_contains "$(cat "$orr")" "CCX_UPSTREAM_BASE_URL=https://openrouter.ai/api
 assert_contains "$(cat "$orr")" "CCX_UPSTREAM_API_KEY=sk-or-abc123456789" "openrouter key written"
 assert_contains "$(cat "$orr")" "ANTHROPIC_MODEL=qwen/qwen3-coder" "openrouter model recorded"
 
+# Ordered fallback policy is stored with the profile; secrets remain maskable.
+"$CCX" new --name fb --provider openrouter --model qwen/qwen3-coder \
+  --upstream-key sk-primary-123456789 \
+  --fallback-url https://fallback.example/v1 \
+  --fallback-key sk-fallback-987654321 \
+  --router-attempts 2 --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "new router profile with fallback exits 0"
+fb="$CCX_HOME/profiles/fb/profile.env"
+assert_contains "$(cat "$fb")" "CCX_ROUTER_FALLBACK_URLS=https://fallback.example/v1" "fallback URL stored"
+assert_contains "$(cat "$fb")" "CCX_ROUTER_FALLBACK_KEYS=sk-fallback-987654321" "fallback key stored"
+assert_contains "$(cat "$fb")" "CCX_ROUTER_ATTEMPTS_PER_UPSTREAM=2" "router attempt policy stored"
+
+# Empty positional key entries remain aligned instead of shifting a later key
+# onto the wrong fallback origin.
+"$CCX" new --name fbpos --provider openrouter --model qwen/qwen3-coder \
+  --upstream-key primary-secret \
+  --fallback-url https://first.example/v1 \
+  --fallback-url https://second.example/v1 \
+  --fallback-key "" --fallback-key second-secret --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "fallback keys preserve an empty first position"
+fbpos="$CCX_HOME/profiles/fbpos/profile.env"
+assert_contains "$(cat "$fbpos")" "CCX_ROUTER_FALLBACK_KEYS=,second-secret" "fallback key positions stay aligned"
+
+"$CCX" new --name bad-fallback --provider claude --fallback-url https://fallback.example/v1 --yes >/dev/null 2>&1
+assert_exit "$?" 1 "direct provider rejects router fallback options"
+"$CCX" new --name bad-attempts --provider openrouter --router-attempts 0 --yes >/dev/null 2>&1
+assert_exit "$?" 1 "router attempts must be in the supported range"
+"$CCX" new --name bad-http --provider custom-oai --model m \
+  --upstream-url http://api.example.com/v1 --upstream-key secret --yes >/dev/null 2>&1
+assert_exit "$?" 1 "new rejects credentialed remote HTTP upstreams"
+"$CCX" new --name bad-http-fallback --provider openrouter --model m \
+  --fallback-url http://backup.example.com/v1 --yes >/dev/null 2>&1
+assert_exit "$?" 1 "new rejects remote HTTP fallbacks"
+"$CCX" new --name bad-authority --provider custom-oai --model m \
+  --upstream-url 'https://:bogus' --upstream-key secret --yes >/dev/null 2>&1
+assert_exit "$?" 1 "new rejects a malformed endpoint authority"
+"$CCX" new --name bad-port --provider custom-oai --model m \
+  --upstream-url 'http://127.0.0.1:notaport' --yes >/dev/null 2>&1
+assert_exit "$?" 1 "new rejects a malformed loopback port"
+"$CCX" new --name injected --provider claude \
+  --model $'safe\nNODE_OPTIONS=--require=/tmp/evil.js' --yes >/dev/null 2>&1
+assert_exit "$?" 1 "new rejects multiline environment injection"
+assert_eq "$([ -e "$CCX_HOME/profiles/injected" ] && printf created || printf absent)" "absent" "rejected profile is not written"
+
 # per-slot override via --opus keeps the rest on the single model
 "$CCX" new --name lq2 --provider ollama --model base-model --opus big-model --yes >/dev/null 2>&1; rc=$?
 assert_exit "$rc" 0 "new ollama with --opus exits 0"
@@ -237,6 +294,54 @@ c1="$CCX_HOME/profiles/c1/profile.env"
 assert_contains "$(cat "$c1")" "CCX_UPSTREAM_BASE_URL=https://api.example.com/v1" "typed upstream url"
 assert_contains "$(cat "$c1")" "ANTHROPIC_MODEL=gpt-4o" "typed model"
 assert_contains "$(cat "$c1")" "ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-4o" "typed model fills slots"
+
+# --- OAI Task 3b: OpenRouter provider pinning (positional, per upstream) ---
+"$CCX" new --name pin --provider openrouter --model qwen/qwen3-coder \
+  --upstream-key sk-primary-123456789 \
+  --provider-only groq,fireworks --provider-order groq,fireworks --require-parameters \
+  --fallback-url https://openrouter.ai/api/v1 \
+  --fallback-provider-only together --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "new with provider pinning exits 0"
+pin="$CCX_HOME/profiles/pin/profile.env"
+assert_contains "$(cat "$pin")" "CCX_ROUTER_PROVIDER_ONLY=groq,fireworks;together" "pinning only is positional across upstreams"
+assert_contains "$(cat "$pin")" "CCX_ROUTER_PROVIDER_ORDER=groq,fireworks" "pinning order stored for the primary"
+assert_contains "$(cat "$pin")" "CCX_ROUTER_REQUIRE_PARAMETERS=1" "require-parameters stored for the primary"
+
+# Pinning only a fallback must leave the primary position empty, not shift.
+"$CCX" new --name pinfb --provider openrouter --model qwen/qwen3-coder \
+  --upstream-key sk-primary-123456789 \
+  --fallback-url https://fallback.example/v1 \
+  --fallback-provider-only together --fallback-require-parameters 1 --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "new pinning only a fallback exits 0"
+pinfb="$CCX_HOME/profiles/pinfb/profile.env"
+assert_contains "$(cat "$pinfb")" "CCX_ROUTER_PROVIDER_ONLY=;together" "empty primary position is preserved"
+assert_contains "$(cat "$pinfb")" "CCX_ROUTER_REQUIRE_PARAMETERS=;1" "require-parameters aligns to the fallback"
+
+# An unpinned router profile must not gain any of the new keys.
+assert_not_contains "$(cat "$CCX_HOME/profiles/lq/profile.env")" "CCX_ROUTER_PROVIDER_ONLY" "unpinned profile has no pinning keys"
+assert_not_contains "$(cat "$CCX_HOME/profiles/lq/profile.env")" "CCX_ROUTER_REQUIRE_PARAMETERS" "unpinned profile has no require-parameters key"
+
+out="$("$CCX" new --name pinbad --provider openrouter --model m --upstream-key k \
+  --provider-only 'groq;together' --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "a semicolon inside a pinning value is rejected"
+assert_contains "$out" "cannot contain semicolons" "semicolon rejection explains itself"
+
+out="$("$CCX" new --name pinbad2 --provider openrouter --model m --upstream-key k \
+  --provider-only 'bad slug' --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "an invalid provider slug is rejected"
+assert_contains "$out" "provider slug" "slug rejection explains itself"
+
+out="$("$CCX" new --name pinbad3 --provider openrouter --model m --upstream-key k \
+  --fallback-provider-only together --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "fallback pinning without a fallback URL is rejected"
+
+out="$("$CCX" new --name pinbad4 --provider ollama --model m \
+  --provider-only groq --yes 2>&1)"; rc=$?
+assert_exit "$rc" 0 "pinning a non-OpenRouter router profile is allowed (proxies are legitimate)"
+
+out="$("$CCX" new --name pinbad5 --provider glm --token sk-test-123456789 \
+  --provider-only groq --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "pinning a direct provider is rejected"
 
 # --- OAI Task 4: free-port picker + apikey generator ---
 p="$("$CCX" __freeport 2>&1)"; rc=$?
@@ -267,6 +372,22 @@ assert_contains "$out" "exec: true -p hello" "router dry-run forwards claude arg
 out2="$(CCX_DRY_RUN=1 "$CCX" orr 2>&1)"
 assert_not_contains "$out2" "sk-or-abc123456789" "upstream key masked in dry-run"
 assert_contains "$out2" "CCX_ROUTER_UPSTREAM_KEY=sk-…6789" "dry-run shows masked upstream key env"
+out3="$(CCX_DRY_RUN=1 "$CCX" fb 2>&1)"
+assert_contains "$out3" "CCX_ROUTER_FALLBACK_URLS=https://fallback.example/v1" "dry-run shows ordered fallback"
+assert_contains "$out3" "CCX_ROUTER_ATTEMPTS_PER_UPSTREAM=2" "dry-run shows retry policy"
+assert_contains "$out3" "CCX_ROUTER_FALLBACK_KEYS=(configured, hidden)" "dry-run reports hidden fallback keys"
+out4="$(CCX_DRY_RUN=1 "$CCX" pin 2>&1)"
+assert_contains "$out4" "CCX_ROUTER_PROVIDER_ONLY=groq,fireworks;together" "dry-run shows provider pinning"
+assert_contains "$out4" "CCX_ROUTER_REQUIRE_PARAMETERS=1" "dry-run shows require-parameters"
+assert_not_contains "$(CCX_DRY_RUN=1 "$CCX" lq 2>&1)" "CCX_ROUTER_PROVIDER_ONLY" "dry-run omits pinning when unset"
+# A hand-edited profile is re-validated at launch, not trusted because it is
+# already on disk: more positions than upstreams must not reach the router.
+"$CCX" new --name pinedit --provider openrouter --model m --upstream-key sk-edit-123456789 --yes >/dev/null 2>&1
+printf 'CCX_ROUTER_PROVIDER_ONLY=groq;together\n' >> "$CCX_HOME/profiles/pinedit/profile.env"
+out5="$(CCX_DRY_RUN=1 "$CCX" pinedit 2>&1)"; rc=$?
+assert_exit "$rc" 1 "hand-edited over-long pinning is rejected at launch"
+assert_contains "$out5" "more positions (2) than configured upstreams (1)" "launch rejection names the mismatch"
+assert_not_contains "$out3" "sk-fallback-987654321" "dry-run hides raw fallback key"
 
 # --- OAI Task 6: live router lifecycle (start, health-check, teardown) ---
 if command -v python3 >/dev/null 2>&1; then
@@ -274,6 +395,19 @@ if command -v python3 >/dev/null 2>&1; then
   out="$(CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" CCX_ROUTER_TIMEOUT=8 "$CCX" lq -p hi 2>&1)"; rc=$?
   assert_exit "$rc" 0 "router live run exits 0"
   assert_contains "$out" "router ready on http://127.0.0.1:" "announces router readiness"
+  assert_contains "$out" "router.log" "launch reports the redacted router log path"
+  assert_mode "$CCX_HOME/profiles/lq/router.log" 600 "router log is private"
+  "$CCX" logs lq --lines 10 >/dev/null 2>&1; rc=$?
+  assert_exit "$rc" 0 "logs reads the latest router session"
+  mv "$CCX_HOME/profiles/lq/router.log" "$CCX_HOME/profiles/lq/router.log.previous"
+  printf 'must-survive\n' > "$CCX_HOME/log-target"
+  ln -s "$CCX_HOME/log-target" "$CCX_HOME/profiles/lq/router.log"
+  "$CCX" logs lq >/dev/null 2>&1; rc=$?
+  assert_exit "$rc" 1 "logs refuses a symlink"
+  CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" CCX_ROUTER_TIMEOUT=8 "$CCX" lq -p hi >/dev/null 2>&1; rc=$?
+  assert_exit "$rc" 0 "router launch safely replaces a log symlink"
+  assert_eq "$(cat "$CCX_HOME/log-target")" "must-survive" "router log symlink target is not truncated"
+  assert_eq "$([ -L "$CCX_HOME/profiles/lq/router.log" ] && printf symlink || printf regular)" "regular" "new router log is a regular file"
   # router torn down: the port it used is no longer accepting connections
   lport="$(printf '%s' "$out" | grep -o '127.0.0.1:[0-9]*' | head -1 | grep -o '[0-9]*$')"
   TESTS_RUN=$((TESTS_RUN + 1))
@@ -301,6 +435,9 @@ assert_exit "$rc" 0 "show router exits 0"
 assert_contains "$out" "CCX_UPSTREAM_BASE_URL=https://openrouter.ai" "show prints upstream url"
 assert_contains "$out" "CCX_UPSTREAM_API_KEY=sk-…6789" "upstream key masked in show"
 assert_not_contains "$out" "sk-or-abc123456789" "raw upstream key hidden"
+out="$("$CCX" show fb 2>&1)"; rc=$?
+assert_exit "$rc" 0 "show fallback profile exits 0"
+assert_not_contains "$out" "sk-fallback-987654321" "show hides raw fallback keys"
 
 # --- Safety: profile-name validation rejects traversal/odd names on every command ---
 for bad in "../evil" "a/b" "." ".." "with space" "semi;colon"; do
@@ -311,10 +448,207 @@ for bad in "../evil" "a/b" "." ".." "with space" "semi;colon"; do
 done
 out="$("$CCX" show "../../etc/passwd" 2>&1)"; assert_contains "$out" "invalid profile name" "show gives a clear error for a bad name"
 
+# Existing/manual files must not bypass the strict launch boundary.
+mkdir -p "$CCX_HOME/profiles/duplicate" "$CCX_HOME/profiles/unknown-env"
+cat > "$CCX_HOME/profiles/duplicate/profile.env" <<'EOF'
+CCX_PROVIDER=claude
+CCX_ISOLATE=false
+ANTHROPIC_MODEL=first
+ANTHROPIC_MODEL=second
+EOF
+cat > "$CCX_HOME/profiles/unknown-env/profile.env" <<'EOF'
+CCX_PROVIDER=claude
+CCX_ISOLATE=false
+ANTHROPIC_MODEL=opusplan
+NODE_OPTIONS=--require=/tmp/evil.js
+EOF
+chmod 600 "$CCX_HOME/profiles/duplicate/profile.env" "$CCX_HOME/profiles/unknown-env/profile.env"
+CCX_DRY_RUN=1 "$CCX" duplicate >/dev/null 2>&1; assert_exit "$?" 1 "launch rejects duplicate profile keys"
+CCX_DRY_RUN=1 "$CCX" unknown-env >/dev/null 2>&1; assert_exit "$?" 1 "launch refuses non-Anthropic environment injection"
+CCX_ROUTER_FALLBACK_URLS=http://backup.example.com/v1 CCX_DRY_RUN=1 "$CCX" fb >/dev/null 2>&1
+assert_exit "$?" 1 "launch validates effective fallback environment overrides"
+
 # --- ccx --version ---
 out="$("$CCX" --version 2>&1)"; rc=$?
 assert_exit "$rc" 0 "--version exits 0"
 assert_contains "$out" "ccx 0.1.0" "--version prints ccx version"
 assert_contains "$out" "claude:" "--version reports claude detection"
+
+# --- Diagnostics: doctor is read-only, structured, and secret-safe ---
+out="$("$CCX" doctor mm2 --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor JSON exits 0 when required checks pass"
+assert_contains "$out" '"schema_version":1' "doctor JSON has schema version"
+assert_contains "$out" '"command":"doctor"' "doctor JSON identifies command"
+assert_contains "$out" '"profile":"mm2"' "doctor JSON identifies profile"
+assert_contains "$out" '"summary":{' "doctor JSON includes summary"
+assert_contains "$out" '"checks":[' "doctor JSON includes checks"
+assert_contains "$out" '"capabilities":{' "doctor JSON includes capabilities"
+assert_contains "$out" '"id":"profile.credential"' "doctor checks configured credential"
+assert_contains "$out" '"status":"pass"' "doctor emits stable statuses"
+assert_not_contains "$out" "sk-mm-000011112222" "doctor JSON never prints credential"
+
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema_version"] == 1; assert isinstance(d["checks"], list)' >/dev/null 2>&1
+  assert_exit "$?" 0 "doctor output is valid JSON"
+fi
+
+# Provider pinning is reported, and pinning a host that is not OpenRouter is a
+# warning rather than a failure: a reverse proxy in front of it is legitimate.
+out="$("$CCX" doctor pin --json --no-network 2>&1)"
+assert_contains "$out" '"id":"router.provider_pinning"' "doctor reports provider pinning"
+assert_contains "$out" 'groq,fireworks;together' "doctor names the configured pinning"
+out="$("$CCX" doctor lq --json --no-network 2>&1)"
+assert_contains "$out" '"id":"router.provider_pinning"' "doctor reports pinning even when unset"
+assert_contains "$out" 'No provider pinning is configured' "doctor states when pinning is absent"
+"$CCX" new --name pinproxy --provider custom-oai --model m \
+  --upstream-url https://proxy.example/v1 --upstream-key sk-proxy-123456789 \
+  --provider-only groq --yes >/dev/null 2>&1
+out="$("$CCX" doctor pinproxy --json --no-network 2>&1)"
+assert_contains "$out" '"status":"warn"' "pinning a non-OpenRouter upstream warns"
+
+out="$("$CCX" doctor mm2 --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor human output exits 0"
+assert_contains "$out" "CCX doctor: mm2" "doctor human output has heading"
+assert_contains "$out" "File permissions" "doctor human output labels checks"
+assert_contains "$out" "Summary:" "doctor human output has summary"
+assert_not_contains "$out" "sk-mm-000011112222" "doctor human output never prints credential"
+
+# A required security failure returns non-zero but still produces JSON.
+out="$("$CCX" doctor loose --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 1 "doctor fails loose profile permissions"
+assert_contains "$out" '"id":"profile.permissions"' "doctor reports permission check"
+assert_contains "$out" '"status":"fail"' "doctor JSON reports overall failure"
+assert_not_contains "$out" "sk-loose-000011112222" "failed doctor report hides credential"
+
+out="$("$CCX" doctor '../bad' --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 1 "doctor rejects traversal name"
+assert_contains "$out" '"id":"profile.name"' "doctor reports invalid name without reading it"
+
+# Remote plaintext HTTP is rejected without contacting it or echoing its URL.
+mkdir -p "$CCX_HOME/profiles/insecure"
+cat > "$CCX_HOME/profiles/insecure/profile.env" <<'EOF'
+CCX_PROVIDER=custom
+CCX_ISOLATE=false
+ANTHROPIC_BASE_URL=http://127.evil.example/secret-path
+ANTHROPIC_AUTH_TOKEN=doctor-secret-value
+ANTHROPIC_MODEL=test-model
+EOF
+chmod 600 "$CCX_HOME/profiles/insecure/profile.env"
+out="$("$CCX" doctor insecure --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 1 "doctor rejects non-loopback plaintext HTTP"
+assert_contains "$out" "Remote endpoints must use HTTPS" "doctor explains HTTPS requirement"
+assert_not_contains "$out" "127.evil.example" "doctor does not echo configured endpoint"
+assert_not_contains "$out" "doctor-secret-value" "doctor does not echo rejected credential"
+
+mkdir -p "$CCX_HOME/profiles/bad-fallback-list"
+cat > "$CCX_HOME/profiles/bad-fallback-list/profile.env" <<'EOF'
+CCX_PROVIDER=openrouter
+CCX_ISOLATE=true
+CCX_ROUTER=builtin
+CCX_UPSTREAM_BASE_URL=https://openrouter.ai/api/v1
+CCX_UPSTREAM_API_KEY=hidden-primary-key
+CCX_ROUTER_FALLBACK_URLS=https://fallback.example/v1,
+ANTHROPIC_MODEL=test-model
+EOF
+chmod 600 "$CCX_HOME/profiles/bad-fallback-list/profile.env"
+out="$(CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" doctor bad-fallback-list --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 1 "doctor rejects a trailing empty fallback URL"
+assert_contains "$out" '"id":"router.fallbacks"' "doctor reports the invalid fallback list"
+assert_not_contains "$out" "fallback.example" "invalid fallback report keeps endpoints redacted"
+
+# Fake curl provides deterministic, zero-cost model and capability responses.
+# It records argv so the test also proves credentials are passed through a
+# private header file rather than exposed on the process command line.
+fake_curl="$CCX_HOME/fake-curl"
+cat > "$fake_curl" <<'EOS'
+#!/usr/bin/env bash
+set -u
+orig="$*"; output=""; data=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    --proto | --connect-timeout | --max-time | --request | --write-out | --header) shift 2 ;;
+    --silent) shift ;;
+    *) shift ;;
+  esac
+done
+[ -z "${FAKE_CURL_LOG:-}" ] || printf '%s\n' "$orig" >> "$FAKE_CURL_LOG"
+case "${FAKE_CURL_RESPONSE:-auto}" in
+  stream-error) body='data: {"error":{"message":"upstream failed"}}
+
+data: [DONE]' ;;
+  echoed-tool) body='{"choices":[{"message":{"content":"ccx_probe"}}]}' ;;
+  empty-basic) body='{"choices":[]}' ;;
+  *) case "$data" in
+  *'"stream":true'*) body='data: {"choices":[{"delta":{"content":"O"}}]}
+
+data: [DONE]' ;;
+  *ccx_probe*) body='{"choices":[{"message":{"tool_calls":[{"function":{"name":"ccx_probe","arguments":"{}"}}]}}]}' ;;
+  '') body='{"data":[{"id":"test-model"}]}' ;;
+  *) body='{"choices":[{"message":{"content":"OK"}}]}' ;;
+  esac ;;
+esac
+printf '%s' "$body" > "$output"
+printf '200'
+EOS
+chmod +x "$fake_curl" "$HERE/fake_ccx_router.sh"
+curl_log="$CCX_HOME/fake-curl.log"
+
+out="$(CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" doctor fb --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor accepts valid ordered fallback policy"
+assert_contains "$out" '"id":"router.fallbacks"' "doctor reports fallback configuration"
+assert_contains "$out" '1 fallback endpoint(s)' "doctor reports fallback count without URL"
+assert_contains "$out" '"id":"router.retry_policy"' "doctor reports retry policy"
+assert_not_contains "$out" "fallback.example" "doctor does not disclose fallback endpoints"
+assert_not_contains "$out" "sk-fallback-987654321" "doctor does not disclose fallback credentials"
+out="$(CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" doctor fbpos --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor accepts empty positional fallback credentials"
+assert_contains "$out" '2 positional fallback credential slot(s)' "doctor describes fallback slots accurately"
+
+out="$(FAKE_CURL_LOG="$curl_log" CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" doctor orr --json 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor authenticated endpoint probe exits 0"
+assert_contains "$out" '"id":"endpoint.reachable"' "doctor reports endpoint reachability"
+assert_contains "$out" "authenticated model-list request" "doctor performs non-billed model-list probe"
+assert_not_contains "$out" "sk-or-abc123456789" "network doctor output hides upstream key"
+assert_not_contains "$(cat "$curl_log")" "sk-or-abc123456789" "network doctor keeps key out of curl argv"
+
+# JSON mode never prompts or probes without explicit consent.
+: > "$curl_log"
+out="$(FAKE_CURL_LOG="$curl_log" CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" certify orr --json 2>&1)"; rc=$?
+assert_exit "$rc" 1 "certify JSON requires --yes"
+assert_contains "$out" '"id":"certify.consent"' "certify reports missing consent"
+assert_contains "$out" '"capabilities":{"basic":"skip"' "certify marks unrun capabilities skipped"
+assert_eq "$([ -s "$curl_log" ] && printf called || printf untouched)" "untouched" "certify makes no request before consent"
+assert_not_contains "$out" "sk-or-abc123456789" "certify consent report hides upstream key"
+
+: > "$curl_log"
+out="$(FAKE_CURL_LOG="$curl_log" CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" "$CCX" certify orr --json --yes 2>&1)"; rc=$?
+assert_exit "$rc" 0 "certify authorized probes exit 0"
+assert_contains "$out" '"command":"certify"' "certify JSON identifies command"
+assert_contains "$out" '"status":"pass"' "certify passes recognized probe responses"
+assert_contains "$out" '"capabilities":{"basic":"pass","streaming":"pass","tools":"pass"}' "certify reports capability badges"
+assert_contains "$out" "OpenAI-compatible upstream" "certify states router-profile probe scope"
+assert_not_contains "$out" "sk-or-abc123456789" "certify output hides upstream key"
+assert_not_contains "$(cat "$curl_log")" "sk-or-abc123456789" "certify keeps key out of curl argv"
+assert_eq "$(wc -l < "$curl_log" | tr -d ' ')" 3 "certify uses exactly three minimal requests"
+cert_out="$out"
+
+out="$(FAKE_CURL_RESPONSE=stream-error CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" \
+  "$CCX" certify orr --checks streaming --json --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "selected streaming check fails on an SSE error event"
+assert_contains "$out" '"streaming":"fail"' "SSE error is not misclassified as compatible"
+out="$(FAKE_CURL_RESPONSE=echoed-tool CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" \
+  "$CCX" certify orr --checks tools --json --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "selected tool check requires a structured tool call"
+assert_contains "$out" '"tools":"fail"' "plain echoed tool name is not accepted"
+out="$(FAKE_CURL_RESPONSE=empty-basic CCX_CURL_BIN="$fake_curl" CCX_ROUTER_BIN="$HERE/fake_ccx_router.sh" \
+  "$CCX" certify orr --checks basic --json --yes 2>&1)"; rc=$?
+assert_exit "$rc" 1 "basic certification rejects empty choices"
+
+if command -v python3 >/dev/null 2>&1; then
+  printf '%s' "$cert_out" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["capabilities"]["tools"] == "pass"' >/dev/null 2>&1
+  assert_exit "$?" 0 "certify output is valid JSON"
+fi
 
 finish

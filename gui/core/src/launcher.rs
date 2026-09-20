@@ -4,6 +4,19 @@ use std::process::Command;
 use crate::config;
 use crate::profile::Profile;
 
+#[cfg(unix)]
+fn set_private_dir_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn set_private_dir_permissions(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TerminalSpec {
     pub bin: String,
@@ -89,25 +102,20 @@ pub fn copy_command(p: &Profile) -> String {
     format!("ccx {}", p.name)
 }
 
-// What to run inside the terminal. Router profiles need the full ccr lifecycle
-// (start, health-check, teardown), which only the `ccx` CLI implements — so we
-// launch `ccx <name>` rather than `claude` with a hand-built env.
+// Always delegate profile parsing, validation, environment setup, and router
+// lifecycle to the CLI. This keeps secrets out of the GUI/terminal process
+// arguments and gives direct and routed profiles one security boundary.
 pub fn child_command(p: &Profile) -> Vec<String> {
-    if p.is_router() {
-        vec!["ccx".to_string(), p.name.clone()]
-    } else {
-        vec!["claude".to_string()]
-    }
+    vec!["ccx".to_string(), p.name.clone()]
 }
 
 pub fn launch(p: &Profile, home: &Path, term_override: Option<Vec<String>>) -> Result<(), String> {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
 
     if p.isolate {
         let h = config::profile_dir(home, &p.name).join("home");
         fs::create_dir_all(&h).map_err(|e| e.to_string())?;
-        fs::set_permissions(&h, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        set_private_dir_permissions(&h)?;
     }
 
     let (bin, args): (String, Vec<String>) = match term_override {
@@ -121,13 +129,6 @@ pub fn launch(p: &Profile, home: &Path, term_override: Option<Vec<String>>) -> R
 
     let mut cmd = Command::new(&bin);
     cmd.args(&args).args(child_command(p));
-    // Router profiles delegate to `ccx <name>`, which sets the env itself; only
-    // the direct-claude path needs the hand-built env.
-    if !p.is_router() {
-        for (k, v) in build_env(p, home) {
-            cmd.env(k, v);
-        }
-    }
     cmd.spawn().map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -194,8 +195,11 @@ mod tests {
     }
 
     #[test]
-    fn child_command_for_anthropic_is_claude() {
-        assert_eq!(child_command(&prof(false)), vec!["claude".to_string()]);
+    fn child_command_for_anthropic_delegates_to_ccx() {
+        assert_eq!(
+            child_command(&prof(false)),
+            vec!["ccx".to_string(), "mm".to_string()]
+        );
     }
 
     #[test]

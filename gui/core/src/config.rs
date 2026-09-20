@@ -7,7 +7,12 @@ pub fn ccx_home_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
     if let Some(x) = get("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
         return PathBuf::from(x).join("ccx");
     }
-    let home = get("HOME").unwrap_or_default();
+    if let Some(appdata) = get("APPDATA").filter(|s| !s.is_empty()) {
+        return PathBuf::from(appdata).join("ccx");
+    }
+    let home = get("HOME")
+        .or_else(|| get("USERPROFILE"))
+        .unwrap_or_default();
     PathBuf::from(home).join(".config").join("ccx")
 }
 
@@ -61,6 +66,24 @@ mod tests {
     fn ccx_home_falls_back_to_home_dotconfig() {
         let get = resolver(&[("HOME", "/home/u")]);
         assert_eq!(ccx_home_from(get), PathBuf::from("/home/u/.config/ccx"));
+    }
+
+    #[test]
+    fn ccx_home_uses_windows_appdata() {
+        let get = resolver(&[("APPDATA", "C:\\Users\\u\\AppData\\Roaming")]);
+        assert_eq!(
+            ccx_home_from(get),
+            PathBuf::from("C:\\Users\\u\\AppData\\Roaming").join("ccx")
+        );
+    }
+
+    #[test]
+    fn ccx_home_falls_back_to_userprofile() {
+        let get = resolver(&[("USERPROFILE", "C:\\Users\\u")]);
+        assert_eq!(
+            ccx_home_from(get),
+            PathBuf::from("C:\\Users\\u").join(".config").join("ccx")
+        );
     }
 
     #[test]
