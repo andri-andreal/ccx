@@ -657,6 +657,11 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
   upstream_key="$(kv_get "$penv" CCX_UPSTREAM_API_KEY)"
   port="$(pick_free_port)"
   apikey="$(gen_apikey)"
+  # Auto mode's server-side classifier needs Anthropic's API to see the
+  # `safeguards` field; an OpenAI-compatible upstream never can, so skip asking
+  # (Claude Code otherwise holds the first checked action behind a notice).
+  # A value from the profile or the shell wins.
+  export CLAUDE_CODE_AUTO_MODE_SERVER="${CLAUDE_CODE_AUTO_MODE_SERVER:-0}"
 
   if [ "${CCX_DRY_RUN:-}" = "1" ]; then
     bin="$(resolve_router_bin || printf '%s' "$CCX_ROUTER_BIN")"
@@ -666,6 +671,7 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
     [ -n "$upstream_key" ] && printf 'env: CCX_ROUTER_UPSTREAM_KEY=%s\n' "$(mask_token "$upstream_key")"
     printf 'env: ANTHROPIC_BASE_URL=http://127.0.0.1:%s\n' "$port"
     printf 'env: ANTHROPIC_AUTH_TOKEN=%s\n' "$(mask_token "$apikey")"
+    printf 'env: CLAUDE_CODE_AUTO_MODE_SERVER=%s\n' "$CLAUDE_CODE_AUTO_MODE_SERVER"
     [ -n "${CLAUDE_CONFIG_DIR:-}" ] && printf 'env: CLAUDE_CONFIG_DIR=%s\n' "$CLAUDE_CONFIG_DIR"
     printf 'exec: %s %s\n' "$CCX_CLAUDE_BIN" "$*"
     exit 0
