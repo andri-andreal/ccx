@@ -28,7 +28,10 @@ pub fn to_openai(req: &MessagesRequest) -> ChatRequest {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
         stop: req.stop_sequences.clone(),
-        stream: req.stream,
+        // Always explicit: some upstreams (e.g. 9router) stream when the field is
+        // absent, and Claude Code's non-streaming calls (auto mode classifier)
+        // omit it, so the SSE body would fail to parse as a chat completion.
+        stream: Some(req.stream.unwrap_or(false)),
         tools: req
             .tools
             .as_ref()
@@ -291,5 +294,12 @@ mod tests {
         let out = to_openai(&req);
         assert_eq!(out.stop, Some(vec!["X".to_string()]));
         assert_eq!(out.stream, Some(true));
+    }
+
+    #[test]
+    fn missing_stream_sent_as_explicit_false() {
+        let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let v = serde_json::to_value(to_openai(&req)).unwrap();
+        assert_eq!(v["stream"], json!(false));
     }
 }
