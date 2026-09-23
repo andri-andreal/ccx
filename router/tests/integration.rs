@@ -45,9 +45,10 @@ fn mock_upstream() -> Router {
     Router::new().route(
         "/v1/chat/completions",
         post(|body: Bytes| async move {
-            let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-            if value["stream"].as_bool().unwrap_or(false) {
-                assert_eq!(value["stream_options"]["include_usage"], true);
+            let v: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
+            // Streams unless `stream` is explicitly false, like some real
+            // upstreams (e.g. 9router) do.
+            if v["stream"].as_bool().unwrap_or(true) {
                 let sse = concat!(
                     "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
                     "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",

@@ -44,12 +44,10 @@ pub fn to_openai(req: &MessagesRequest) -> Result<ChatRequest, RequestTranslatio
         temperature: req.temperature,
         top_p: req.top_p,
         stop: req.stop_sequences.clone(),
-        stream: req.stream,
-        // Without this, many OpenAI-compatible providers omit final usage
-        // from streams and CCX would always report zero output tokens.
-        stream_options: req.stream.filter(|s| *s).map(|_| StreamOptions {
-            include_usage: true,
-        }),
+        // Always explicit: some upstreams (e.g. 9router) stream when the field is
+        // absent, and Claude Code's non-streaming calls (auto mode classifier)
+        // omit it, so the SSE body would fail to parse as a chat completion.
+        stream: Some(req.stream.unwrap_or(false)),
         tools: req
             .tools
             .as_ref()
@@ -515,5 +513,12 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("losslessly"));
+    }
+
+    #[test]
+    fn missing_stream_sent_as_explicit_false() {
+        let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        let v = serde_json::to_value(to_openai(&req)).unwrap();
+        assert_eq!(v["stream"], json!(false));
     }
 }

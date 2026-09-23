@@ -368,6 +368,10 @@ assert_contains "$out" "exec: true" "exec uses CCX_CLAUDE_BIN"
 # args pass through
 out="$(CCX_DRY_RUN=1 "$CCX" lq -p "hello" 2>&1)"
 assert_contains "$out" "exec: true -p hello" "router dry-run forwards claude args"
+# auto mode: server-side classifier off by default, overridable
+assert_contains "$out" "env: CLAUDE_CODE_AUTO_MODE_SERVER=0" "router profile skips server-side auto mode classifier"
+out="$(CLAUDE_CODE_AUTO_MODE_SERVER=1 CCX_DRY_RUN=1 "$CCX" lq 2>&1)"
+assert_contains "$out" "env: CLAUDE_CODE_AUTO_MODE_SERVER=1" "CLAUDE_CODE_AUTO_MODE_SERVER from env wins"
 # openrouter upstream key masked
 out2="$(CCX_DRY_RUN=1 "$CCX" orr 2>&1)"
 assert_not_contains "$out2" "sk-or-abc123456789" "upstream key masked in dry-run"
