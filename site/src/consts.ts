@@ -5,7 +5,7 @@ export const SITE_DESCRIPTION =
   'OpenAI-compatible backends (OpenAI, OpenRouter, Ollama, vLLM, LM Studio) ' +
   'via a managed local router. CLI + desktop GUI.';
 
-export const REPO_URL = 'https://github.com/andri-andreal/claude-code-profile-switcher';
+export const REPO_URL = 'https://github.com/andri-andreal/ccx';
 
 // kind: 'anthropic' = direct /v1/messages; 'router' = OpenAI-compatible via the built-in ccx-router.
 export const PROVIDERS = [
@@ -45,6 +45,14 @@ export const FEATURES = [
     body: 'Endpoints and model IDs live in simple template files you can tweak.',
   },
   {
+    title: 'Know before you launch',
+    body: '`ccx doctor` checks a profile safely; opt-in certification verifies responses, streams, and tools.',
+  },
+  {
+    title: 'Reliable local routing',
+    body: 'Ordered fallbacks, bounded retries and timeouts, request IDs, and secret-safe event logs.',
+  },
+  {
     title: 'CLI + desktop GUI',
     body: 'Manage profiles from the terminal or a Tauri desktop app — fully interchangeable.',
   },
@@ -53,6 +61,7 @@ export const FEATURES = [
 export const DOCS_NAV = [
   { href: '/docs/installation/', label: 'Installation' },
   { href: '/docs/usage/', label: 'Usage' },
+  { href: '/docs/diagnostics/', label: 'Diagnostics' },
   { href: '/docs/providers/', label: 'Providers' },
   { href: '/docs/desktop-gui/', label: 'Desktop GUI' },
   { href: '/docs/roadmap/', label: 'Roadmap' },

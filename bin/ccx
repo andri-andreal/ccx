@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 CCX_HOME="${CCX_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccx}"
 CCX_CLAUDE_BIN="${CCX_CLAUDE_BIN:-claude}"
 CCX_ROUTER_BIN="${CCX_ROUTER_BIN:-ccx-router}"
+CCX_CURL_BIN="${CCX_CURL_BIN:-curl}"
 CCX_VERSION="0.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -272,17 +274,26 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
 }
 
 fetch_models() { # url mode token — print model ids (one per line); nonzero on failure
-  local url="$1" mode="$2" tok="$3" body
-  command -v curl >/dev/null 2>&1 || return 1
-  local -a hdr=()
+  local url="$1" mode="$2" tok="$3" body rc=0 header=""
+  command -v "$CCX_CURL_BIN" >/dev/null 2>&1 || return 1
+  case "$tok" in *$'\n'* | *$'\r'*) return 1 ;; esac
   if [ "$mode" = "anthropic" ]; then
-    hdr=(-H 'anthropic-version: 2023-06-01')
-    [ -n "$tok" ] && hdr+=(-H "x-api-key: $tok")
+    header='anthropic-version: 2023-06-01'
+    [ -n "$tok" ] && header="$header"$'\n'"x-api-key: $tok"
   else
-    [ -n "$tok" ] && hdr=(-H "Authorization: Bearer $tok")
+    [ -n "$tok" ] && header="Authorization: Bearer $tok"
   fi
   # -f fails on HTTP >=400 (e.g. 401 without a key) so we cleanly fall back.
-  body="$(curl -fsS --max-time 12 "${hdr[@]}" "$url" 2>/dev/null)" || return 1
+  # Header material is streamed over stdin (`-H @-`) so credentials never
+  # appear in curl's argv or a temporary file. Cap the body before placing it
+  # in a shell variable so a hostile discovery endpoint cannot exhaust memory.
+  if [ -n "$header" ]; then
+    body="$(printf '%s\n' "$header" | "$CCX_CURL_BIN" -fsS --max-time 12 --max-filesize 1048576 \
+      -H @- "$url" 2>/dev/null)" || rc=$?
+  else
+    body="$("$CCX_CURL_BIN" -fsS --max-time 12 --max-filesize 1048576 "$url" 2>/dev/null)" || rc=$?
+  fi
+  [ "$rc" -eq 0 ] || return 1
   [ -n "$body" ] || return 1
   # Both OpenAI- and Anthropic-shaped responses list ids under .data[].id.
   if command -v jq >/dev/null 2>&1; then
@@ -413,7 +424,7 @@ choose_model() { # set caller's $model. Args: provider default_model models_url 
   local provider="$1" default_model="$2" url="$3" mode="$4" tok="$5"
   local -a fetched=() items=()
   local m chosen
-  if [ -t 0 ] && [ -n "$url" ] && command -v curl >/dev/null 2>&1; then
+  if [ -t 0 ] && [ -n "$url" ] && command -v "$CCX_CURL_BIN" >/dev/null 2>&1; then
     printf 'ccx: fetching model list …\n' >&2
     while IFS= read -r m; do [ -n "$m" ] && fetched+=("$m"); done < <(fetch_models "$url" "$mode" "$tok")
   fi
@@ -460,6 +471,894 @@ gen_apikey() { # print a random URL-safe token to secure the local router hop
   printf '%s' "$k"
 }
 
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+# The diagnostic report is deliberately dependency-free and machine-readable.
+# Keep check ids and the JSON shape stable: the GUI and other callers consume
+# them.  Messages never include configured URLs, credentials, or response bodies.
+
+declare -a DIAG_IDS=() DIAG_LABELS=() DIAG_STATUSES=() DIAG_MESSAGES=() DIAG_REQUIRED=()
+DIAG_COMMAND=""
+DIAG_PROFILE=""
+DIAG_CAP_BASIC="unknown"
+DIAG_CAP_STREAMING="unknown"
+DIAG_CAP_TOOLS="unknown"
+
+diag_reset() {
+  DIAG_COMMAND="$1"; DIAG_PROFILE="${2:-}"
+  DIAG_IDS=(); DIAG_LABELS=(); DIAG_STATUSES=(); DIAG_MESSAGES=(); DIAG_REQUIRED=()
+  DIAG_CAP_BASIC="unknown"; DIAG_CAP_STREAMING="unknown"; DIAG_CAP_TOOLS="unknown"
+}
+
+diag_add() { # id label status message required(true|false)
+  DIAG_IDS+=("$1"); DIAG_LABELS+=("$2"); DIAG_STATUSES+=("$3")
+  DIAG_MESSAGES+=("$4"); DIAG_REQUIRED+=("$5")
+}
+
+json_escape() { # print a JSON string payload without surrounding quotes
+  # Diagnostics are built from constants and validated profile names.  Apply
+  # substitutions in this order so the backslashes we introduce are retained.
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\b'/\\b}"
+  s="${s//$'\f'/\\f}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  # Other C0 controls cannot occur in valid profile names or built-in messages;
+  # replace them defensively so even hostile argv still yields valid JSON.
+  case "$s" in *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C tr '\001-\010\013\014\016-\037\177' '?')" ;; esac
+  printf '%s' "$s"
+}
+
+diag_counts() { # set report counters + status globals
+  DIAG_PASSED=0; DIAG_WARNINGS=0; DIAG_FAILED=0; DIAG_SKIPPED=0
+  DIAG_OVERALL="pass"
+  local i st req
+  for ((i = 0; i < ${#DIAG_IDS[@]}; i++)); do
+    st="${DIAG_STATUSES[$i]}"; req="${DIAG_REQUIRED[$i]}"
+    case "$st" in
+      pass) DIAG_PASSED=$((DIAG_PASSED + 1)) ;;
+      warn) DIAG_WARNINGS=$((DIAG_WARNINGS + 1)); [ "$DIAG_OVERALL" = pass ] && DIAG_OVERALL="warn" ;;
+      fail)
+        DIAG_FAILED=$((DIAG_FAILED + 1))
+        if [ "$req" = true ]; then DIAG_OVERALL="fail"
+        elif [ "$DIAG_OVERALL" = pass ]; then DIAG_OVERALL="warn"
+        fi
+        ;;
+      skip)
+        DIAG_SKIPPED=$((DIAG_SKIPPED + 1))
+        [ "$req" != true ] || [ "$DIAG_OVERALL" != pass ] || DIAG_OVERALL="warn"
+        ;;
+    esac
+  done
+  return 0
+}
+
+diag_print_json() {
+  diag_counts
+  local i comma="" profile_json="null"
+  [ -z "$DIAG_PROFILE" ] || profile_json="\"$(json_escape "$DIAG_PROFILE")\""
+  printf '{"schema_version":1,"command":"%s","profile":%s,"status":"%s",' \
+    "$(json_escape "$DIAG_COMMAND")" "$profile_json" "$DIAG_OVERALL"
+  printf '"summary":{"passed":%d,"warnings":%d,"failed":%d,"skipped":%d},' \
+    "$DIAG_PASSED" "$DIAG_WARNINGS" "$DIAG_FAILED" "$DIAG_SKIPPED"
+  printf '"checks":['
+  for ((i = 0; i < ${#DIAG_IDS[@]}; i++)); do
+    printf '%s{"id":"%s","label":"%s","status":"%s","message":"%s","required":%s}' \
+      "$comma" "$(json_escape "${DIAG_IDS[$i]}")" "$(json_escape "${DIAG_LABELS[$i]}")" \
+      "${DIAG_STATUSES[$i]}" "$(json_escape "${DIAG_MESSAGES[$i]}")" "${DIAG_REQUIRED[$i]}"
+    comma=,
+  done
+  printf '],"capabilities":{"basic":"%s","streaming":"%s","tools":"%s"}}\n' \
+    "$DIAG_CAP_BASIC" "$DIAG_CAP_STREAMING" "$DIAG_CAP_TOOLS"
+}
+
+diag_print_human() {
+  diag_counts
+  local title="$DIAG_COMMAND" i mark
+  [ -z "$DIAG_PROFILE" ] || title="$title: $DIAG_PROFILE"
+  printf 'CCX %s\n' "$title"
+  for ((i = 0; i < ${#DIAG_IDS[@]}; i++)); do
+    case "${DIAG_STATUSES[$i]}" in
+      pass) mark=PASS ;;
+      warn) mark=WARN ;;
+      fail) mark=FAIL ;;
+      skip) mark=SKIP ;;
+    esac
+    printf '  %-4s %-22s %s\n' "$mark" "${DIAG_LABELS[$i]}" "${DIAG_MESSAGES[$i]}"
+  done
+  printf '\nCapabilities: basic=%s, streaming=%s, tools=%s\n' \
+    "$DIAG_CAP_BASIC" "$DIAG_CAP_STREAMING" "$DIAG_CAP_TOOLS"
+  printf 'Summary: %d passed, %d warnings, %d failed, %d skipped (%s)\n' \
+    "$DIAG_PASSED" "$DIAG_WARNINGS" "$DIAG_FAILED" "$DIAG_SKIPPED" "$DIAG_OVERALL"
+}
+
+diag_finish() { # json(true|false)
+  local json="$1"
+  if [ "$json" = true ]; then diag_print_json; else diag_print_human; fi
+  [ "$DIAG_OVERALL" != fail ]
+}
+
+is_loopback_url() {
+  local authority="${1#*://}" host port
+  authority="${authority%%/*}"; authority="${authority%%\?*}"; authority="${authority%%\#*}"
+  case "$authority" in
+    localhost | \[::1\]) return 0 ;;
+    localhost:*) port="${authority#localhost:}" ;;
+    \[::1\]:*) port="${authority#\[::1\]:}" ;;
+  esac
+  if [ -n "${port:-}" ]; then case "$port" in *[!0-9]*) return 1 ;; *) return 0 ;; esac; fi
+  host="${authority%%:*}"
+  case "$host" in
+    127.*)
+      case "$host" in *[!0-9.]*) return 1 ;; esac
+      [ "$(printf '%s' "$host" | awk -F. 'NF==4 && $1==127 && $2>=0 && $2<=255 && $3>=0 && $3<=255 && $4>=0 && $4<=255 {print "yes"}')" = yes ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+valid_ipv4_address() {
+  local host="$1"
+  [ "$(printf '%s' "$host" | awk -F. '
+    NF == 4 {
+      for (i = 1; i <= 4; i++) {
+        if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit
+      }
+      print "yes"
+    }
+  ')" = yes ]
+}
+
+valid_ipv6_literal() {
+  local value="$1" left right compressed=false part groups_count=0 i
+  local -a left_groups=() right_groups=() groups=()
+  if [[ "$value" == *::* ]]; then
+    left="${value%%::*}"
+    right="${value#*::}"
+    [[ "$right" != *::* ]] || return 1
+    compressed=true
+  else
+    left="$value"
+    right=""
+    case "$value" in :* | *:) return 1 ;; esac
+  fi
+  [ -z "$left" ] || IFS=':' read -r -a left_groups <<< "$left"
+  if [ "$compressed" = true ]; then
+    [ -z "$right" ] || IFS=':' read -r -a right_groups <<< "$right"
+  fi
+  groups=("${left_groups[@]}" "${right_groups[@]}")
+  for ((i = 0; i < ${#groups[@]}; i++)); do
+    part="${groups[$i]}"
+    [ -n "$part" ] || return 1
+    if [[ "$part" == *.* ]]; then
+      [ "$i" -eq $((${#groups[@]} - 1)) ] || return 1
+      valid_ipv4_address "$part" || return 1
+      groups_count=$((groups_count + 2))
+    else
+      [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      groups_count=$((groups_count + 1))
+    fi
+  done
+  if [ "$compressed" = true ]; then
+    [ "$groups_count" -lt 8 ]
+  else
+    [ "$groups_count" -eq 8 ]
+  fi
+}
+
+valid_endpoint_authority() {
+  local authority="$1" host="" port="" prefix rest label
+  local -a labels=()
+  if [[ "$authority" == \[* ]]; then
+    prefix="${authority%%]*}"
+    [ "$prefix" != "$authority" ] || return 1
+    host="${prefix#\[}"
+    rest="${authority:$(( ${#prefix} + 1 ))}"
+    valid_ipv6_literal "$host" || return 1
+    if [ -n "$rest" ]; then
+      case "$rest" in :*) port="${rest#:}" ;; *) return 1 ;; esac
+    fi
+  else
+    case "$authority" in
+      *:*)
+        host="${authority%:*}"
+        port="${authority##*:}"
+        case "$host" in *:*) return 1 ;; esac
+        ;;
+      *) host="$authority" ;;
+    esac
+    [ -n "$host" ] || return 1
+    case "$host" in
+      *[!0-9.]*)
+        host="${host%.}"
+        [ -n "$host" ] || return 1
+        case "$host" in .* | *..* | *[!A-Za-z0-9.-]*) return 1 ;; esac
+        IFS='.' read -r -a labels <<< "$host"
+        for label in "${labels[@]}"; do
+          [ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+          case "$label" in -* | *-) return 1 ;; esac
+        done
+        ;;
+      *) valid_ipv4_address "$host" || return 1 ;;
+    esac
+  fi
+  if [ -n "$port" ]; then
+    case "$port" in *[!0-9]* | '') return 1 ;; esac
+    [ "${#port}" -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+  elif [[ "$authority" == *: ]]; then
+    return 1
+  fi
+  return 0
+}
+
+validate_endpoint_url() { # 0 valid, 1 invalid, 2 insecure remote HTTP, 3 embedded credentials
+  local url="$1" authority
+  case "$url" in http://* | https://*) ;; *) return 1 ;; esac
+  case "$url" in *[[:space:]]* | *'?'* | *'#'* | *'\'*) return 1 ;; esac
+  authority="${url#*://}"; authority="${authority%%/*}"
+  [ -n "$authority" ] || return 1
+  case "$authority" in *@*) return 3 ;; esac
+  valid_endpoint_authority "$authority" || return 1
+  case "$url" in http://*) is_loopback_url "$url" || return 2 ;; esac
+  return 0
+}
+
+require_single_line() { # label value [allow-empty]
+  local label="$1" value="$2" allow_empty="${3:-false}"
+  case "$value" in *$'\n'* | *$'\r'*) die "$label must be a single-line value" ;; esac
+  if [ "$allow_empty" != true ] && [ -z "$value" ]; then die "$label must not be empty"; fi
+}
+
+require_endpoint_url() { # label value; never echo the potentially secret URL
+  local label="$1" value="$2" rc=0
+  validate_endpoint_url "$value" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) die "$label: remote endpoints must use HTTPS" ;;
+    3) die "$label: credentials must not be embedded in the URL" ;;
+    *) die "$label: expected a valid HTTP or HTTPS URL without whitespace, query, or fragment" ;;
+  esac
+}
+
+csv_entry_count() { # empty string -> 0; otherwise preserve empty positional entries
+  local value="$1"
+  if [ -z "$value" ]; then printf '0'; else awk -F, '{print NF}' <<< "$value"; fi
+}
+
+validate_fallback_config() { # urls keys
+  local urls="$1" keys="$2" url url_count key_count
+  require_single_line 'fallback URLs' "$urls" true
+  require_single_line 'fallback keys' "$keys" true
+  if [ -z "$urls" ]; then
+    [ -z "$keys" ] || die 'fallback keys require at least one fallback URL'
+    return 0
+  fi
+  case "$urls" in ,* | *, | *,,*) die 'fallback URLs cannot contain empty entries' ;; esac
+  local -a entries=()
+  IFS=',' read -r -a entries <<< "$urls"
+  for url in "${entries[@]}"; do require_endpoint_url 'fallback URL' "$url"; done
+  url_count="${#entries[@]}"
+  key_count="$(csv_entry_count "$keys")"
+  [ "$key_count" -le "$url_count" ] || die 'more fallback keys than fallback URLs are configured'
+}
+
+# Pinning is stored positionally: `;` separates upstreams (position 0 is the
+# primary), `,` separates slugs within one upstream. A comma cannot separate
+# positions the way it does for fallback keys, because each position is itself
+# a list.
+validate_provider_pinning() { # label value max_positions
+  local label="$1" value="$2" max="$3" position slug count
+  [ -n "$value" ] || return 0
+  require_single_line "$label" "$value" true
+  local -a positions=()
+  IFS=';' read -r -a positions <<< "$value"
+  count="${#positions[@]}"
+  [ "$count" -le "$max" ] \
+    || die "$label has more positions ($count) than configured upstreams ($max)"
+  for position in "${positions[@]}"; do
+    [ -n "$position" ] || continue
+    local -a slugs=()
+    IFS=',' read -r -a slugs <<< "$position"
+    for slug in "${slugs[@]}"; do
+      [ -n "$slug" ] || continue
+      printf '%s' "$slug" | grep -qE '^[A-Za-z0-9._-]+$' \
+        || die "$label has an invalid provider slug: $slug"
+    done
+  done
+}
+
+validate_require_parameters() { # label value max_positions
+  local label="$1" value="$2" max="$3" position count
+  [ -n "$value" ] || return 0
+  require_single_line "$label" "$value" true
+  local -a positions=()
+  IFS=';' read -r -a positions <<< "$value"
+  count="${#positions[@]}"
+  [ "$count" -le "$max" ] \
+    || die "$label has more positions ($count) than configured upstreams ($max)"
+  for position in "${positions[@]}"; do
+    case "$position" in '' | 1 | true) ;; *) die "$label entries must be 1, true, or empty" ;; esac
+  done
+}
+
+# Fold a primary position and the positional fallback entries into the single
+# `;`-separated value the router parses.
+join_pinning() { # primary fallbacks
+  if [ -n "$2" ]; then printf '%s;%s' "$1" "$2"; else printf '%s' "$1"; fi
+}
+
+profile_syntax_valid() {
+  local file="$1" line key seen=" "
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in '' | '#'* ) continue ;; esac
+    case "$line" in *$'\r'*) return 1 ;; esac
+    case "$line" in *=*) ;; *) return 1 ;; esac
+    key="${line%%=*}"
+    printf '%s' "$key" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$' || return 1
+    case "$seen" in *" $key "*) return 1 ;; esac
+    seen="$seen$key "
+  done < "$file"
+  return 0
+}
+
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+
+# Result globals populated by http_request. Authentication is streamed to curl
+# over stdin so credentials never appear in argv, output, or a temporary file.
+HTTP_STATUS=""; HTTP_BODY=""; HTTP_OK=false
+http_request() { # method url auth(none|bearer|apikey) token payload accept
+  local method="$1" url="$2" auth="$3" token="$4" payload="$5" accept="$6"
+  local body_file status="" rc=0 secret_header=""
+  local -a args=()
+  HTTP_STATUS="000"; HTTP_BODY=""; HTTP_OK=false
+  body_file="$(mktemp "${TMPDIR:-/tmp}/ccx-http-body.XXXXXX")" || return 1
+  chmod 600 "$body_file"
+  if [ "$auth" != none ] && [ -n "$token" ]; then
+    case "$auth" in
+      bearer) secret_header="Authorization: Bearer $token" ;;
+      apikey) secret_header="x-api-key: $token" ;;
+    esac
+    args+=(--header @-)
+  fi
+  args+=(--header 'Content-Type: application/json' --header "Accept: $accept")
+  if [ "$method" = POST ]; then args+=(--data-binary "$payload"); fi
+  if [ -n "$secret_header" ]; then
+    status="$(printf '%s\n' "$secret_header" | "$CCX_CURL_BIN" --silent --proto '=http,https' \
+      --connect-timeout 4 --max-time 20 --max-filesize 1048576 --request "$method" \
+      --output "$body_file" --write-out '%{http_code}' "${args[@]}" "$url" 2>/dev/null)" || rc=$?
+  else
+    status="$("$CCX_CURL_BIN" --silent --proto '=http,https' --connect-timeout 4 --max-time 20 \
+      --max-filesize 1048576 --request "$method" --output "$body_file" \
+      --write-out '%{http_code}' "${args[@]}" "$url" 2>/dev/null)" || rc=$?
+  fi
+  HTTP_BODY="$(head -c 1048576 "$body_file" | LC_ALL=C tr -d '\000')"
+  rm -f -- "$body_file"
+  case "$status" in [0-9][0-9][0-9]) HTTP_STATUS="$status" ;; *) HTTP_STATUS="000" ;; esac
+  if [ "$rc" -eq 0 ] && [ "$HTTP_STATUS" != 000 ]; then HTTP_OK=true; return 0; fi
+  return 1
+}
+
+json_parser_available() {
+  command -v python3 >/dev/null 2>&1 || command -v node >/dev/null 2>&1
+}
+
+probe_shape_valid() { # capability protocol; reads HTTP_BODY without echoing it
+  local capability="$1" protocol="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$HTTP_BODY" | python3 -c '
+import json,re,sys
+cap, protocol = sys.argv[1], sys.argv[2]
+raw = sys.stdin.read()
+def ordinary():
+    try: value = json.loads(raw)
+    except Exception: return False
+    if not isinstance(value, dict) or value.get("type") == "error" or "error" in value:
+        return False
+    if cap == "basic":
+        if protocol == "anthropic":
+            return value.get("type") == "message" and isinstance(value.get("content"), list)
+        choices = value.get("choices")
+        return isinstance(choices, list) and bool(choices) and isinstance(choices[0].get("message"), dict)
+    if protocol == "anthropic":
+        return any(isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "ccx_probe" for block in value.get("content", []))
+    return any(call.get("function", {}).get("name") == "ccx_probe" for choice in value.get("choices", []) if isinstance(choice, dict) for call in choice.get("message", {}).get("tool_calls", []) if isinstance(call, dict))
+def streaming():
+    normalized = raw.replace("\r\n", "\n").replace("\r", "\n")
+    names, payloads = [], []
+    for block in re.split(r"\n\n+", normalized):
+        data = []
+        for line in block.split("\n"):
+            if line.startswith("event:"): names.append(line[6:].strip())
+            elif line.startswith("data:"): data.append(line[5:].lstrip())
+        joined = "\n".join(data)
+        if joined and joined != "[DONE]":
+            try: payloads.append(json.loads(joined))
+            except Exception: pass
+    if any(isinstance(v, dict) and (v.get("type") == "error" or "error" in v) for v in payloads):
+        return False
+    if protocol == "anthropic":
+        valid = {"message_start","content_block_start","content_block_delta","content_block_stop","message_delta","message_stop"}
+        return any(name in valid for name in names) or any(isinstance(v, dict) and v.get("type") in valid for v in payloads)
+    return any(isinstance(choice.get("delta"), dict) for v in payloads if isinstance(v, dict) for choice in v.get("choices", []) if isinstance(choice, dict))
+ok = streaming() if cap == "streaming" else ordinary()
+sys.exit(0 if ok else 1)
+' "$capability" "$protocol" >/dev/null 2>&1
+    return
+  fi
+  if command -v node >/dev/null 2>&1; then
+    printf '%s' "$HTTP_BODY" | node -e '
+const [cap, protocol] = process.argv.slice(1);
+let raw = ""; process.stdin.setEncoding("utf8"); process.stdin.on("data", c => raw += c);
+process.stdin.on("end", () => {
+  const safe = s => { try { return JSON.parse(s); } catch { return null; } };
+  let ok = false;
+  if (cap !== "streaming") {
+    const v = safe(raw);
+    if (v && typeof v === "object" && v.type !== "error" && !("error" in v)) {
+      if (cap === "basic") ok = protocol === "anthropic"
+        ? v.type === "message" && Array.isArray(v.content)
+        : Array.isArray(v.choices) && v.choices.length > 0 && typeof v.choices[0]?.message === "object";
+      else ok = protocol === "anthropic"
+        ? (v.content || []).some(b => b?.type === "tool_use" && b?.name === "ccx_probe")
+        : (v.choices || []).some(c => (c?.message?.tool_calls || []).some(t => t?.function?.name === "ccx_probe"));
+    }
+  } else {
+    const names = [], values = [];
+    for (const block of raw.replace(/\r\n?/g, "\n").split(/\n\n+/)) {
+      const data = [];
+      for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) names.push(line.slice(6).trim());
+        if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
+      }
+      const joined = data.join("\n"); const parsed = joined && joined !== "[DONE]" ? safe(joined) : null;
+      if (parsed) values.push(parsed);
+    }
+    const bad = values.some(v => v?.type === "error" || (v && "error" in v));
+    if (!bad && protocol === "anthropic") {
+      const valid = new Set(["message_start","content_block_start","content_block_delta","content_block_stop","message_delta","message_stop"]);
+      ok = names.some(n => valid.has(n)) || values.some(v => valid.has(v?.type));
+    } else if (!bad) ok = values.some(v => (v?.choices || []).some(c => c?.delta && typeof c.delta === "object"));
+  }
+  process.exit(ok ? 0 : 1);
+});
+' "$capability" "$protocol" >/dev/null 2>&1
+    return
+  fi
+  return 2
+}
+
+profile_diagnostics() { # profile network(true|false); sets PROFILE_* globals
+  local name="$1" network="$2" penv mode syntax=true url_rc models_url auth_kind token \
+        fallback_urls fallback_keys router_attempts fallback_count key_count fallback_valid \
+        pin_only pin_order pin_require pin_max pin_summary pin_status pin_hosts
+  PROFILE_READY=false; PROFILE_PROVIDER=""; PROFILE_ROUTER=""; PROFILE_URL=""
+  PROFILE_TOKEN=""; PROFILE_AUTH_KIND=none; PROFILE_MODEL=""; PROFILE_PROTOCOL=""
+
+  if ! valid_profile_name "$name"; then
+    diag_add profile.name 'Profile name' fail 'Profile name is invalid.' true
+    return
+  fi
+  penv="$(profile_env "$name")"
+  if [ ! -f "$penv" ]; then
+    diag_add profile.exists 'Profile' fail 'Profile was not found.' true
+    return
+  fi
+  diag_add profile.exists 'Profile' pass 'Profile file was found.' true
+
+  mode="$(file_mode "$penv")"
+  if [ "$mode" = 600 ]; then
+    diag_add profile.permissions 'File permissions' pass 'Profile file is private (0600).' true
+  else
+    diag_add profile.permissions 'File permissions' fail 'Profile file must have mode 0600.' true
+  fi
+
+  profile_syntax_valid "$penv" || syntax=false
+  if [ "$syntax" = true ]; then
+    diag_add profile.syntax 'Profile syntax' pass 'Profile syntax is valid and keys are unique.' true
+  else
+    diag_add profile.syntax 'Profile syntax' fail 'Profile has a malformed line, duplicate key, or invalid key.' true
+    return
+  fi
+
+  PROFILE_PROVIDER="$(kv_get "$penv" CCX_PROVIDER)"
+  PROFILE_ROUTER="$(kv_get "$penv" CCX_ROUTER)"
+  PROFILE_MODEL="$(kv_get "$penv" ANTHROPIC_MODEL)"
+  local isolate; isolate="$(kv_get "$penv" CCX_ISOLATE)"
+  if [ -n "$PROFILE_PROVIDER" ]; then
+    diag_add profile.provider 'Provider' pass 'Provider is configured.' true
+  else
+    diag_add profile.provider 'Provider' fail 'CCX_PROVIDER is missing.' true
+  fi
+  if [ -n "$PROFILE_MODEL" ]; then
+    diag_add profile.model 'Model' pass 'A default model is configured.' true
+  else
+    diag_add profile.model 'Model' fail 'ANTHROPIC_MODEL is missing.' true
+  fi
+  case "$isolate" in
+    true)
+      local home hmode; home="$(profile_dir "$name")/home"
+      if [ ! -d "$home" ]; then
+        diag_add profile.isolation 'Isolation' warn 'Isolated config directory is missing; launch will create it.' false
+      else
+        hmode="$(file_mode "$home")"
+        if [ "$hmode" = 700 ]; then
+          diag_add profile.isolation 'Isolation' pass 'Isolated config directory is private (0700).' false
+        else
+          diag_add profile.isolation 'Isolation' warn 'Isolated config directory should have mode 0700.' false
+        fi
+      fi
+      ;;
+    false) diag_add profile.isolation 'Isolation' pass 'Profile intentionally uses the default Claude config.' false ;;
+    *) diag_add profile.isolation 'Isolation' fail 'CCX_ISOLATE must be true or false.' true ;;
+  esac
+
+  if [ -n "$PROFILE_ROUTER" ]; then
+    PROFILE_PROTOCOL=openai
+    PROFILE_URL="$(kv_get "$penv" CCX_UPSTREAM_BASE_URL)"
+    PROFILE_TOKEN="$(kv_get "$penv" CCX_UPSTREAM_API_KEY)"
+    [ -z "$PROFILE_TOKEN" ] || PROFILE_AUTH_KIND=bearer
+    if resolve_router_bin >/dev/null 2>&1; then
+      diag_add system.router_binary 'Router binary' pass 'ccx-router is available.' true
+    else
+      diag_add system.router_binary 'Router binary' fail 'ccx-router is not available.' true
+    fi
+    fallback_urls="$(kv_get "$penv" CCX_ROUTER_FALLBACK_URLS)"
+    fallback_keys="$(kv_get "$penv" CCX_ROUTER_FALLBACK_KEYS)"
+    router_attempts="$(kv_get "$penv" CCX_ROUTER_ATTEMPTS_PER_UPSTREAM)"
+    if [ -n "$fallback_urls" ]; then
+      local -a fallback_list=()
+      fallback_count="$(csv_entry_count "$fallback_urls")"; fallback_valid=true
+      case "$fallback_urls" in ,* | *, | *,,*) fallback_valid=false ;; esac
+      [ "$fallback_valid" != true ] || IFS=',' read -r -a fallback_list <<< "$fallback_urls"
+      local fallback_url
+      for fallback_url in "${fallback_list[@]}"; do
+        if ! validate_endpoint_url "$fallback_url"; then fallback_valid=false; break; fi
+      done
+      if [ "$fallback_valid" = true ]; then
+        diag_add router.fallbacks 'Ordered fallbacks' pass "$fallback_count fallback endpoint(s) are configured." false
+      else
+        diag_add router.fallbacks 'Ordered fallbacks' fail 'A fallback endpoint has an invalid or insecure URL.' true
+      fi
+      if [ -n "$fallback_keys" ]; then
+        key_count="$(csv_entry_count "$fallback_keys")"
+        if [ "$key_count" -le "$fallback_count" ]; then
+          diag_add router.fallback_credentials 'Fallback credentials' pass "$key_count positional fallback credential slot(s) are present; empty slots send no Authorization header." false
+        else
+          diag_add router.fallback_credentials 'Fallback credentials' fail 'More fallback credentials than endpoints are configured.' true
+        fi
+      fi
+    else
+      diag_add router.fallbacks 'Ordered fallbacks' pass 'No fallback endpoint is configured.' false
+      [ -z "$fallback_keys" ] || diag_add router.fallback_credentials 'Fallback credentials' fail 'Fallback credentials require fallback endpoints.' true
+    fi
+    if [ -z "$router_attempts" ]; then
+      diag_add router.retry_policy 'Retry policy' pass 'Each upstream is attempted once.' false
+    elif [[ "$router_attempts" =~ ^[0-9]+$ ]] && [ "$router_attempts" -ge 1 ] && [ "$router_attempts" -le 10 ]; then
+      diag_add router.retry_policy 'Retry policy' pass "$router_attempts attempt(s) per upstream are configured." false
+    else
+      diag_add router.retry_policy 'Retry policy' fail 'Attempts per upstream must be between 1 and 10.' true
+    fi
+    pin_only="$(kv_get "$penv" CCX_ROUTER_PROVIDER_ONLY)"
+    pin_order="$(kv_get "$penv" CCX_ROUTER_PROVIDER_ORDER)"
+    pin_require="$(kv_get "$penv" CCX_ROUTER_REQUIRE_PARAMETERS)"
+    if [ -z "$pin_only$pin_order$pin_require" ]; then
+      diag_add router.provider_pinning 'Provider pinning' pass 'No provider pinning is configured.' false
+    else
+      pin_max=1
+      [ -z "$fallback_urls" ] || pin_max=$((1 + $(csv_entry_count "$fallback_urls")))
+      pin_status=pass
+      pin_summary=""
+      [ -z "$pin_only" ] || pin_summary="only=$pin_only"
+      [ -z "$pin_order" ] || pin_summary="${pin_summary:+$pin_summary, }order=$pin_order"
+      [ -z "$pin_require" ] || pin_summary="${pin_summary:+$pin_summary, }require_parameters=$pin_require"
+      # Positions beyond the chain would be rejected at launch, so surface it here.
+      local pin_value pin_count
+      for pin_value in "$pin_only" "$pin_order" "$pin_require"; do
+        [ -n "$pin_value" ] || continue
+        pin_count="$(printf '%s' "$pin_value" | awk -F';' '{print NF}')"
+        [ "$pin_count" -le "$pin_max" ] || pin_status=fail
+      done
+      if [ "$pin_status" = fail ]; then
+        diag_add router.provider_pinning 'Provider pinning' fail \
+          "Pinning describes more upstreams than the $pin_max configured ($pin_summary)." true
+      else
+        # `provider` is an OpenRouter field. A proxy in front of it is
+        # legitimate, so an unrecognised host is a warning, never a failure.
+        pin_hosts="$PROFILE_URL,$fallback_urls"
+        if printf '%s' "$pin_hosts" | grep -q 'openrouter\.ai'; then
+          diag_add router.provider_pinning 'Provider pinning' pass \
+            "Provider pinning is configured ($pin_summary)." false
+        else
+          diag_add router.provider_pinning 'Provider pinning' warn \
+            "Provider pinning is configured ($pin_summary) but no upstream is openrouter.ai; the provider field is ignored unless the endpoint proxies OpenRouter." false
+        fi
+      fi
+    fi
+  else
+    PROFILE_PROTOCOL=anthropic
+    PROFILE_URL="$(kv_get "$penv" ANTHROPIC_BASE_URL)"
+    PROFILE_TOKEN="$(kv_get "$penv" ANTHROPIC_API_KEY)"
+    if [ -n "$PROFILE_TOKEN" ]; then PROFILE_AUTH_KIND=apikey
+    else
+      PROFILE_TOKEN="$(kv_get "$penv" ANTHROPIC_AUTH_TOKEN)"
+      [ -z "$PROFILE_TOKEN" ] || PROFILE_AUTH_KIND=bearer
+    fi
+  fi
+
+  if [ -z "$PROFILE_URL" ]; then
+    if [ -z "$PROFILE_ROUTER" ] && [ "$PROFILE_PROVIDER" = claude ]; then
+      diag_add profile.endpoint 'Endpoint' pass 'Claude first-party login will provide the endpoint.' true
+      diag_add profile.credential 'Credential' pass 'Claude first-party login manages authentication.' true
+      case "$network" in
+        false) diag_add endpoint.reachable 'Endpoint reachability' skip 'No explicit endpoint to probe safely.' false ;;
+        omit) : ;;
+        *) diag_add endpoint.reachable 'Endpoint reachability' skip 'No explicit endpoint to probe safely.' false ;;
+      esac
+    else
+      diag_add profile.endpoint 'Endpoint' fail 'Provider endpoint is missing.' true
+      diag_add profile.credential 'Credential' skip 'Credential check skipped because endpoint is missing.' false
+    fi
+    return
+  fi
+
+  url_rc=0; validate_endpoint_url "$PROFILE_URL" || url_rc=$?
+  case "$url_rc" in
+    0) diag_add profile.endpoint 'Endpoint' pass 'Endpoint uses an allowed URL form.' true ;;
+    1) diag_add profile.endpoint 'Endpoint' fail 'Endpoint must be an HTTP or HTTPS URL.' true; return ;;
+    2) diag_add profile.endpoint 'Endpoint' fail 'Remote endpoints must use HTTPS.' true; return ;;
+    3) diag_add profile.endpoint 'Endpoint' fail 'Credentials must not be embedded in the endpoint URL.' true; return ;;
+  esac
+
+  if [ -n "$PROFILE_TOKEN" ]; then
+    case "$PROFILE_TOKEN" in *$'\r'* | *$'\n'*) diag_add profile.credential 'Credential' fail 'Credential contains an invalid line break.' true; return ;; esac
+    diag_add profile.credential 'Credential' pass 'A credential is configured (value hidden).' true
+  elif is_loopback_url "$PROFILE_URL"; then
+    diag_add profile.credential 'Credential' pass 'Local endpoint does not require a stored credential.' true
+  else
+    diag_add profile.credential 'Credential' fail 'Remote endpoint has no configured credential.' true
+  fi
+
+  PROFILE_READY=true
+  if [ "$network" = omit ]; then
+    return
+  elif [ "$network" = false ]; then
+    diag_add endpoint.reachable 'Endpoint reachability' skip 'Network checks were disabled.' false
+    return
+  fi
+  if ! command -v "$CCX_CURL_BIN" >/dev/null 2>&1; then
+    diag_add system.curl 'HTTP client' fail 'curl is required for network diagnostics.' true
+    return
+  fi
+  diag_add system.curl 'HTTP client' pass 'curl is available.' true
+  if [ "$PROFILE_PROTOCOL" = openai ]; then models_url="${PROFILE_URL%/}/models"
+  else models_url="${PROFILE_URL%/}/v1/models"; fi
+  auth_kind="$PROFILE_AUTH_KIND"; token="$PROFILE_TOKEN"
+  if http_request GET "$models_url" "$auth_kind" "$token" '' 'application/json'; then
+    case "$HTTP_STATUS" in
+      2??) diag_add endpoint.reachable 'Endpoint reachability' pass 'Endpoint accepted an authenticated model-list request.' true ;;
+      401 | 403) diag_add endpoint.reachable 'Endpoint reachability' fail 'Endpoint rejected the configured credential.' true ;;
+      404 | 405) diag_add endpoint.reachable 'Endpoint reachability' warn 'Endpoint is reachable but does not expose model discovery.' false ;;
+      429) diag_add endpoint.reachable 'Endpoint reachability' warn 'Endpoint is reachable but currently rate-limited.' false ;;
+      *) diag_add endpoint.reachable 'Endpoint reachability' fail "Endpoint returned HTTP $HTTP_STATUS." true ;;
+    esac
+  else
+    diag_add endpoint.reachable 'Endpoint reachability' fail 'Endpoint connection failed or timed out.' true
+  fi
+}
+
+common_system_diagnostics() {
+  if [ -d "$CCX_HOME" ]; then
+    diag_add system.config_dir 'Config directory' pass 'CCX configuration directory exists.' false
+  else
+    diag_add system.config_dir 'Config directory' warn 'CCX configuration directory does not exist yet.' false
+  fi
+  if command -v "$CCX_CLAUDE_BIN" >/dev/null 2>&1; then
+    diag_add system.claude_binary 'Claude binary' pass 'Claude Code is available.' true
+  else
+    diag_add system.claude_binary 'Claude binary' fail 'Claude Code is not available.' true
+  fi
+}
+
+cmd_doctor() {
+  local name="" json=false network=true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=true; shift ;;
+      --no-network) network=false; shift ;;
+      -h | --help)
+        printf 'Usage: ccx doctor [profile] [--json] [--no-network]\n'
+        return 0
+        ;;
+      --*) die "doctor: unknown option: $1" ;;
+      *) [ -z "$name" ] || die 'doctor: only one profile may be specified'; name="$1"; shift ;;
+    esac
+  done
+  diag_reset doctor "$name"
+  common_system_diagnostics
+  if [ -n "$name" ]; then
+    profile_diagnostics "$name" "$network"
+  else
+    local count=0 d
+    if [ -d "$(profiles_dir)" ]; then
+      for d in "$(profiles_dir)"/*/profile.env; do [ -f "$d" ] && count=$((count + 1)); done
+    fi
+    if [ "$count" -gt 0 ]; then
+      diag_add profiles.available 'Profiles' pass "$count profile(s) are available; pass a profile name for full checks." false
+    else
+      diag_add profiles.available 'Profiles' warn 'No profiles are available yet.' false
+    fi
+  fi
+  diag_finish "$json"
+}
+
+certify_add_skipped() { # check ids not selected or blocked
+  local cap="$1" message="$2" required="$3"
+  case "$cap" in
+    basic) DIAG_CAP_BASIC=skip; diag_add capability.basic 'Basic response' skip "$message" "$required" ;;
+    streaming) DIAG_CAP_STREAMING=skip; diag_add capability.streaming 'Streaming' skip "$message" "$required" ;;
+    tools) DIAG_CAP_TOOLS=skip; diag_add capability.tools 'Tool calls' skip "$message" "$required" ;;
+  esac
+}
+
+certify_skip_remaining() { # reason for selected capabilities
+  local reason="$1" part required
+  for part in basic streaming tools; do
+    case "$selected" in
+      *",$part,"*) certify_add_skipped "$part" "$reason" true ;;
+      *) certify_add_skipped "$part" "Capability was not selected." false ;;
+    esac
+  done
+}
+
+certify_probe() { # capability; adds a check and sets capability state
+  local cap="$1" endpoint payload accept='application/json' required=true
+  local model; model="$(json_escape "$PROFILE_MODEL")"
+  if [ "$PROFILE_PROTOCOL" = anthropic ]; then
+    endpoint="${PROFILE_URL%/}/v1/messages"
+    case "$cap" in
+      basic) payload="{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}" ;;
+      streaming) payload="{\"model\":\"$model\",\"max_tokens\":1,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}"; accept='text/event-stream' ;;
+      tools) payload="{\"model\":\"$model\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Call ccx_probe exactly once.\"}],\"tools\":[{\"name\":\"ccx_probe\",\"description\":\"Inert compatibility probe; performs no action.\",\"input_schema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"ccx_probe\"}}" ;;
+    esac
+  else
+    endpoint="${PROFILE_URL%/}/chat/completions"
+    case "$cap" in
+      basic) payload="{\"model\":\"$model\",\"max_tokens\":1,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}" ;;
+      streaming) payload="{\"model\":\"$model\",\"max_tokens\":1,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with OK.\"}]}"; accept='text/event-stream' ;;
+      tools) payload="{\"model\":\"$model\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Call ccx_probe exactly once.\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"ccx_probe\",\"description\":\"Inert compatibility probe; performs no action.\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}}],\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"ccx_probe\"}}}" ;;
+    esac
+  fi
+
+  if ! http_request POST "$endpoint" "$PROFILE_AUTH_KIND" "$PROFILE_TOKEN" "$payload" "$accept"; then
+    case "$cap" in
+      basic) DIAG_CAP_BASIC=fail; diag_add capability.basic 'Basic response' fail 'Probe connection failed or timed out.' true ;;
+      streaming) DIAG_CAP_STREAMING=fail; diag_add capability.streaming 'Streaming' fail 'Probe connection failed or timed out.' "$required" ;;
+      tools) DIAG_CAP_TOOLS=fail; diag_add capability.tools 'Tool calls' fail 'Probe connection failed or timed out.' "$required" ;;
+    esac
+    return
+  fi
+  if [[ "$HTTP_STATUS" != 2?? ]]; then
+    local msg="Probe was rejected with HTTP $HTTP_STATUS."
+    case "$cap" in
+      basic) DIAG_CAP_BASIC=fail; diag_add capability.basic 'Basic response' fail "$msg" true ;;
+      streaming) DIAG_CAP_STREAMING=fail; diag_add capability.streaming 'Streaming' fail "$msg" "$required" ;;
+      tools) DIAG_CAP_TOOLS=fail; diag_add capability.tools 'Tool calls' fail "$msg" "$required" ;;
+    esac
+    return
+  fi
+
+  case "$cap" in
+    basic)
+      if probe_shape_valid basic "$PROFILE_PROTOCOL"; then
+        DIAG_CAP_BASIC=pass; diag_add capability.basic 'Basic response' pass 'Provider returned a recognized response.' true
+      else
+        DIAG_CAP_BASIC=fail; diag_add capability.basic 'Basic response' fail 'Provider returned an unrecognized response shape.' true
+      fi
+      ;;
+    streaming)
+      if probe_shape_valid streaming "$PROFILE_PROTOCOL"; then
+        DIAG_CAP_STREAMING=pass; diag_add capability.streaming 'Streaming' pass 'Provider returned a valid event stream.' "$required"
+      else
+        DIAG_CAP_STREAMING=fail; diag_add capability.streaming 'Streaming' fail 'Provider did not return valid stream events.' "$required"
+      fi
+      ;;
+    tools)
+      if probe_shape_valid tools "$PROFILE_PROTOCOL"; then
+        DIAG_CAP_TOOLS=pass; diag_add capability.tools 'Tool calls' pass 'Provider returned the inert tool call.' "$required"
+      else
+        DIAG_CAP_TOOLS=fail; diag_add capability.tools 'Tool calls' fail 'Provider did not return the requested inert tool call.' "$required"
+      fi
+      ;;
+  esac
+}
+
+cmd_certify() {
+  local name="" json=false yes=false checks='basic,streaming,tools' selected="" ans=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json=true; shift ;;
+      --yes | -y) yes=true; shift ;;
+      --checks) [ $# -ge 2 ] || die 'certify: --checks requires a value'; checks="$2"; shift 2 ;;
+      -h | --help)
+        printf 'Usage: ccx certify <profile> [--checks basic,streaming,tools] [--yes] [--json]\n'
+        return 0
+        ;;
+      --*) die "certify: unknown option: $1" ;;
+      *) [ -z "$name" ] || die 'certify: only one profile may be specified'; name="$1"; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die 'certify: profile name required'
+  [ -n "$checks" ] || die 'certify: --checks cannot be empty'
+  case ",$checks," in
+    *,all,*) checks='basic,streaming,tools' ;;
+  esac
+  local part rest="$checks"
+  while [ -n "$rest" ]; do
+    part="${rest%%,*}"; if [ "$rest" = "$part" ]; then rest=""; else rest="${rest#*,}"; fi
+    case "$part" in basic | streaming | tools) selected="$selected,$part," ;; *) die "certify: unknown check: $part" ;; esac
+  done
+
+  diag_reset certify "$name"
+  common_system_diagnostics
+  profile_diagnostics "$name" omit
+  if [ -n "$PROFILE_ROUTER" ]; then
+    diag_add certify.scope 'Certification scope' pass 'Probes target the OpenAI-compatible upstream; router translation is covered by router conformance tests.' false
+  elif [ -n "$PROFILE_URL" ]; then
+    diag_add certify.scope 'Certification scope' pass 'Probes target the configured Anthropic-compatible endpoint.' false
+  else
+    diag_add certify.scope 'Certification scope' fail 'Certification requires an explicit endpoint and credential; Claude login sessions are not read.' true
+  fi
+
+  if [ "$yes" != true ]; then
+    if [ "$json" != true ] && [ -t 0 ]; then
+      printf 'Certification sends up to three minimal requests and may incur provider charges. Continue? [y/N] '
+      read -r ans || true
+      case "$ans" in y | Y | yes | YES) yes=true ;; esac
+    fi
+  fi
+  if [ "$yes" != true ]; then
+    diag_add certify.consent 'Probe consent' fail 'Active probes require confirmation; pass --yes after user consent.' true
+    certify_skip_remaining 'Probe was not run without consent.'
+    diag_finish "$json"
+    return
+  fi
+  diag_add certify.consent 'Probe consent' pass 'Active minimal probes were explicitly authorized.' true
+
+  if ! command -v "$CCX_CURL_BIN" >/dev/null 2>&1; then
+    diag_add system.curl 'HTTP client' fail 'curl is required for certification.' true
+    certify_skip_remaining 'Probe was blocked by failed preflight checks.'
+    diag_finish "$json"
+    return
+  fi
+  diag_add system.curl 'HTTP client' pass 'curl is available.' true
+  if ! json_parser_available; then
+    diag_add system.json_parser 'JSON parser' fail 'python3 or node is required to validate certification responses safely.' true
+    certify_skip_remaining 'Probe was blocked because no safe JSON parser is available.'
+    diag_finish "$json"
+    return
+  fi
+  diag_add system.json_parser 'JSON parser' pass 'A structured response parser is available.' true
+
+  diag_counts
+  if [ "$DIAG_OVERALL" = fail ] || [ "$PROFILE_READY" != true ]; then
+    certify_skip_remaining 'Probe was blocked by failed preflight checks.'
+    diag_finish "$json"
+    return
+  fi
+
+  for part in basic streaming tools; do
+    case "$selected" in
+      *",$part,"*) certify_probe "$part" ;;
+      *) certify_add_skipped "$part" 'Capability was not selected.' false ;;
+    esac
+  done
+  diag_finish "$json"
+}
+
 # Router teardown reads a script global so it works as a trap handler regardless
 # of call site. ccx-router runs in the foreground (we background it ourselves),
 # so killing the spawned PID is enough — no config dir or PID file to clean up.
@@ -475,6 +1374,9 @@ cmd_help() {
 Usage: ccx <profile> [claude args...]   launch claude with a profile
        ccx new                          create a profile (wizard / flags)
        ccx list                         list profiles
+       ccx doctor [profile]             diagnose setup/profile (--json)
+       ccx certify <profile>            run opt-in capability probes
+       ccx logs <profile> [--follow]    show redacted router events
        ccx show <profile>               show a profile (token masked)
        ccx edit <profile>               edit a profile in $EDITOR
        ccx rm <profile>                 remove a profile
@@ -508,22 +1410,106 @@ cmd_list() {
 cmd_new() {
   local name="" provider="" base_url="" token="" model="" model_set="" \
         m_opus="" m_sonnet="" m_haiku="" isolate="" yes="" \
-        router="" upstream_url="" upstream_key=""
+        router="" upstream_url="" upstream_key="" fallback_urls="" \
+        fallback_keys="" router_attempts="" fallback_key_args=0 \
+        pin_only="" pin_order="" pin_require="" fb_pin_only="" fb_pin_order="" \
+        fb_pin_require="" fb_pin_only_args=0 fb_pin_order_args=0 fb_pin_require_args=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
       --provider) provider="$2"; shift 2 ;;
       --base-url) base_url="$2"; shift 2 ;;
       --token) token="$2"; shift 2 ;;
+      --token-stdin)
+        IFS= read -r token || [ -n "$token" ] || die 'new: could not read token from stdin'
+        shift ;;
       --model) model="$2"; model_set=1; shift 2 ;;
       --opus) m_opus="$2"; shift 2 ;;
       --sonnet) m_sonnet="$2"; shift 2 ;;
       --haiku) m_haiku="$2"; shift 2 ;;
       --upstream-url) upstream_url="$2"; shift 2 ;;
       --upstream-key) upstream_key="$2"; shift 2 ;;
+      --upstream-key-stdin)
+        IFS= read -r upstream_key || [ -n "$upstream_key" ] || die 'new: could not read upstream key from stdin'
+        shift ;;
+      --fallback-url)
+        [ $# -ge 2 ] || die 'new: --fallback-url requires a value'
+        case "$2" in *','*) die 'new: fallback URLs cannot contain commas' ;; esac
+        fallback_urls="${fallback_urls:+$fallback_urls,}$2"; shift 2 ;;
+      --fallback-key)
+        [ $# -ge 2 ] || die 'new: --fallback-key requires a value'
+        case "$2" in *','*) die 'new: fallback keys cannot contain commas' ;; esac
+        [ "$fallback_key_args" -eq 0 ] || fallback_keys="$fallback_keys,"
+        fallback_keys="$fallback_keys$2"; fallback_key_args=$((fallback_key_args + 1)); shift 2 ;;
+      --fallback-key-stdin)
+        local stdin_fallback_key=""
+        IFS= read -r stdin_fallback_key \
+          || [ -n "$stdin_fallback_key" ] \
+          || die 'new: could not read fallback key from stdin'
+        case "$stdin_fallback_key" in *','*) die 'new: fallback keys cannot contain commas' ;; esac
+        [ "$fallback_key_args" -eq 0 ] || fallback_keys="$fallback_keys,"
+        fallback_keys="$fallback_keys$stdin_fallback_key"
+        fallback_key_args=$((fallback_key_args + 1)); shift ;;
+      --router-attempts)
+        [ $# -ge 2 ] || die 'new: --router-attempts requires a value'
+        router_attempts="$2"; shift 2 ;;
+      --provider-only)
+        [ $# -ge 2 ] || die 'new: --provider-only requires a value'
+        case "$2" in *';'*) die 'new: provider pinning values cannot contain semicolons' ;; esac
+        pin_only="$2"; shift 2 ;;
+      --provider-order)
+        [ $# -ge 2 ] || die 'new: --provider-order requires a value'
+        case "$2" in *';'*) die 'new: provider pinning values cannot contain semicolons' ;; esac
+        pin_order="$2"; shift 2 ;;
+      --require-parameters) pin_require=1; shift ;;
+      --fallback-provider-only)
+        [ $# -ge 2 ] || die 'new: --fallback-provider-only requires a value'
+        case "$2" in *';'*) die 'new: provider pinning values cannot contain semicolons' ;; esac
+        [ "$fb_pin_only_args" -eq 0 ] || fb_pin_only="$fb_pin_only;"
+        fb_pin_only="$fb_pin_only$2"
+        fb_pin_only_args=$((fb_pin_only_args + 1)); shift 2 ;;
+      --fallback-provider-order)
+        [ $# -ge 2 ] || die 'new: --fallback-provider-order requires a value'
+        case "$2" in *';'*) die 'new: provider pinning values cannot contain semicolons' ;; esac
+        [ "$fb_pin_order_args" -eq 0 ] || fb_pin_order="$fb_pin_order;"
+        fb_pin_order="$fb_pin_order$2"
+        fb_pin_order_args=$((fb_pin_order_args + 1)); shift 2 ;;
+      --fallback-require-parameters)
+        # Positional like --fallback-key, so it takes a value: a bare flag
+        # could not express "leave fallback #1 alone but pin fallback #2".
+        [ $# -ge 2 ] || die 'new: --fallback-require-parameters requires a value'
+        [ "$fb_pin_require_args" -eq 0 ] || fb_pin_require="$fb_pin_require;"
+        case "$2" in
+          1 | true) fb_pin_require="${fb_pin_require}1" ;;
+          0 | false | '') ;;
+          *) die 'new: --fallback-require-parameters must be 1 or 0' ;;
+        esac
+        fb_pin_require_args=$((fb_pin_require_args + 1)); shift 2 ;;
       --isolate) isolate=true; shift ;;
       --no-isolate) isolate=false; shift ;;
       --yes | -y) yes=1; shift ;;
+      -h | --help)
+        cat <<'EOF'
+Usage: ccx new [--name NAME] [--provider PROVIDER] [--model MODEL] [--yes]
+               [--base-url URL] [--token TOKEN|--token-stdin]
+               [--upstream-url URL] [--upstream-key KEY|--upstream-key-stdin]
+               [--fallback-url URL ...] [--fallback-key KEY|--fallback-key-stdin ...]
+               [--router-attempts 1..10]
+               [--provider-only SLUGS] [--provider-order SLUGS] [--require-parameters]
+               [--fallback-provider-only SLUGS ...] [--fallback-provider-order SLUGS ...]
+               [--fallback-require-parameters 1|0 ...]
+
+OpenRouter provider pinning takes comma-separated provider slugs and applies to
+one upstream each: the --provider-* flags pin the primary, and each repeated
+--fallback-provider-* flag pins the --fallback-url at the same position.
+--require-parameters asks OpenRouter for providers that support the request's
+parameters, which is what keeps a non-tool-capable endpoint out of the way.
+
+Prefer the hidden interactive prompt or *-stdin options for secrets. Supplying a
+secret directly as an argument can expose it to shell history and process tools.
+EOF
+        return 0
+        ;;
       *) die "new: unknown option: $1" ;;
     esac
   done
@@ -533,6 +1519,7 @@ cmd_new() {
   [ -e "$(profile_dir "$name")" ] && die "profile already exists: $name"
   [ -n "$provider" ] || choose_provider
   [ -n "$provider" ] || die "provider is required"
+  valid_profile_name "$provider" || die 'provider name must contain only letters, digits, _ or -'
 
   local tf has_opus="" has_sonnet="" has_haiku=""
   tf="$(template_file "$provider")"
@@ -547,6 +1534,35 @@ cmd_new() {
     [ -n "$isolate" ]  || isolate="$(kv_get "$tf" CCX_ISOLATE)"
   fi
   [ -n "$isolate" ] || isolate=true
+  case "$isolate" in true | false) ;; *) die 'CCX_ISOLATE must be true or false' ;; esac
+  if [ -z "$router" ] && { [ -n "$fallback_urls" ] || [ -n "$fallback_keys" ] || [ -n "$router_attempts" ]; }; then
+    die 'new: fallback options are only valid for OpenAI-compatible router providers'
+  fi
+  if [ "$fallback_key_args" -gt 0 ] && [ -z "$fallback_urls" ]; then
+    die 'new: --fallback-key requires at least one --fallback-url'
+  fi
+  if [ -z "$router" ] && { [ -n "$pin_only" ] || [ -n "$pin_order" ] || [ -n "$pin_require" ] \
+    || [ -n "$fb_pin_only" ] || [ -n "$fb_pin_order" ] || [ -n "$fb_pin_require" ]; }; then
+    die 'new: provider pinning is only valid for OpenAI-compatible router providers'
+  fi
+  if [ -z "$fallback_urls" ] \
+    && { [ "$fb_pin_only_args" -gt 0 ] || [ "$fb_pin_order_args" -gt 0 ] \
+      || [ "$fb_pin_require_args" -gt 0 ]; }; then
+    die 'new: fallback provider pinning requires at least one --fallback-url'
+  fi
+  pin_only="$(join_pinning "$pin_only" "$fb_pin_only")"
+  pin_order="$(join_pinning "$pin_order" "$fb_pin_order")"
+  pin_require="$(join_pinning "$pin_require" "$fb_pin_require")"
+  local pin_max=1
+  [ -z "$fallback_urls" ] || pin_max=$((1 + $(csv_entry_count "$fallback_urls")))
+  validate_provider_pinning CCX_ROUTER_PROVIDER_ONLY "$pin_only" "$pin_max"
+  validate_provider_pinning CCX_ROUTER_PROVIDER_ORDER "$pin_order" "$pin_max"
+  validate_require_parameters CCX_ROUTER_REQUIRE_PARAMETERS "$pin_require" "$pin_max"
+  if [ -n "$router_attempts" ]; then
+    case "$router_attempts" in '' | *[!0-9]*) die 'new: --router-attempts must be between 1 and 10' ;; esac
+    [ "$router_attempts" -ge 1 ] && [ "$router_attempts" -le 10 ] \
+      || die 'new: --router-attempts must be between 1 and 10'
+  fi
 
   # A custom provider (no template) has no endpoint baked in — ask for it so the
   # profile is usable, and so its model list can be fetched. (custom-oai covers
@@ -579,6 +1595,23 @@ cmd_new() {
     fi
   fi
 
+  # Validate every value before model discovery or profile serialization. This
+  # prevents plaintext credential transport and newline-based env injection.
+  require_single_line 'provider' "$provider"
+  require_single_line 'API token' "$token" true
+  require_single_line 'upstream API key' "$upstream_key" true
+  require_single_line 'router type' "$router" true
+  if [ -n "$router" ]; then
+    require_endpoint_url 'upstream URL' "$upstream_url"
+    validate_fallback_config "$fallback_urls" "$fallback_keys"
+    local fallback_url_count
+    fallback_url_count="$(csv_entry_count "$fallback_urls")"
+    [ "$fallback_key_args" -le "$fallback_url_count" ] \
+      || die 'more fallback keys than fallback URLs are configured'
+  elif [ -n "$base_url" ]; then
+    require_endpoint_url 'base URL' "$base_url"
+  fi
+
   # Pick the model interactively unless given with --model or running with -y.
   # choose_model fetches the provider's live /models list when it can, then falls
   # back to the template default + manual entry. Models URL priority:
@@ -589,10 +1622,12 @@ cmd_new() {
       models_url_tmpl="$(kv_get "$tf" CCX_MODELS_URL)"
       models_auth_tmpl="$(kv_get "$tf" CCX_MODELS_AUTH)"   # 'bearer' or 'anthropic'
     fi
+    case "$models_auth_tmpl" in '' | bearer | anthropic) ;; *) die 'CCX_MODELS_AUTH must be bearer or anthropic' ;; esac
     if   [ -n "$models_url_tmpl" ];                  then m_url="$models_url_tmpl"
     elif [ -n "$router" ] && [ -n "$upstream_url" ]; then m_url="${upstream_url%/}/models"
     elif [ -n "$base_url" ];                         then m_url="${base_url%/}/v1/models"
     fi
+    [ -z "$m_url" ] || require_endpoint_url 'model discovery URL' "$m_url"
     # Auth style: router upstreams use Bearer; Anthropic bases use x-api-key.
     # A template may override via CCX_MODELS_AUTH when its list endpoint differs
     # (e.g. kimi lists through Moonshot's OpenAI /v1/models, which wants Bearer).
@@ -616,6 +1651,11 @@ cmd_new() {
     if [ -z "$m_haiku" ]  && [ -n "$has_haiku" ];  then m_haiku="$model";  fi
   fi
 
+  require_single_line 'model' "$model" true
+  require_single_line 'opus model' "$m_opus" true
+  require_single_line 'sonnet model' "$m_sonnet" true
+  require_single_line 'haiku model' "$m_haiku" true
+
   local pdir penv
   pdir="$(profile_dir "$name")"
   mkdir -p "$pdir"
@@ -630,6 +1670,12 @@ cmd_new() {
       printf 'CCX_ROUTER=%s\n' "$router"
       [ -n "$upstream_url" ] && printf 'CCX_UPSTREAM_BASE_URL=%s\n' "$upstream_url"
       [ -n "$upstream_key" ] && printf 'CCX_UPSTREAM_API_KEY=%s\n' "$upstream_key"
+      [ -n "$fallback_urls" ] && printf 'CCX_ROUTER_FALLBACK_URLS=%s\n' "$fallback_urls"
+      [ -n "$fallback_keys" ] && printf 'CCX_ROUTER_FALLBACK_KEYS=%s\n' "$fallback_keys"
+      [ -n "$router_attempts" ] && printf 'CCX_ROUTER_ATTEMPTS_PER_UPSTREAM=%s\n' "$router_attempts"
+      [ -n "$pin_only" ] && printf 'CCX_ROUTER_PROVIDER_ONLY=%s\n' "$pin_only"
+      [ -n "$pin_order" ] && printf 'CCX_ROUTER_PROVIDER_ORDER=%s\n' "$pin_order"
+      [ -n "$pin_require" ] && printf 'CCX_ROUTER_REQUIRE_PARAMETERS=%s\n' "$pin_require"
     else
       [ -n "$base_url" ] && printf 'ANTHROPIC_BASE_URL=%s\n' "$base_url"
       [ -n "$token" ]    && printf 'ANTHROPIC_AUTH_TOKEN=%s\n' "$token"
@@ -649,12 +1695,58 @@ cmd_new() {
 
 run_router() { # name provider [claude args...] — bring up ccx-router, then run claude
   local name="$1" provider="$2"; shift 2
-  local pdir penv router port apikey upstream_url upstream_key bin
+  local pdir penv router port apikey upstream_url upstream_key bin \
+        fallback_urls fallback_keys attempts connect_timeout response_timeout \
+        stream_idle_timeout stream_ping_interval stream_usage router_log log_file \
+        pin_only pin_order pin_require pin_max
   pdir="$(profile_dir "$name")"
   penv="$pdir/profile.env"
   router="$(kv_get "$penv" CCX_ROUTER)"
   upstream_url="$(kv_get "$penv" CCX_UPSTREAM_BASE_URL)"
   upstream_key="$(kv_get "$penv" CCX_UPSTREAM_API_KEY)"
+  fallback_urls="${CCX_ROUTER_FALLBACK_URLS:-$(kv_get "$penv" CCX_ROUTER_FALLBACK_URLS)}"
+  fallback_keys="${CCX_ROUTER_FALLBACK_KEYS:-$(kv_get "$penv" CCX_ROUTER_FALLBACK_KEYS)}"
+  attempts="${CCX_ROUTER_ATTEMPTS_PER_UPSTREAM:-$(kv_get "$penv" CCX_ROUTER_ATTEMPTS_PER_UPSTREAM)}"
+  connect_timeout="${CCX_ROUTER_CONNECT_TIMEOUT_MS:-$(kv_get "$penv" CCX_ROUTER_CONNECT_TIMEOUT_MS)}"
+  response_timeout="${CCX_ROUTER_RESPONSE_TIMEOUT_MS:-$(kv_get "$penv" CCX_ROUTER_RESPONSE_TIMEOUT_MS)}"
+  stream_idle_timeout="${CCX_ROUTER_STREAM_IDLE_TIMEOUT_MS:-$(kv_get "$penv" CCX_ROUTER_STREAM_IDLE_TIMEOUT_MS)}"
+  stream_ping_interval="${CCX_ROUTER_STREAM_PING_INTERVAL_MS:-$(kv_get "$penv" CCX_ROUTER_STREAM_PING_INTERVAL_MS)}"
+  stream_usage="${CCX_ROUTER_STREAM_USAGE:-$(kv_get "$penv" CCX_ROUTER_STREAM_USAGE)}"
+  router_log="${CCX_ROUTER_LOG:-$(kv_get "$penv" CCX_ROUTER_LOG)}"
+  pin_only="${CCX_ROUTER_PROVIDER_ONLY:-$(kv_get "$penv" CCX_ROUTER_PROVIDER_ONLY)}"
+  pin_order="${CCX_ROUTER_PROVIDER_ORDER:-$(kv_get "$penv" CCX_ROUTER_PROVIDER_ORDER)}"
+  pin_require="${CCX_ROUTER_REQUIRE_PARAMETERS:-$(kv_get "$penv" CCX_ROUTER_REQUIRE_PARAMETERS)}"
+  [ -n "$router_log" ] || router_log=json
+  log_file="$pdir/router.log"
+
+  require_single_line 'upstream API key' "$upstream_key" true
+  require_endpoint_url 'upstream URL' "$upstream_url"
+  validate_fallback_config "$fallback_urls" "$fallback_keys"
+  pin_max=1
+  [ -z "$fallback_urls" ] || pin_max=$((1 + $(csv_entry_count "$fallback_urls")))
+  validate_provider_pinning CCX_ROUTER_PROVIDER_ONLY "$pin_only" "$pin_max"
+  validate_provider_pinning CCX_ROUTER_PROVIDER_ORDER "$pin_order" "$pin_max"
+  validate_require_parameters CCX_ROUTER_REQUIRE_PARAMETERS "$pin_require" "$pin_max"
+  if [ -n "$attempts" ]; then
+    case "$attempts" in *[!0-9]*) die 'attempts per upstream must be between 1 and 10' ;; esac
+    [ "$attempts" -ge 1 ] && [ "$attempts" -le 10 ] \
+      || die 'attempts per upstream must be between 1 and 10'
+  fi
+  local timeout_value timeout_label
+  for timeout_label in connect_timeout response_timeout stream_idle_timeout stream_ping_interval; do
+    case "$timeout_label" in
+      connect_timeout) timeout_value="$connect_timeout" ;;
+      response_timeout) timeout_value="$response_timeout" ;;
+      stream_idle_timeout) timeout_value="$stream_idle_timeout" ;;
+      stream_ping_interval) timeout_value="$stream_ping_interval" ;;
+    esac
+    if [ -n "$timeout_value" ]; then
+      case "$timeout_value" in *[!0-9]*) die 'router timeout values must be positive integers' ;; esac
+      [ "$timeout_value" -gt 0 ] || die 'router timeout values must be positive integers'
+    fi
+  done
+  case "$stream_usage" in '' | auto | on | off) ;; *) die 'CCX_ROUTER_STREAM_USAGE must be auto, on, or off' ;; esac
+  case "$router_log" in json | off) ;; *) die 'CCX_ROUTER_LOG must be json or off' ;; esac
   port="$(pick_free_port)"
   apikey="$(gen_apikey)"
   # Auto mode's server-side classifier needs Anthropic's API to see the
@@ -669,6 +1761,13 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
     printf 'router: %s --port %s --upstream-url %s\n' "$bin" "$port" "$upstream_url"
     printf 'env: CCX_ROUTER_API_KEY=%s\n' "$(mask_token "$apikey")"
     [ -n "$upstream_key" ] && printf 'env: CCX_ROUTER_UPSTREAM_KEY=%s\n' "$(mask_token "$upstream_key")"
+    [ -n "$fallback_urls" ] && printf 'env: CCX_ROUTER_FALLBACK_URLS=%s\n' "$fallback_urls"
+    [ -n "$fallback_keys" ] && printf 'env: CCX_ROUTER_FALLBACK_KEYS=(configured, hidden)\n'
+    [ -n "$attempts" ] && printf 'env: CCX_ROUTER_ATTEMPTS_PER_UPSTREAM=%s\n' "$attempts"
+    [ -n "$pin_only" ] && printf 'env: CCX_ROUTER_PROVIDER_ONLY=%s\n' "$pin_only"
+    [ -n "$pin_order" ] && printf 'env: CCX_ROUTER_PROVIDER_ORDER=%s\n' "$pin_order"
+    [ -n "$pin_require" ] && printf 'env: CCX_ROUTER_REQUIRE_PARAMETERS=%s\n' "$pin_require"
+    printf 'env: CCX_ROUTER_LOG=%s\n' "$router_log"
     printf 'env: ANTHROPIC_BASE_URL=http://127.0.0.1:%s\n' "$port"
     printf 'env: ANTHROPIC_AUTH_TOKEN=%s\n' "$(mask_token "$apikey")"
     printf 'env: CLAUDE_CODE_AUTO_MODE_SERVER=%s\n' "$CLAUDE_CODE_AUTO_MODE_SERVER"
@@ -686,8 +1785,28 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
 
   CCX_ROUTER_TORN=""
   trap router_teardown EXIT INT TERM
-  CCX_ROUTER_API_KEY="$apikey" CCX_ROUTER_UPSTREAM_KEY="$upstream_key" \
-    "$bin" --port "$port" --upstream-url "$upstream_url" >/dev/null 2>&1 &
+  # Replace (rather than truncate) any previous path, so a malicious symlink at
+  # router.log is never followed. mktemp creates the new inode mode 0600 under
+  # the process-wide private umask.
+  local log_tmp
+  log_tmp="$(mktemp "$pdir/.router.log.XXXXXX")" || die 'cannot create private router log'
+  chmod 600 "$log_tmp"
+  mv -f -- "$log_tmp" "$log_file"
+  CCX_ROUTER_API_KEY="$apikey" \
+  CCX_ROUTER_UPSTREAM_KEY="$upstream_key" \
+  CCX_ROUTER_FALLBACK_URLS="$fallback_urls" \
+  CCX_ROUTER_FALLBACK_KEYS="$fallback_keys" \
+  CCX_ROUTER_ATTEMPTS_PER_UPSTREAM="$attempts" \
+  CCX_ROUTER_PROVIDER_ONLY="$pin_only" \
+  CCX_ROUTER_PROVIDER_ORDER="$pin_order" \
+  CCX_ROUTER_REQUIRE_PARAMETERS="$pin_require" \
+  CCX_ROUTER_CONNECT_TIMEOUT_MS="$connect_timeout" \
+  CCX_ROUTER_RESPONSE_TIMEOUT_MS="$response_timeout" \
+  CCX_ROUTER_STREAM_IDLE_TIMEOUT_MS="$stream_idle_timeout" \
+  CCX_ROUTER_STREAM_PING_INTERVAL_MS="$stream_ping_interval" \
+  CCX_ROUTER_STREAM_USAGE="$stream_usage" \
+  CCX_ROUTER_LOG="$router_log" \
+    "$bin" --port "$port" --upstream-url "$upstream_url" >/dev/null 2>>"$log_file" &
   CCX_ROUTER_PID=$!
 
   # Readiness = the port accepts a TCP connection (dependency-free, no curl).
@@ -696,10 +1815,13 @@ run_router() { # name provider [claude args...] — bring up ccx-router, then ru
     if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then ready=1; break; fi
     sleep 1; waited=$((waited + 1))
   done
-  [ -n "$ready" ] || { router_teardown; die \
-    "ccx-router did not become ready on 127.0.0.1:$port within ${timeout}s"; }
+  if [ -z "$ready" ]; then
+    router_teardown
+    [ ! -s "$log_file" ] || { printf 'ccx: router log:\n' >&2; tail -n 20 "$log_file" >&2; }
+    die "ccx-router did not become ready on 127.0.0.1:$port within ${timeout}s"
+  fi
 
-  printf 'ccx: router ready on http://127.0.0.1:%s (%s)\n' "$port" "$provider" >&2
+  printf 'ccx: router ready on http://127.0.0.1:%s (%s); log: %s\n' "$port" "$provider" "$log_file" >&2
   export ANTHROPIC_BASE_URL="http://127.0.0.1:$port"
   export ANTHROPIC_AUTH_TOKEN="$apikey"
 
@@ -723,13 +1845,15 @@ cmd_run() {
     cmd_list >&2
     exit 1
   fi
+  profile_syntax_valid "$penv" \
+    || die "profile '$name' is malformed or contains duplicate environment keys; run: ccx doctor $name --no-network"
 
   local mode; mode="$(stat -c '%a' "$penv" 2>/dev/null || stat -f '%Lp' "$penv")"
   if [ "$mode" != "600" ]; then
     printf 'ccx: warning: %s has mode %s (expected 600); run: chmod 600 %s\n' "$penv" "$mode" "$penv" >&2
   fi
 
-  local isolate=false provider="" router="" key val
+  local isolate=false provider="" router="" base_url="" model="" key val
   local -a exports=()
   while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in '' | '#'*) continue ;; esac
@@ -739,9 +1863,18 @@ cmd_run() {
       CCX_PROVIDER) provider="$val" ;;
       CCX_ROUTER) router="$val" ;;
       CCX_*) : ;;
-      *) export "$key=$val"; exports+=("$key=$val") ;;
+      ANTHROPIC_*)
+        export "$key=$val"; exports+=("$key=$val")
+        [ "$key" != ANTHROPIC_BASE_URL ] || base_url="$val"
+        [ "$key" != ANTHROPIC_MODEL ] || model="$val"
+        ;;
+      *) die "unsupported profile environment key: $key" ;;
     esac
   done < "$penv"
+
+  case "$isolate" in true | false) ;; *) die "profile '$name' has invalid CCX_ISOLATE (expected true or false)" ;; esac
+  require_single_line 'profile provider' "$provider"
+  require_single_line 'profile model' "$model"
 
   if [ "$isolate" = "true" ]; then
     local home; home="$(profile_dir "$name")/home"
@@ -755,6 +1888,7 @@ cmd_run() {
     run_router "$name" "$provider" "$@"
     return
   fi
+  [ -z "$base_url" ] || require_endpoint_url 'profile base URL' "$base_url"
 
   if [ "${CCX_DRY_RUN:-}" = "1" ]; then
     printf 'CCX_DRY_RUN profile=%s provider=%s\n' "$name" "$provider"
@@ -780,13 +1914,37 @@ cmd_show() {
   valid_profile_name "$name" || die "invalid profile name: $name"
   local penv; penv="$(profile_env "$name")"
   [ -f "$penv" ] || die "unknown profile: $name"
+  profile_syntax_valid "$penv" || die "profile '$name' is malformed or contains duplicate keys"
   while IFS= read -r line || [ -n "$line" ]; do
-    case "$line" in
-      ANTHROPIC_AUTH_TOKEN=* | ANTHROPIC_API_KEY=* | CCX_UPSTREAM_API_KEY=*)
+    local show_key="${line%%=*}"
+    case "$show_key" in
+      *TOKEN* | *API_KEY* | *SECRET* | CCX_ROUTER_FALLBACK_KEYS)
         printf '%s=%s\n' "${line%%=*}" "$(mask_token "${line#*=}")" ;;
       *) printf '%s\n' "$line" ;;
     esac
   done < "$penv"
+}
+
+cmd_logs() {
+  local name="${1:-}" follow=false lines="${CCX_LOG_LINES:-100}"
+  [ -n "$name" ] || die 'logs: profile name required'
+  valid_profile_name "$name" || die "invalid profile name: $name"
+  shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -f | --follow) follow=true; shift ;;
+      --lines)
+        [ $# -ge 2 ] || die 'logs: --lines requires a value'
+        lines="$2"; shift 2 ;;
+      *) die "logs: unknown option: $1" ;;
+    esac
+  done
+  case "$lines" in '' | *[!0-9]*) die 'logs: --lines must be a positive integer' ;; esac
+  [ "$lines" -gt 0 ] || die 'logs: --lines must be a positive integer'
+  local log_file; log_file="$(profile_dir "$name")/router.log"
+  [ -f "$log_file" ] && [ ! -L "$log_file" ] \
+    || die "no safe regular router log for profile '$name'; launch it first"
+  if [ "$follow" = true ]; then tail -n "$lines" -f "$log_file"; else tail -n "$lines" "$log_file"; fi
 }
 
 cmd_edit() {
@@ -837,6 +1995,9 @@ main() {
     version | --version | -V) cmd_version ;;
     list | ls) cmd_list ;;
     new) shift; cmd_new "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    certify) shift; cmd_certify "$@" ;;
+    logs | log) shift; cmd_logs "$@" ;;
     show) shift; cmd_show "$@" ;;
     edit) shift; cmd_edit "$@" ;;
     rm | remove | delete) shift; cmd_rm "$@" ;;

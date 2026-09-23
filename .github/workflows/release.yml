@@ -1,0 +1,449 @@
+name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a prerelease
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    name: Validate release
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: meta
+        name: Resolve release metadata
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          prerelease="${INPUT_PRERELEASE:-false}"
+          if [[ "$tag" == *-* ]]; then prerelease=true; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          scripts/check-release-version.sh "$tag"
+      - name: Check release script syntax
+        run: bash -n install.sh scripts/*.sh
+      - name: Test checksum-enforced installation
+        run: scripts/test-installer.sh
+
+  router:
+    name: Router ${{ matrix.os }}/${{ matrix.arch }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: ccx-router
+            asset: ccx-router-linux-x86_64
+          - os: linux
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: ccx-router
+            asset: ccx-router-linux-aarch64
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: ccx-router
+            asset: ccx-router-macos-x86_64
+          - os: macos
+            arch: aarch64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary: ccx-router
+            asset: ccx-router-macos-aarch64
+          - os: windows
+            arch: x86_64
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: ccx-router.exe
+            asset: ccx-router-windows-x86_64.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router
+          key: ${{ matrix.target }}
+      - name: Test router
+        shell: bash
+        run: cargo test --locked --manifest-path router/Cargo.toml --target "${{ matrix.target }}"
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --manifest-path router/Cargo.toml --target "${{ matrix.target }}"
+      - name: Stage release asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "router/target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  prepare-router:
+    name: Checksums and provenance
+    needs: [preflight, router]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      # Optional repository secrets. When set, SHA256SUMS is also signed with
+      # cosign and the corresponding public key is attached to the release.
+      CCX_COSIGN_PRIVATE_KEY: ${{ secrets.CCX_COSIGN_PRIVATE_KEY }}
+      COSIGN_PASSWORD: ${{ secrets.CCX_COSIGN_PASSWORD }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ccx-router-*
+          path: dist
+          merge-multiple: true
+      - name: Validate asset set and create checksums
+        shell: bash
+        run: |
+          expected=5
+          actual="$(find dist -maxdepth 1 -type f -name 'ccx-router-*' | wc -l)"
+          if [ "$actual" -ne "$expected" ]; then
+            echo "expected $expected router assets, found $actual" >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+          (cd dist && sha256sum ccx-router-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Attest router build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/ccx-router-*
+      - name: Install cosign for optional detached signature
+        if: ${{ env.CCX_COSIGN_PRIVATE_KEY != '' }}
+        uses: sigstore/cosign-installer@v3
+      - name: Sign checksums with optional repository key
+        if: ${{ env.CCX_COSIGN_PRIVATE_KEY != '' }}
+        shell: bash
+        run: |
+          cosign public-key --key env://CCX_COSIGN_PRIVATE_KEY > dist/cosign.pub
+          cosign sign-blob --yes \
+            --key env://CCX_COSIGN_PRIVATE_KEY \
+            --output-signature dist/SHA256SUMS.sig \
+            dist/SHA256SUMS
+      - name: Store release-ready router assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-router
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  desktop:
+    name: Desktop ${{ matrix.os }}/${{ matrix.arch }}
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-24.04
+            bundles: deb,appimage
+          - os: macos
+            arch: x86_64
+            runner: macos-15-intel
+            bundles: app,dmg
+          - os: macos
+            arch: aarch64
+            runner: macos-14
+            bundles: app,dmg
+          - os: windows
+            arch: x86_64
+            runner: windows-2022
+            bundles: nsis,msi
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.tag }}
+      - name: Install Linux bundle dependencies
+        if: matrix.os == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            gui/src-tauri
+            gui/core
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: gui
+      - name: Generate native macOS and Windows icons
+        if: matrix.os != 'linux'
+        run: npm run tauri -- icon src-tauri/icons/icon.png
+        working-directory: gui
+      - name: Build Tauri bundles
+        working-directory: gui
+        env:
+          # Optional signing/notarization hooks. Unsigned artifacts still build
+          # when these repository secrets are absent.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run tauri -- build --bundles "${{ matrix.bundles }}"
+      - name: Stage desktop assets
+        shell: bash
+        run: |
+          # macOS runners still ship an older Bash where nounset handling for
+          # empty indexed arrays is inconsistent. Explicit cardinality checks
+          # below provide the same safety without relying on `set -u`.
+          set -eo pipefail
+          shopt -s nullglob
+          mkdir -p dist
+          bundle_search_root="gui/target"
+
+          select_one() {
+            local label="$1"
+            shift
+            if [ "$#" -ne 1 ]; then
+              echo "expected exactly one $label bundle, found $#" >&2
+              find "$bundle_search_root" -path '*/release/bundle/*' -print >&2 || true
+              exit 1
+            fi
+            selected="$1"
+          }
+
+          select_bundle() {
+            local label="$1"
+            local file_type="$2"
+            local path_pattern="$3"
+            local match
+            local matches=()
+            while IFS= read -r -d '' match; do
+              matches+=("$match")
+            done < <(
+              find "$bundle_search_root" \
+                -type "$file_type" -path "$path_pattern" -print0
+            )
+            select_one "$label" "${matches[@]}"
+          }
+
+          case "${{ matrix.os }}-${{ matrix.arch }}" in
+            linux-x86_64)
+              select_bundle "deb" f '*/release/bundle/deb/*.deb'
+              cp "$selected" dist/ccx-desktop-linux-x86_64.deb
+              select_bundle "AppImage" f '*/release/bundle/appimage/*.AppImage'
+              cp "$selected" dist/ccx-desktop-linux-x86_64.AppImage
+              ;;
+            macos-x86_64|macos-aarch64)
+              select_bundle "DMG" f '*/release/bundle/dmg/*.dmg'
+              cp "$selected" "dist/ccx-desktop-macos-${{ matrix.arch }}.dmg"
+              select_bundle "macOS app" d '*/release/bundle/macos/*.app'
+              app_parent="${selected%/*}"
+              app_name="${selected##*/}"
+              COPYFILE_DISABLE=1 tar -czf \
+                "dist/ccx-desktop-macos-${{ matrix.arch }}.app.tar.gz" \
+                -C "$app_parent" "$app_name"
+              ;;
+            windows-x86_64)
+              select_bundle "NSIS" f '*/release/bundle/nsis/*.exe'
+              cp "$selected" dist/ccx-desktop-windows-x86_64-setup.exe
+              select_bundle "MSI" f '*/release/bundle/msi/*.msi'
+              cp "$selected" dist/ccx-desktop-windows-x86_64.msi
+              ;;
+            *)
+              echo "unsupported desktop matrix entry" >&2
+              exit 1
+              ;;
+          esac
+      - name: Store release-ready desktop assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish complete release
+    needs: [preflight, prepare-router, desktop]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-router
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: dist
+          merge-multiple: true
+      - name: Validate complete release asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            ccx-router-linux-x86_64
+            ccx-router-linux-aarch64
+            ccx-router-macos-x86_64
+            ccx-router-macos-aarch64
+            ccx-router-windows-x86_64.exe
+            SHA256SUMS
+            ccx-desktop-linux-x86_64.deb
+            ccx-desktop-linux-x86_64.AppImage
+            ccx-desktop-macos-x86_64.dmg
+            ccx-desktop-macos-x86_64.app.tar.gz
+            ccx-desktop-macos-aarch64.dmg
+            ccx-desktop-macos-aarch64.app.tar.gz
+            ccx-desktop-windows-x86_64-setup.exe
+            ccx-desktop-windows-x86_64.msi
+          )
+
+          for asset in "${expected[@]}"; do
+            if [ ! -f "dist/$asset" ]; then
+              echo "missing release asset: $asset" >&2
+              exit 1
+            fi
+          done
+
+          if { [ -f dist/SHA256SUMS.sig ] && [ ! -f dist/cosign.pub ]; } || \
+             { [ ! -f dist/SHA256SUMS.sig ] && [ -f dist/cosign.pub ]; }; then
+            echo "Cosign signature and public key must be present together" >&2
+            exit 1
+          fi
+
+          for path in dist/*; do
+            asset="${path##*/}"
+            known=false
+            for expected_asset in "${expected[@]}"; do
+              if [ "$asset" = "$expected_asset" ]; then known=true; break; fi
+            done
+            case "$asset" in
+              SHA256SUMS.sig|cosign.pub) known=true ;;
+            esac
+            if [ "$known" != true ]; then
+              echo "unexpected release asset: $asset" >&2
+              exit 1
+            fi
+          done
+      - name: Refuse to modify an existing release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+        with:
+          script: |
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              { owner: context.repo.owner, repo: context.repo.repo, per_page: 100 },
+            );
+            const existing = releases.find(
+              (release) => release.tag_name === process.env.RELEASE_TAG,
+            );
+            if (existing) {
+              core.setFailed(
+                `Release ${process.env.RELEASE_TAG} already exists ` +
+                `(id=${existing.id}, draft=${existing.draft}). ` +
+                "Delete the stale draft or choose a new tag before retrying.",
+              );
+            }
+      - id: draft
+        name: Upload all assets to a hidden draft
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          name: ccx ${{ needs.preflight.outputs.tag }}
+          draft: true
+          prerelease: ${{ needs.preflight.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            Prebuilt `ccx-router` binaries are checksum-verified by `install.sh`.
+
+            GitHub build provenance is attached to every router binary. If this
+            repository has `CCX_COSIGN_PRIVATE_KEY` configured, `SHA256SUMS.sig`
+            and `cosign.pub` are included for detached verification as well.
+
+            Desktop bundles currently use the existing `ccx` command on `PATH`;
+            install the CLI before launching a profile from the desktop app.
+          files: dist/*
+          fail_on_unmatched_files: true
+      - name: Publish the complete draft
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ steps.draft.outputs.id }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+        with:
+          script: |
+            const releaseId = Number(process.env.RELEASE_ID);
+            if (!Number.isSafeInteger(releaseId)) {
+              throw new Error(
+                `Invalid draft release id: ${process.env.RELEASE_ID}`,
+              );
+            }
+            const { data: draft } = await github.rest.repos.getRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+            });
+            if (!draft.draft || draft.tag_name !== process.env.RELEASE_TAG) {
+              throw new Error(
+                `Release ${releaseId} is not the expected hidden draft`,
+              );
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: releaseId,
+              draft: false,
+              prerelease: process.env.PRERELEASE === "true",
+            });

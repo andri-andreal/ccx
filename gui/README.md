@@ -2,6 +2,9 @@
 
 Desktop profile manager for [ccx](../README.md), built with Tauri v2 (Rust) + Svelte.
 
+It supports direct and routed profiles, ordered router fallbacks, automatic offline
+health badges, non-prompt Doctor checks, and consent-gated capability certification.
+
 ## Prerequisites
 - Rust + cargo, `tauri-cli` (`cargo install tauri-cli` or via `npm`)
 - Node + npm
@@ -30,6 +33,16 @@ cargo test --manifest-path gui/Cargo.toml
   (mode 600). A profile made here works with `ccx <name>` and vice versa.
 - "Launch" opens your terminal running `claude` with the profile's environment.
   "Copy" copies `ccx <name>` (requires the CLI installed) — the token never touches the clipboard.
+- The current desktop bundle calls `ccx` from `PATH`; install the CLI/router before
+  launching a profile. Release bundles do not embed a second copy of the CLI.
+- Doctor checks can contact the configured model-list endpoint but never send a
+  prompt. Certification sends up to three minimal requests only after confirmation
+  and may incur provider charges.
+- Router fallback keys are stored in the same private `profile.env`. Existing
+  credentials never enter the renderer: edits preserve them by default, while
+  Replace/Remove are write-only operations.
+- Certification consent is enforced by an OS-native dialog in Rust, even for a
+  direct IPC invocation. Production CSP permits only packaged assets and Tauri IPC.
 - Provider endpoints/model IDs are editable defaults; change them per profile or in
   `~/.config/ccx/providers/*.tmpl`.
 - A standalone `cargo build` needs the frontend built first (`npm run build`); `npm run tauri dev/build` does this automatically.

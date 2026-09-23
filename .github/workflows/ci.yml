@@ -5,51 +5,106 @@ on:
     branches: [main]
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   cli:
     name: CLI — shellcheck + bash tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
         run: sudo apt-get update && sudo apt-get install -y shellcheck
       - name: ShellCheck (error severity)
-        run: shellcheck -S error bin/ccx install.sh tests/*.sh
+        run: shellcheck -S error bin/ccx install.sh tests/*.sh scripts/*.sh
       - name: Bash test suite
         run: bash tests/test_ccx.sh
 
-  rust:
-    name: Rust — fmt + clippy + test
-    runs-on: ubuntu-latest
+  release-scripts:
+    name: Installer and release scripts
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Check shell syntax
+        run: bash -n install.sh scripts/*.sh
+      - name: Verify component versions agree
+        shell: bash
+        run: |
+          version="$(sed -n 's/^CCX_VERSION="\([^"]*\)".*/\1/p' bin/ccx | head -n 1)"
+          scripts/check-release-version.sh "v$version"
+      - name: Test verified prebuilt installation
+        run: scripts/test-installer.sh
+
+  rust:
+    name: Rust — fmt + clippy + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Tauri test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            router
+            gui
       - name: Format check
         run: |
           cargo fmt --manifest-path router/Cargo.toml --check
           cargo fmt --manifest-path gui/Cargo.toml --all --check
       - name: Clippy (deny warnings)
         run: |
-          cargo clippy --manifest-path router/Cargo.toml --all-targets -- -D warnings
-          cargo clippy --manifest-path gui/core/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path router/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --locked --manifest-path gui/Cargo.toml --all-targets -- -D warnings
       - name: Test
         run: |
-          cargo test --manifest-path router/Cargo.toml
-          cargo test --manifest-path gui/core/Cargo.toml
+          cargo test --locked --manifest-path router/Cargo.toml
+          cargo test --locked --manifest-path gui/Cargo.toml
+
+  router-platforms:
+    name: Router test — ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macOS
+            runner: macos-14
+          - os: Windows
+            runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: router
+      - name: Test ccx-router
+        run: cargo test --locked --manifest-path router/Cargo.toml
+      - name: Test macOS prebuilt installer contract
+        if: runner.os == 'macOS'
+        run: scripts/test-installer.sh
 
   web:
     name: Web — site + GUI frontend build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            site/package-lock.json
+            gui/package-lock.json
       - name: Build docs site
         working-directory: site
         run: npm ci && npm run build

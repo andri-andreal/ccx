@@ -7,7 +7,8 @@
 //! (PR #1356, "Content block is not a text block") precisely because it failed
 //! to do this.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
 
 use serde_json::{json, Value};
 
@@ -32,13 +33,45 @@ impl SseEvent {
     pub fn to_wire(&self) -> String {
         format!("event: {}\ndata: {}\n\n", self.event, self.data)
     }
+
+    pub fn error(error_type: &str, message: &str, request_id: &str) -> Self {
+        SseEvent::new(
+            "error",
+            json!({
+                "type": "error",
+                "error": {"type": error_type, "message": message},
+                "request_id": request_id
+            }),
+        )
+    }
+
+    pub fn ping() -> Self {
+        SseEvent::new("ping", json!({"type": "ping"}))
+    }
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamTranslationError(pub String);
+
+impl fmt::Display for StreamTranslationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StreamTranslationError {}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Open {
     None,
     Text(usize),
-    Tool(usize),
+}
+
+#[derive(Default)]
+struct PendingTool {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
 }
 
 pub struct StreamTranslator {
@@ -46,7 +79,11 @@ pub struct StreamTranslator {
     id: String,
     open: Open,
     next_index: usize,
-    tool_index: HashMap<u32, usize>, // OpenAI tool_call index -> Anthropic block index
+    // OpenAI may interleave argument deltas for multiple tool calls. Anthropic
+    // content blocks are emitted sequentially, so calls are buffered by their
+    // upstream index and flushed in index order once complete.
+    pending_tools: BTreeMap<u32, PendingTool>,
+    flushed_tools: HashSet<u32>,
     finish_reason: Option<String>,
     saw_tool_call: bool,
     output_tokens: u32,
@@ -59,7 +96,8 @@ impl StreamTranslator {
             id: id.into(),
             open: Open::None,
             next_index: 0,
-            tool_index: HashMap::new(),
+            pending_tools: BTreeMap::new(),
+            flushed_tools: HashSet::new(),
             finish_reason: None,
             saw_tool_call: false,
             output_tokens: 0,
@@ -88,7 +126,7 @@ impl StreamTranslator {
     fn close_open(&mut self, out: &mut Vec<SseEvent>) {
         let idx = match self.open {
             Open::None => return,
-            Open::Text(i) | Open::Tool(i) => i,
+            Open::Text(i) => i,
         };
         out.push(SseEvent::new(
             "content_block_stop",
@@ -97,7 +135,7 @@ impl StreamTranslator {
         self.open = Open::None;
     }
 
-    pub fn push(&mut self, chunk: &ChatChunk) -> Vec<SseEvent> {
+    pub fn push(&mut self, chunk: &ChatChunk) -> Result<Vec<SseEvent>, StreamTranslationError> {
         let mut out = Vec::new();
 
         if let Some(u) = &chunk.usage {
@@ -106,10 +144,19 @@ impl StreamTranslator {
             }
         }
 
+        if chunk.choices.len() > 1 {
+            return Err(StreamTranslationError(
+                "upstream returned multiple streaming choices; only n=1 is supported".into(),
+            ));
+        }
+
         for choice in &chunk.choices {
             // Text delta.
             if let Some(text) = &choice.delta.content {
                 if !text.is_empty() {
+                    if !self.pending_tools.is_empty() {
+                        self.flush_tools(&mut out)?;
+                    }
                     if !matches!(self.open, Open::Text(_)) {
                         self.close_open(&mut out);
                         let idx = self.next_index;
@@ -133,54 +180,105 @@ impl StreamTranslator {
 
             // Tool-call deltas.
             if let Some(tcs) = &choice.delta.tool_calls {
+                if !tcs.is_empty() {
+                    self.close_open(&mut out);
+                }
                 for tc in tcs {
                     self.saw_tool_call = true;
-                    let aidx = match self.tool_index.get(&tc.index) {
-                        Some(&i) => i,
-                        None => {
-                            // New tool call: close whatever is open, open a tool block.
-                            self.close_open(&mut out);
-                            let idx = self.next_index;
-                            self.next_index += 1;
-                            self.tool_index.insert(tc.index, idx);
-                            self.open = Open::Tool(idx);
-                            let name = tc
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.name.clone())
-                                .unwrap_or_default();
-                            let id = tc.id.clone().unwrap_or_else(|| format!("call_{idx}"));
-                            out.push(SseEvent::new(
-                                "content_block_start",
-                                json!({"type":"content_block_start","index":idx,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
-                            ));
-                            idx
-                        }
-                    };
+                    if self.flushed_tools.contains(&tc.index) {
+                        return Err(StreamTranslationError(format!(
+                            "upstream sent another delta for completed tool index {}",
+                            tc.index
+                        )));
+                    }
+                    let pending = self.pending_tools.entry(tc.index).or_default();
+                    merge_field(&mut pending.id, tc.id.as_deref(), "tool id", tc.index)?;
                     if let Some(f) = &tc.function {
+                        merge_field(
+                            &mut pending.name,
+                            f.name.as_deref(),
+                            "function name",
+                            tc.index,
+                        )?;
                         if let Some(args) = &f.arguments {
-                            if !args.is_empty() {
-                                out.push(SseEvent::new(
-                                    "content_block_delta",
-                                    json!({"type":"content_block_delta","index":aidx,"delta":{"type":"input_json_delta","partial_json":args}}),
-                                ));
-                            }
+                            pending.arguments.push_str(args);
                         }
                     }
                 }
             }
 
             if let Some(fr) = &choice.finish_reason {
+                if let Some(existing) = &self.finish_reason {
+                    if existing != fr {
+                        return Err(StreamTranslationError(format!(
+                            "conflicting upstream finish reasons: {existing} and {fr}"
+                        )));
+                    }
+                }
                 self.finish_reason = Some(fr.clone());
             }
         }
 
-        out
+        Ok(out)
     }
 
-    pub fn finish(&mut self) -> Vec<SseEvent> {
+    fn flush_tools(&mut self, out: &mut Vec<SseEvent>) -> Result<(), StreamTranslationError> {
+        self.close_open(out);
+        let tools = std::mem::take(&mut self.pending_tools);
+        for (upstream_index, tool) in tools {
+            let name = tool.name.filter(|name| !name.is_empty()).ok_or_else(|| {
+                StreamTranslationError(format!(
+                    "upstream tool index {upstream_index} is missing a function name"
+                ))
+            })?;
+            let arguments = if tool.arguments.trim().is_empty() {
+                "{}".to_owned()
+            } else {
+                tool.arguments
+            };
+            let input: Value = serde_json::from_str(&arguments).map_err(|error| {
+                StreamTranslationError(format!(
+                    "upstream returned invalid JSON arguments for tool '{name}': {error}"
+                ))
+            })?;
+            if !input.is_object() {
+                return Err(StreamTranslationError(format!(
+                    "upstream arguments for tool '{name}' must be a JSON object"
+                )));
+            }
+
+            let index = self.next_index;
+            self.next_index += 1;
+            let id = tool
+                .id
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| format!("call_ccx{upstream_index}"));
+            out.push(SseEvent::new(
+                "content_block_start",
+                json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
+            ));
+            out.push(SseEvent::new(
+                "content_block_delta",
+                json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":arguments}}),
+            ));
+            out.push(SseEvent::new(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            ));
+            self.flushed_tools.insert(upstream_index);
+        }
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<SseEvent>, StreamTranslationError> {
         let mut out = Vec::new();
         self.close_open(&mut out);
+        self.flush_tools(&mut out)?;
+        if self.finish_reason.is_none() {
+            return Err(StreamTranslationError(
+                "upstream stream ended without a finish_reason".into(),
+            ));
+        }
         let stop_reason = map_stop_reason(self.finish_reason.as_deref(), self.saw_tool_call);
         out.push(SseEvent::new(
             "message_delta",
@@ -190,7 +288,32 @@ impl StreamTranslator {
             "message_stop",
             json!({"type":"message_stop"}),
         ));
-        out
+        Ok(out)
+    }
+
+    pub fn output_tokens(&self) -> u32 {
+        self.output_tokens
+    }
+}
+
+fn merge_field(
+    current: &mut Option<String>,
+    incoming: Option<&str>,
+    field: &str,
+    index: u32,
+) -> Result<(), StreamTranslationError> {
+    let Some(incoming) = incoming.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match current {
+        Some(existing) if existing != incoming => Err(StreamTranslationError(format!(
+            "upstream changed {field} for tool index {index}"
+        ))),
+        Some(_) => Ok(()),
+        None => {
+            *current = Some(incoming.to_owned());
+            Ok(())
+        }
     }
 }
 
@@ -208,9 +331,9 @@ mod tests {
         let mut t = StreamTranslator::new(model, "msg_1");
         let mut events = vec![t.start()];
         for c in chunks {
-            events.extend(t.push(&chunk(c)));
+            events.extend(t.push(&chunk(c)).unwrap());
         }
-        events.extend(t.finish());
+        events.extend(t.finish().unwrap());
         let names: Vec<String> = events.iter().map(|e| e.event.clone()).collect();
         (events, names)
     }
@@ -260,7 +383,6 @@ mod tests {
                 "message_start",
                 "content_block_start",
                 "content_block_delta",
-                "content_block_delta",
                 "content_block_stop",
                 "message_delta",
                 "message_stop",
@@ -277,7 +399,10 @@ mod tests {
             .filter(|e| e.event == "content_block_delta")
             .collect();
         assert_eq!(deltas[0].data["delta"]["type"], "input_json_delta");
-        assert_eq!(deltas[0].data["delta"]["partial_json"], "{\"path\":");
+        assert_eq!(
+            deltas[0].data["delta"]["partial_json"],
+            "{\"path\":\"a.txt\"}"
+        );
         let md = events.iter().find(|e| e.event == "message_delta").unwrap();
         assert_eq!(md.data["delta"]["stop_reason"], "tool_use");
     }
@@ -353,5 +478,54 @@ mod tests {
             ev.to_wire(),
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
         );
+    }
+
+    #[test]
+    fn interleaved_parallel_tools_are_buffered_and_emitted_sequentially() {
+        let (events, _) = run(
+            "m",
+            &[
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"p\":"}},{"index":1,"id":"b","function":{"name":"glob","arguments":"{\"g\":"}}]}}]}"#,
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"\"*.rs\"}"}},{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            ],
+        );
+        let starts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event == "content_block_start")
+            .collect();
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0].data["content_block"]["id"], "a");
+        assert_eq!(starts[1].data["content_block"]["id"], "b");
+        let order: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.event == "content_block_start" || event.event == "content_block_stop"
+            })
+            .map(|event| (event.event.as_str(), event.data["index"].as_u64().unwrap()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("content_block_start", 0),
+                ("content_block_stop", 0),
+                ("content_block_start", 1),
+                ("content_block_stop", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn malformed_complete_tool_json_is_rejected() {
+        let mut translator = StreamTranslator::new("m", "id");
+        translator
+            .push(&chunk(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"not-json"}}]},"finish_reason":"tool_calls"}]}"#,
+            ))
+            .unwrap();
+        assert!(translator
+            .finish()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid JSON arguments"));
     }
 }

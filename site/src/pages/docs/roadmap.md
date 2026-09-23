@@ -32,11 +32,21 @@ vLLM / LM Studio, …) can't be used directly. `ccx` now ships its own translato
       interleave) + an integration test against a mock upstream; bash dry-run and
       live-lifecycle tests.
 
-- [x] GUI: provider picker + router/upstream fields in the create/edit form, with a
-      per-profile Direct / Via ccx-router / Local badge and the upstream URL shown.
+- [x] Byte-safe incremental SSE parser (split UTF-8, CRLF, multiline events),
+      parallel tool calls, canonical errors, bounded bodies, and stream keepalives.
+- [x] Ordered fallback, bounded retry/timeouts, `Retry-After`, request metadata,
+      private structured logs, and `ccx logs`.
+- [x] `ccx doctor` plus consent-gated basic/streaming/tool certification with a
+      versioned JSON report.
+
+- [x] GUI: provider picker, router/upstream/fallback settings, local health badges,
+      detailed diagnostics, and capability badges.
 - [x] Wizard fetches each provider's live model list (`/v1/models`) with a
       type-to-filter picker; falls back to the template default / manual entry.
-
-### Remaining
-
-- [ ] Prebuilt `ccx-router` binaries so Rust isn't required to install.
+- [x] Checksum-verified prebuilt router release matrix for Linux x86_64/aarch64,
+      macOS Intel/ARM64, and Windows x86_64, with provenance and optional Cosign.
+- [x] Native desktop release matrix for Linux, macOS, and Windows, with optional
+      signing/notarization credentials.
+- [x] OpenRouter provider pinning (`only`, `order`, `require_parameters`),
+      configured per upstream so a pinned OpenRouter endpoint can share a
+      fallback chain with backends that do not know the field.
