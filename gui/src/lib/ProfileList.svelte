@@ -29,7 +29,7 @@
   // A router profile whose upstream is loopback is a local server (Ollama/vLLM/LM Studio).
   const isLocal = (p) =>
     !!p.router && /(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])/.test(p.upstreamUrl ?? "");
-  const kindLabel = (p) => (!p.router ? "Direct" : isLocal(p) ? "Local" : "Via ccx-router");
+  const kindLabel = (p) => (p.provider === "codex" ? "Codex CLI" : !p.router ? "Direct" : isLocal(p) ? "Local" : "Via ccx-router");
   const kindClass = (p) => (!p.router ? "direct" : isLocal(p) ? "local" : "router");
 </script>
 

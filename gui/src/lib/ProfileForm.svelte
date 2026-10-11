@@ -17,7 +17,8 @@
   });
 
   let isRouter = $derived(!!form.router);
-  let anthropicProviders = $derived(providers.filter((p) => !p.router));
+  let isCodex = $derived(form.provider === "codex");
+  let anthropicProviders = $derived(providers.filter((p) => !p.router && p.name !== "codex"));
   let routerProviders = $derived(providers.filter((p) => p.router));
 
   onMount(async () => {
@@ -71,6 +72,7 @@
       sonnet: opt(form.sonnet),
       haiku: opt(form.haiku),
     };
+    if (isCodex) return { ...shared, opus: null, sonnet: null, haiku: null };
     if (isRouter) {
       return {
         ...shared,
@@ -114,10 +116,17 @@
     <optgroup label="OpenAI-compatible (via ccx-router)">
       {#each routerProviders as p (p.name)}<option value={p.name}>{p.name}</option>{/each}
     </optgroup>
+    <optgroup label="Native CLI (ChatGPT login)">
+      <option value="codex">codex</option>
+    </optgroup>
   </select>
 </label>
 
-{#if isRouter}
+{#if isCodex}
+  <p class="hint">Uses Codex CLI and its existing login. After saving, run
+    <code>ccx {form.name || "your-profile"} login</code> to sign in with ChatGPT.
+    On a remote machine, add <code>--device-auth</code>.</p>
+{:else if isRouter}
   <p class="hint">Routed through <code>ccx-router</code>, a translator <code>ccx</code> builds and
     starts on launch. Requires Rust to build (<code>./install.sh</code>).</p>
 
@@ -146,19 +155,19 @@
   </label>
 {/if}
 
-<label class="check"><input type="checkbox" bind:checked={form.isolate} /> Isolate config (own CLAUDE_CONFIG_DIR)</label>
+<label class="check"><input type="checkbox" bind:checked={form.isolate} /> Isolate config (own {isCodex ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"})</label>
 
 <label>Model
-  <input bind:value={form.model} placeholder={isRouter ? "qwen2.5-coder:32b" : "model id"} />
+  <input bind:value={form.model} placeholder={isCodex ? "(blank = Codex default)" : isRouter ? "qwen2.5-coder:32b" : "model id"} />
 </label>
 
-<details>
+{#if !isCodex}<details>
   <summary>Advanced — model slots (opus / sonnet / haiku)</summary>
   <p class="hint">Each maps an alias to a concrete model id{isRouter ? " (passed through to the upstream)" : ""}.</p>
   <label>opus → <input bind:value={form.opus} /></label>
   <label>sonnet → <input bind:value={form.sonnet} /></label>
   <label>haiku → <input bind:value={form.haiku} /></label>
-</details>
+</details>{/if}
 
 <div class="actions">
   <button onclick={save}>Save</button>

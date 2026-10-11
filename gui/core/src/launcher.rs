@@ -93,7 +93,7 @@ pub fn copy_command(p: &Profile) -> String {
 // (start, health-check, teardown), which only the `ccx` CLI implements — so we
 // launch `ccx <name>` rather than `claude` with a hand-built env.
 pub fn child_command(p: &Profile) -> Vec<String> {
-    if p.is_router() {
+    if p.is_router() || p.provider == "codex" {
         vec!["ccx".to_string(), p.name.clone()]
     } else {
         vec!["claude".to_string()]
@@ -123,7 +123,7 @@ pub fn launch(p: &Profile, home: &Path, term_override: Option<Vec<String>>) -> R
     cmd.args(&args).args(child_command(p));
     // Router profiles delegate to `ccx <name>`, which sets the env itself; only
     // the direct-claude path needs the hand-built env.
-    if !p.is_router() {
+    if !p.is_router() && p.provider != "codex" {
         for (k, v) in build_env(p, home) {
             cmd.env(k, v);
         }
@@ -196,6 +196,16 @@ mod tests {
     #[test]
     fn child_command_for_anthropic_is_claude() {
         assert_eq!(child_command(&prof(false)), vec!["claude".to_string()]);
+    }
+
+    #[test]
+    fn child_command_for_codex_delegates_to_ccx() {
+        let p = Profile {
+            name: "codex-work".into(),
+            provider: "codex".into(),
+            ..Default::default()
+        };
+        assert_eq!(child_command(&p), vec!["ccx", "codex-work"]);
     }
 
     #[test]

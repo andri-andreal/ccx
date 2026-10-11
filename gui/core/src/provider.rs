@@ -57,6 +57,7 @@ fn r(name: &str, upstream: Option<&str>, model: Option<&str>) -> ProviderTemplat
 pub fn builtins() -> Vec<ProviderTemplate> {
     vec![
         t("claude", false, None, Some("opusplan"), None, None, None),
+        t("codex", false, None, None, None, None, None),
         t(
             "minimax",
             true,
@@ -128,7 +129,7 @@ fn parse_template(name: &str, content: &str) -> ProviderTemplate {
         match k {
             "CCX_ISOLATE" => tpl.isolate = v == "true",
             "ANTHROPIC_BASE_URL" => tpl.base_url = Some(v.to_string()),
-            "ANTHROPIC_MODEL" => tpl.model = Some(v.to_string()),
+            "ANTHROPIC_MODEL" | "CODEX_MODEL" => tpl.model = Some(v.to_string()),
             "ANTHROPIC_DEFAULT_OPUS_MODEL" => tpl.opus = Some(v.to_string()),
             "ANTHROPIC_DEFAULT_SONNET_MODEL" => tpl.sonnet = Some(v.to_string()),
             "ANTHROPIC_DEFAULT_HAIKU_MODEL" => tpl.haiku = Some(v.to_string()),
