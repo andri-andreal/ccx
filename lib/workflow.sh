@@ -20,8 +20,11 @@ choose_workflow_profile() {
   for profile in "${choices[@]}"; do
     file="$(profile_env "$profile")"
     provider="$(kv_get "$file" CCX_PROVIDER)"
-    if [ "$provider" = codex ]; then model="$(kv_get "$file" CODEX_MODEL)"
-    else model="$(kv_get "$file" ANTHROPIC_MODEL)"; fi
+    case "$provider" in
+      codex) model="$(kv_get "$file" CODEX_MODEL)" ;;
+      kimi-cli|mcode) model="$(kv_get "$file" CCX_NATIVE_MODEL)" ;;
+      *) model="$(kv_get "$file" ANTHROPIC_MODEL)" ;;
+    esac
     descriptions+=("${provider:-custom} · ${model:-CLI default}")
   done
   tui_subtitles=("${descriptions[@]}")
@@ -35,6 +38,7 @@ choose_workflow_model() {
   provider="$(kv_get "$file" CCX_PROVIDER)"
   saved="$(kv_get "$file" ANTHROPIC_MODEL)"
   [ "$provider" != codex ] || saved="$(kv_get "$file" CODEX_MODEL)"
+  case "$provider" in kimi-cli|mcode) saved="$(kv_get "$file" CCX_NATIVE_MODEL)" ;; esac
   local -a choices=(default) descriptions=("${saved:-CLI default}")
   case "$provider" in
     claude) choices+=(sonnet opus haiku); descriptions+=('Claude Sonnet' 'Claude Opus' 'Claude Haiku') ;;
@@ -60,6 +64,9 @@ choose_workflow_effort() {
   local role="$1" profile="$2" variable="${1}_effort" provider
   provider="$(kv_get "$(profile_env "$profile")" CCX_PROVIDER)"
   local -a levels=(default low medium high xhigh)
+  if [ "$provider" = kimi-cli ]; then
+    printf -v "$variable" %s default; return
+  fi
   if [ "$provider" = codex ]; then
     local model_key="${role}_model" selected_model="" level
     selected_model="${!model_key}"
@@ -77,9 +84,12 @@ choose_workflow_effort() {
 
 create_workflow() {
   local role value
-  for role in planner builder reviewer; do
+  local -a roles=(planner builder reviewer)
+  if [ -n "$orchestrator" ] || [ -z "$yes" ]; then roles=(orchestrator planner builder reviewer); fi
+  for role in "${roles[@]}"; do
     if [ -z "$yes" ] && [ -z "${!role}" ]; then
       case "$role" in
+        orchestrator) choose_workflow_profile orchestrator 'Choose orchestrator:' ;;
         planner) choose_workflow_profile planner 'Choose planner:' ;;
         builder) choose_workflow_profile builder 'Choose builder:' "$planner" ;;
         reviewer) choose_workflow_profile reviewer 'Choose checker (reviewer):' ;;
@@ -99,6 +109,7 @@ create_workflow() {
     fi
     effort="${!effort_key}"
     provider="$(kv_get "$(profile_env "${!role}")" CCX_PROVIDER)"
+    [ "$provider" != kimi-cli ] || [ -z "$effort" ] || [ "$effort" = default ] || die "Kimi CLI supports only default effort"
     case "$effort" in
       ''|default|low|medium|high|xhigh) ;;
       minimal) [ "$provider" = codex ] || die 'minimal effort requires Codex' ;;
@@ -115,6 +126,9 @@ create_workflow() {
   mkdir -p "$pdir"; chmod 700 "$pdir"
   {
     printf 'CCX_TYPE=loop\nCCX_PLANNER=%s\nCCX_BUILDER=%s\nCCX_REVIEWER=%s\n' "$planner" "$builder" "$reviewer"
+    if [ -n "$orchestrator" ]; then
+      printf 'CCX_ORCHESTRATOR=%s\nCCX_ORCHESTRATOR_MODEL=%s\nCCX_ORCHESTRATOR_EFFORT=%s\n' "$orchestrator" "$orchestrator_model" "${orchestrator_effort:-default}"
+    fi
     printf 'CCX_PROOF=%s\nCCX_ROUNDS=%s\nCCX_FIX_ROUNDS=%s\nCCX_TIMEOUT=%s\n' "$proof" "$rounds" "$fix_rounds" "$timeout"
     printf 'CCX_PLANNER_EFFORT=%s\nCCX_BUILDER_EFFORT=%s\nCCX_REVIEWER_EFFORT=%s\n' "${planner_effort:-default}" "${builder_effort:-default}" "${reviewer_effort:-default}"
     printf 'CCX_PLANNER_MODEL=%s\nCCX_BUILDER_MODEL=%s\nCCX_REVIEWER_MODEL=%s\n' "$planner_model" "$builder_model" "$reviewer_model"

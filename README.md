@@ -1,6 +1,6 @@
 # ccx - Claude Code and Codex profile/provider switcher
 
-`ccx` launches Claude Code or Codex CLI through named profiles. Use your existing
+`ccx` launches Claude Code, Codex, Kimi Code or MiniMax Code through named profiles. Use your existing
 CLI login, select another provider/model, or save a workflow that plans, builds,
 tests and checks changes until the builder and checker agree.
 
@@ -52,6 +52,35 @@ for you): `openai` · `openrouter` · `ollama` · `vllm` · `lmstudio` · `sakan
 See [OpenAI-compatible providers](#openai-compatible-providers-via-a-local-router).
 
 **Native CLI:** `codex` uses Codex CLI with ChatGPT OAuth or its configured login.
+`kimi-cli` launches the separately installed Kimi Code CLI, and `mcode` launches
+MiniMax Code. These names are distinct from the existing `kimi` and `minimax`
+providers, which use Claude Code. Create and launch native profiles with:
+
+```bash
+ccx new --name kimi-native --provider kimi-cli --yes
+ccx new --name minimax-native --provider mcode --yes
+ccx kimi-native login
+ccx minimax-native login --region global
+ccx kimi-native
+ccx minimax-native
+```
+
+In a terminal, `ccx new` opens a provider picker that lists every bundled
+template in the same three groups, with the default model or endpoint as a
+dim subtitle: Anthropic-compatible, OpenAI-compatible (via `ccx-router`), and
+Native CLI. "Custom / type manually" accepts a provider name of your own, and
+your own templates in `$CCX_HOME/providers` join the list. The menu scrolls and
+reports its position when it is taller than the terminal.
+
+Install and authenticate each CLI separately. Set `CCX_KIMI_BIN` or
+`CCX_MCODE_BIN` to override its executable. The optional `--model` saves a native
+model default. Native Kimi and mcode profiles can also be selected as workflow roles. On Linux,
+these roles require `bwrap` (Bubblewrap); their CLI data directories must be outside
+the project. Planning and review run with a read-only project, and the builder may
+write to it. Kimi uses its default effort; mcode supports its own effort values.
+CLI data/session directories remain writable. Kimi uses JSON responses requested
+in the prompt, which CCX validates; an invalid response stops the workflow.
+Native Kimi and mcode profiles do not yet support `--isolate`.
 
 | Profile provider/type | Executable | Authentication/configuration |
 | --- | --- | --- |
@@ -71,7 +100,7 @@ Codex CLI directly.
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and on your `PATH` for Claude/provider profiles.
   `ccx` runs the `claude` binary (override with `CCX_CLAUDE_BIN`).
 - Codex CLI on your `PATH` for native Codex profiles (override with `CCX_CODEX_BIN`).
-- Python 3.10+ for saved workflows; both CLIs are needed when the selected roles use both engines.
+- Python 3.10+ for saved workflows; install each CLI used by the selected roles.
 - Bash (the `ccx` CLI is a Bash script).
 - `curl` or `wget` for the verified router download. `curl` is also used by
   network diagnostics and certification.
@@ -159,10 +188,10 @@ launcher and desktop-menu entry. More Linux package details are in the
 
 ### Quick start
 
-Run `ccx new` in a terminal. Use **↑/↓ and Enter** to choose **Single model** or
-**Plan/build/review loop**; press **q** to cancel. Single-model creation then opens
-the provider picker. Claude/provider profiles offer model discovery when supported;
-Codex profiles ask for an optional model ID and whether to sign in.
+Run `ccx new` in a terminal. Select **Single model** to create a CLI profile,
+or **Plan/build/review loop** to create a team. Use **↑/↓ and Enter** to
+choose and **q** to cancel. The Single menu offers Claude Code, Codex, Kimi
+Code and MiniMax Code.
 
 Or create native profiles with flags:
 
@@ -179,7 +208,7 @@ of their respective CLI by default. Follow the login section if you need to sign
 ## Use
 
 ```bash
-ccx new                      # create a profile (interactive wizard: provider picker, live model list, upstream URL/key on OpenAI-compatible providers)
+ccx new                      # create a single CLI profile or team
 ccx --version                # print ccx, ccx-router, Claude Code and Codex versions
 ccx list                     # list profiles  (alias: ls)
 ccx doctor work              # configuration + authenticated reachability checks
@@ -280,13 +309,86 @@ native CLI directly. Native profiles are available in the desktop GUI as well.
 
 ## Create a workflow once, launch by name
 
-Run `ccx new` in a terminal and choose **Plan/build/review loop** with **↑/↓ and Enter**.
-Use the same arrow-key menus to select existing profiles for planner, builder and
-checker (reviewer). Each menu shows the provider and model; the builder menu
-starts with the planner profile. All roles may use the same profile/model;
-each turn uses a separate CLI session. The wizard completes each role in order:
-**profile → model → effort**, then moves to the next role. All three menus use
-**↑/↓ and Enter**. **default** keeps the profile/CLI configuration.
+Teams can use an **orchestrator** profile alongside planner, builder and reviewer.
+The orchestrator selects `inspect` for explicitly read-only requests, `direct` for
+small unambiguous edits, or `plan` for complex or uncertain tasks. Inspect returns
+a report without changing the checkout. Direct skips planning but still runs
+verification and review. You can override the decision for one run:
+
+```bash
+ccx team --route inspect "Explain the authentication flow"
+ccx team --route direct "Fix the typo in README.md"
+ccx team --route plan "Add CSV export"
+```
+
+In an interactive session, existing three-role workflows use their planner profile
+as orchestrator unless one is configured; non-interactive legacy runs keep their
+previous plan-first behavior. The borrowed orchestrator is labelled `(auto)` in the
+team TUI so it is clear it was not configured by the profile. To create a
+four-role workflow non-interactively, add `--orchestrator <profile>` when using
+`ccx new --type loop`; `--orchestrator-model` and `--orchestrator-effort` are optional.
+Interactive creation asks for the orchestrator before the other three roles.
+A plan or direct route requires a verification command; the team TUI asks for one
+in place when detection finds nothing. `--review-only` always plans and reviews
+without building.
+
+In an interactive terminal, the team renders a two-column view: a borderless
+conversation on the left and a live agent rail on the right. The header carries the
+active route, the project path and the current Git branch. Each agent shows a status
+glyph plus its word (`● running`, `✓ done`, `✗ failed`, `○ waiting`), so state never
+depends on colour alone. The current task is pinned at the top of the conversation and
+the active agent's elapsed time runs in the status row. After a task, the conclusion
+appears in a **RESULT** preview block that stays readable in place, and CCX shows the
+full conclusion and stays open. Use `Ctrl+P` or `/commands` for the searchable command
+palette, and Tab to complete slash commands or `@path` file references. Explicit
+`@path` references attach UTF-8 files inside the project (up to 64 KiB each; paths
+with spaces are not yet supported). `/editor` opens `$VISUAL` or `$EDITOR` for a
+multiline task and submits it after the editor exits successfully.
+
+Colours come from a small semantic palette (cyan for you, green for success, magenta
+for the team, red for failure, dim grey for metadata) and can be turned off with
+`NO_COLOR=1`. `/theme default|ocean|contrast` switches palette.
+
+- `/history`: browse prior runs; open one and press `r` to resume its context when
+  the current project matches its saved checkpoint. Earlier runs without a saved
+  checkpoint can be viewed but not resumed.
+- `/timeline`, `/agents`, and `/result`: inspect the conversation, the agent rail or
+  the latest conclusion. `/agents` lists the running agents and drills into one agent's
+  full log; `/result` opens the result preview with its run metadata. Detail views use
+  `n`/`p` to change pages.
+- `/files` and `/diff`: list project files and inspect tracked changes; untracked
+  paths are listed separately. `/diff` needs a Git checkout.
+- `/undo` and `/redo`: restore the latest recorded CCX file changes. Restoration
+  refuses staged changes, a changed checkout, a different commit, or conflicts
+  with ignored files. Checkpoints copy tracked and unignored file contents into
+  private run artifacts, up to 64 MiB and 20,000 files per checkpoint; larger or unsupported
+  projects run normally but cannot use undo for that task. Ignored files are not
+  restored. Undo or redo starts a new conversation context.
+- Outside a Git repository the team still runs. The header shows `· no git`, the
+  footer reports that undo and diff are unavailable, and file snapshots are taken
+  from disk instead of a commit base.
+- `/route auto|plan|direct|inspect` and `/proof COMMAND`: set the route or
+  verification for later tasks in the current session.
+- While an agent is running, type and press Enter to queue a task, or press Esc
+  to stop the current process. The queued task begins after the conclusion is
+  dismissed; `/queue` and `/queue clear` manage queued tasks.
+- `/theme default|ocean|contrast` saves a terminal theme; `/help` lists commands;
+  `/quit` exits.
+
+Runs, normalized activity events, task text, outcomes and checkpoint copies are
+stored under the private CCX runs directory. Older runs may not have their task
+text or activity events. The previous successful task and a bounded portion of
+its outcome are provided as context to the next task, including after a safe
+resume; this does not resume the underlying CLI's native conversation. A new
+session starts with a clean-checkout requirement unless a matching run is resumed.
+Follow-up tasks may use unchanged work from the same session; unrelated external
+edits require inspection. Redirected output remains a plain one-task log.
+
+Run `ccx new` in a terminal and choose **Plan/build/review loop**. Select
+existing CLI profiles for orchestrator, planner, builder and checker. The builder defaults to
+the planner profile. All roles may use the same profile and model. The wizard
+completes each role in order: **profile → model → effort**. Select **default**
+to use the profile or CLI settings. Kimi uses its default effort.
 Native Claude profiles offer Sonnet, Opus and Haiku aliases. Native Codex profiles
 read available model IDs and their effort levels from that profile's local
 `models_cache.json` (isolated home or `CODEX_HOME`/`~/.codex`). CCX does not
@@ -305,10 +407,12 @@ ccx new --name claude --provider claude --yes
 ccx new --name codex --provider codex --login --yes
 
 ccx new --name team --type loop \
-  --planner claude --builder claude --reviewer codex \
+  --orchestrator codex --planner claude --builder claude --reviewer codex \
   --planner-effort high --builder-effort medium --reviewer-effort high --yes
 
 # Run from a clean Git checkout of the project you want to change.
+# A plain folder still works: the team runs, but undo and /diff stay
+# unavailable because they need a commit base.
 ccx team "Add CSV export with acceptance tests"
 ccx team --review-only "Plan CSV export"
 # Per-run revision-budget override:
@@ -347,9 +451,12 @@ Node scripts (`test`, then `check`, then `build`, using the configured package
 manager or lockfile), Cargo (`cargo test`), Go (`go test ./...`), Makefile
 targets (`test`, `check`, `build`), pytest configuration, or unittest tests.
 The default npm placeholder test is ignored. A saved `--proof` takes precedence
-over detection; a runtime `--proof` overrides both. If detection finds nothing,
-CCX asks for a command in a terminal, or reports how to supply `--proof` before
-calling any models. Review-only runs can proceed without verification.
+over detection; a runtime `--proof` overrides both. If detection finds nothing, supply `--proof` or use `/proof COMMAND` in the
+interactive session. A plan or direct route requires verification. Review-only runs can proceed without verification.
+In the team TUI, a task that needs a verification command and finds none asks for it
+in place (`Verification command:`) — the answer becomes the session default, so the
+next task does not ask again. Leaving it empty reports that `/proof COMMAND` can
+supply one and the task can be sent again.
 Commands run with your normal local permissions at the target Git root.
 Approval binds the plan hash and inspection binds the change snapshot, including
 staged, untracked and deleted files. Concurrent workflows in the same checkout
@@ -384,7 +491,9 @@ Workflow calls run without permission bypass flags. Claude planning/review only
 exposes reading tools with customizations disabled; Claude builders expose read
 and edit tools. Codex uses read-only/workspace-write shell sandboxes. The workflow
 queries effective Codex MCP servers and disables them for its calls; Claude uses
-an empty strict MCP configuration. Unsupported CLI flags, authentication failures
+an empty strict MCP configuration. Kimi and mcode retain their own CLI configuration,
+including configured MCP services; Bubblewrap restricts filesystem writes but does
+not restrict network access. Unsupported CLI flags, authentication failures
 or blocked operations are reported rather than retried with weaker permissions.
 No live model calls are made by the automated integration tests.
 
@@ -496,8 +605,11 @@ Paths are relative to the resolved configuration root:
 | `profiles/<name>/workflow.env` | Loop role references, proof command and limits, mode `600` |
 | `providers/*.tmpl` | Provider defaults; model-discovery templates can also define `CCX_MODELS_URL` and `CCX_MODELS_AUTH` |
 | `gui.json` | GUI terminal preferences |
+| `tui.json` | TUI theme preferences, mode `600` |
 | `runs/<unique-run>/PLAN.md` | Reviewed plan |
 | `runs/<unique-run>/<turn>-<phase>/` | Prompt, raw stdout/stderr and parsed result for each model call |
+| `runs/<unique-run>/events.jsonl` | Versioned activity events for the run (private) |
+| `runs/<unique-run>/undo-before.zip` / `undo-after.zip` | Private file checkpoints for guarded undo/redo, when available |
 | `runs/<unique-run>/proof-*.json` and `proof-*.stdout.txt` / `proof-*.stderr.txt` | Verification command, exit status and output |
 | `runs/<unique-run>/consensus-rounds.json` | Builder responses, checker findings and proof history |
 | `runs/<unique-run>/consensus.json` | Successful agreement bound to the plan and code snapshot |
@@ -667,6 +779,7 @@ existing values can be preserved, replaced, or removed, but never revealed.
 | Router unavailable | Rebuild with `cargo build --release --manifest-path router/Cargo.toml`; check `CCX_ROUTER_BIN` |
 | Model picker cannot fetch models | Enter the provider-supported model ID manually; inspect endpoint/auth settings |
 | Workflow requires a clean checkout | Commit/stash your existing work yourself, or run in a clean Git worktree |
+| `Not a git repository` | Only git-backed actions need a checkout (undo, diff). Everything else runs in a plain folder — the header shows `· no git` and undo/diff stay unavailable |
 | Verification keeps failing | Read `proof-*.stderr.txt`/stdout; correct the proof command or implementation |
 | Builder/checker have not agreed | Inspect `consensus-rounds.json`; increase `--fix-rounds` if further revisions are appropriate |
 | Unsupported CLI flag / invalid structured output | Inspect turn stderr; check CLI version compatibility without weakening permissions |

@@ -60,6 +60,38 @@ assert_contains "$(cat "$CCX_HOME/profiles/stdin-key/profile.env")" \
 "$CCX" new --name myglm --provider glm --token x --yes >/dev/null 2>&1; rc=$?
 assert_exit "$rc" 1 "duplicate name rejected"
 
+# --- Task 3b: provider picker offers every bundled template ---
+out="$(printf '\n' | "$CCX" new --name pick-menu 2>&1)"
+for provider in claude codex custom-oai deepseek glm kimi lmstudio minimax \
+                ollama openai openrouter sakana vllm; do
+  assert_contains "$out" "$provider" "provider menu lists $provider"
+done
+assert_contains "$out" "kimi-cli" "provider menu lists the kimi native CLI"
+assert_contains "$out" "mcode" "provider menu lists the mcode native CLI"
+assert_contains "$out" "Anthropic-compatible" "provider menu groups Anthropic endpoints"
+assert_contains "$out" "OpenAI-compatible" "provider menu groups router endpoints"
+assert_contains "$out" "Custom / type manually" "provider menu keeps a custom entry"
+
+# every bundled template must create a usable profile
+for provider in claude codex lmstudio ollama openai openrouter sakana vllm; do
+  "$CCX" new --name "menu-$provider" --provider "$provider" --yes >/dev/null 2>&1; rc=$?
+  assert_exit "$rc" 0 "picker template $provider creates a profile"
+done
+for provider in deepseek glm kimi minimax; do
+  "$CCX" new --name "menu-$provider" --provider "$provider" \
+    --token sk-test-123456789 --yes >/dev/null 2>&1; rc=$?
+  assert_exit "$rc" 0 "picker template $provider creates a profile"
+done
+"$CCX" new --name menu-custom-oai --provider custom-oai \
+  --upstream-url https://api.example.com/v1 --yes >/dev/null 2>&1; rc=$?
+assert_exit "$rc" 0 "picker template custom-oai creates a profile"
+assert_contains "$(cat "$CCX_HOME/profiles/menu-custom-oai/profile.env")" \
+  "CCX_PROVIDER=custom-oai" "custom-oai profile records the provider"
+assert_contains "$(cat "$CCX_HOME/profiles/menu-openai/profile.env")" \
+  "CCX_ROUTER=builtin" "openai profile routes through the local router"
+assert_contains "$(cat "$CCX_HOME/profiles/menu-glm/profile.env")" \
+  "ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic" "glm profile keeps the template endpoint"
+
 # --- Task 4: run (dry-run), no isolation ---
 out="$(CCX_DRY_RUN=1 "$CCX" myclaude 2>&1)"; rc=$?
 assert_exit "$rc" 0 "dry-run claude exits 0"

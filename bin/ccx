@@ -5,6 +5,8 @@ umask 077
 CCX_HOME="${CCX_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccx}"
 CCX_CLAUDE_BIN="${CCX_CLAUDE_BIN:-claude}"
 CCX_CODEX_BIN="${CCX_CODEX_BIN:-codex}"
+CCX_KIMI_BIN="${CCX_KIMI_BIN:-kimi}"
+CCX_MCODE_BIN="${CCX_MCODE_BIN:-mcode}"
 CCX_ROUTER_BIN="${CCX_ROUTER_BIN:-ccx-router}"
 CCX_CURL_BIN="${CCX_CURL_BIN:-curl}"
 CCX_VERSION="0.1.0"
@@ -86,6 +88,16 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   local cols; cols="$(tput cols 2>/dev/null || printf '80')"
   case "$cols" in '' | *[!0-9]*) cols=80 ;; esac
 
+  # Viewport height: the box spends four lines on its borders and blank rows
+  # plus one on the leading newline, so only the rest can hold item rows. A
+  # long menu scrolls instead of overflowing the terminal.
+  local rows; rows="$(tput lines 2>/dev/null || printf '24')"
+  case "$rows" in '' | *[!0-9]*) rows=24 ;; esac
+  local vis=$count top=0
+  local max_vis=$((rows - 5))
+  [ "$max_vis" -lt 3 ] && max_vis=3
+  [ "$vis" -gt "$max_vis" ] && vis="$max_vis"
+
   # Classify rows: a '│' marks a non-selectable group header, everything else is
   # a provider/model row with an optional dim subtitle. Names of subtitled rows
   # share one column width so their subtitles line up.
@@ -106,6 +118,12 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
 
   local title="${header%:}"
   local hint='↑↓ move · ⏎ select · q cancel'
+  # When the list scrolls, say which slice is on screen.
+  local scroll_note=''
+  if [ "$vis" -lt "$count" ]; then
+    scroll_note=" · $((top + 1))-$((top + vis))/$count"
+    hint="$hint$scroll_note"
+  fi
   # Interior width = 3-col marker gutter + widest body + 1-col right margin,
   # widened if the title or hint embedded in the borders needs more room, then
   # clamped to the terminal.
@@ -146,14 +164,22 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   tui_draw() { # full box top-to-bottom; cursor ends on the blank line below it
     printf '%s╭─ %s%s%s %s╮%s\r\n' "$BRD" "$R" "$title" "$BRD" "$(tui_dashes $((inner - 3 - ${#title})))" "$R"
     tui_pad_line
-    for ((j = 0; j < count; j++)); do tui_line "$j"; done
+    for ((j = top; j < top + vis; j++)); do tui_line "$j"; done
     tui_pad_line
     printf '%s╰─ %s %s╯%s\r\n' "$BRD" "$hint" "$(tui_dashes $((inner - 3 - ${#hint})))" "$R"
   }
 
   tui_redraw() { # repaint only the item rows in place
-    printf '\r\033[%dA' "$((count + 2))"   # up to the first item row
-    for ((j = 0; j < count; j++)); do tui_line "$j"; done
+    # Keep the cursor inside the viewport; scrolling happens here so callers
+    # only have to move the cursor.
+    if [ "$cur" -lt "$top" ]; then top="$cur"; fi
+    if [ "$cur" -ge $((top + vis)) ]; then top=$((cur - vis + 1)); fi
+    if [ "$vis" -lt "$count" ]; then
+      scroll_note=" · $((top + 1))-$((top + vis))/$count"
+      hint="↑↓ move · ⏎ select · q cancel$scroll_note"
+    fi
+    printf '\r\033[%dA' "$((vis + 2))"       # up to the first visible item row
+    for ((j = top; j < top + vis; j++)); do tui_line "$j"; done
     printf '\033[2B\r'                       # back down to the blank line below the box
   }
 
@@ -173,29 +199,51 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   fi
 
   local saved_stty; saved_stty="$(stty -g)"
-  stty raw -echo isig min 0 time 1 2>/dev/null || {
+  # VMIN=1/VTIME=0 keeps every read blocked until a real key arrives. With
+  # VMIN=0 an idle poll returns an empty key, which the selector would take
+  # for Enter and close the menu on its own while the user is still reading.
+  stty raw -echo isig min 1 time 0 2>/dev/null || {
     [ "$temporary_screen" -eq 0 ] || printf '\033[?1049l'
     printf '\n'; tui_selected=-1; return 1;
   }
   trap 'stty "$saved_stty" 2>/dev/null; printf "\033[?1049l"; trap - INT TERM' INT TERM
 
-  local key ok=0
+  local key ok=0 pending=''
   while true; do
-    IFS= read -rsn1 key || { ok=-1; break; }
+    if [ -n "$pending" ]; then
+      key="$pending"; pending=''
+    else
+      IFS= read -rsn1 key || { ok=-1; break; }
+    fi
     case "$key" in
       $'\x1b')
-        local c1 c2; IFS= read -rsn1 -t 0.1 c1; IFS= read -rsn1 -t 0.1 c2
-        if [ "$c1$c2" = "[A" ]; then
-          local ni=$((cur - 1))
-          while [ "$ni" -ge 0 ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni - 1)); done
-          [ "$ni" -ge 0 ] && { cur=$ni; tui_redraw; }
-        elif [ "$c1$c2" = "[B" ]; then
-          local ni=$((cur + 1))
-          while [ "$ni" -lt "$count" ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni + 1)); done
-          [ "$ni" -lt "$count" ] && { cur=$ni; tui_redraw; }
+        # Arrow keys arrive as ESC [ <letter>. Read the tail as a unit and
+        # re-queue any byte that turns out not to belong to the sequence, so
+        # a fragmented sequence can never swallow the next keystroke.
+        local c1 c2
+        c1=''; c2=''
+        IFS= read -rsn1 -t 0.2 c1 || c1=''
+        if [ "$c1" = '[' ] || [ "$c1" = 'O' ]; then
+          IFS= read -rsn1 -t 0.2 c2 || c2=''
+          if [ "$c1$c2" = "[A" ]; then
+            local ni=$((cur - 1))
+            while [ "$ni" -ge 0 ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni - 1)); done
+            [ "$ni" -ge 0 ] && { cur=$ni; tui_redraw; }
+          elif [ "$c1$c2" = "[B" ]; then
+            local ni=$((cur + 1))
+            while [ "$ni" -lt "$count" ] && [[ "${items[$ni]}" == *│* ]]; do ni=$((ni + 1)); done
+            [ "$ni" -lt "$count" ] && { cur=$ni; tui_redraw; }
+          else
+            case "$c2" in
+              '' | A | B) ;;
+              *) pending="$c2" ;;
+            esac
+          fi
+        elif [ -n "$c1" ]; then
+          pending="$c1"
         fi
         ;;
-      '') ok=1; break ;;
+      '' | $'\r' | $'\n') ok=1; break ;;
       q|Q) ok=-1; break ;;
     esac
   done
@@ -214,35 +262,56 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   else tui_selected=-1; return 1; fi
 }
 
-choose_provider() { # set caller's $provider from interactive menu or typed name
-  local -a providers=() t_items=() t_subs=() t_sel=()
+provider_hint() { # template file -> one-line description for the picker
+  local tf="$1" router model url host
+  router="$(kv_get "$tf" CCX_ROUTER)"
+  model="$(kv_get "$tf" ANTHROPIC_MODEL)"
+  url="$(kv_get "$tf" CCX_UPSTREAM_BASE_URL)"
+  if [ -n "$router" ]; then
+    if [ -z "$url" ]; then printf 'upstream URL'; return; fi
+    host="${url#*://}"; host="${host%%/*}"; host="${host%%:/*}"
+    printf '%s' "$host"; return
+  fi
+  [ -n "$model" ] && printf '%s' "$model"
+}
+
+choose_provider() { # set caller's $provider from the menu or a typed name
+  local -a providers=() t_items=() t_subs=() menu=()
   local p tf router model i ans custom_idx
   while IFS= read -r p; do providers+=("$p"); done < <(print_provider_names)
 
   tui_subtitles=()
+  # Anthropic-compatible endpoints speak the Claude protocol directly.
   t_items+=("│ Anthropic-compatible")
   t_subs+=("")
   for p in "${providers[@]}"; do
-    [ "$p" != codex ] || continue
+    [ "$p" = codex ] && continue
     tf="$(template_file "$p")"
+    [ -n "$tf" ] || continue
     router="$(kv_get "$tf" CCX_ROUTER)"
     [ -z "$router" ] || continue
     model="$(kv_get "$tf" ANTHROPIC_MODEL)"
     t_items+=("$p")
-    t_subs+=("${model:+($model)}")
+    t_subs+=("${model:+$model}")
   done
+  # OpenAI-compatible upstreams are translated by the local router.
   t_items+=("│ OpenAI-compatible (via ccx-router)")
   t_subs+=("")
   for p in "${providers[@]}"; do
     tf="$(template_file "$p")"
+    [ -n "$tf" ] || continue
     router="$(kv_get "$tf" CCX_ROUTER)"
     [ -n "$router" ] || continue
-    model="$(kv_get "$tf" ANTHROPIC_MODEL)"
     t_items+=("$p")
-    t_subs+=("${model:+($model)}")
+    t_subs+=("$(provider_hint "$tf")")
   done
-  t_items+=("│ Native CLI (ChatGPT login)" "codex")
-  t_subs+=("" "OAuth via Codex CLI")
+  # Native CLIs talk to their own service and need their own login.
+  t_items+=("│ Native CLI")
+  t_subs+=("")
+  t_items+=(codex kimi-cli mcode)
+  t_subs+=("OAuth via Codex CLI" "native CLI" "native CLI")
+  # Anything that is not a bundled template is still a valid choice. It carries
+  # its own label, so it needs no group header of its own.
   t_items+=("Custom / type manually")
   t_subs+=("")
   tui_subtitles=("${t_subs[@]}")
@@ -254,51 +323,55 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
     else
       provider="$chosen"
     fi
-  else
-    # Fallback: numbered menu
-    local -a menu=()
-    printf 'Choose provider (or type a provider name):\n'
-    printf 'Anthropic-compatible:\n'
-    for p in "${providers[@]}"; do
-      [ "$p" != codex ] || continue
-      tf="$(template_file "$p")"
-      router="$(kv_get "$tf" CCX_ROUTER)"
-      [ -z "$router" ] || continue
-      model="$(kv_get "$tf" ANTHROPIC_MODEL)"
-      menu+=("$p")
-      printf '  %2d) %-12s %s\n' "${#menu[@]}" "$p" "${model:+($model)}"
-    done
-    printf 'OpenAI-compatible (via ccx-router):\n'
-    for p in "${providers[@]}"; do
-      tf="$(template_file "$p")"
-      router="$(kv_get "$tf" CCX_ROUTER)"
-      [ -n "$router" ] || continue
-      model="$(kv_get "$tf" ANTHROPIC_MODEL)"
-      menu+=("$p")
-      printf '  %2d) %-12s %s\n' "${#menu[@]}" "$p" "${model:+($model)}"
-    done
-    printf 'Native CLI (ChatGPT login):\n'
-    menu+=(codex)
-    printf '  %2d) codex        OAuth via Codex CLI\n' "${#menu[@]}"
-    custom_idx=$((${#menu[@]} + 1))
-    printf '  %2d) Custom / type manually\n' "$custom_idx"
-    printf 'Provider [1]: '
-    read -r ans || true
-    if [ -z "$ans" ]; then ans=1; fi
-    case "$ans" in
-      *[!0-9]*) provider="$ans" ;;
-      *)
-        if [ "$ans" -ge 1 ] && [ "$ans" -le "${#menu[@]}" ]; then
-          provider="${menu[$((ans - 1))]}"
-        elif [ "$ans" -eq "$custom_idx" ]; then
-          printf 'Provider name: '
-          read -r provider || true
-        else
-          die "invalid provider choice: $ans"
-        fi
-        ;;
-    esac
+    return
   fi
+
+  # Fallback: the same groups as a numbered menu.
+  printf 'Choose provider (or type a provider name):\n'
+  local group name
+  for group in anthropic router native; do
+    case "$group" in
+      anthropic) printf 'Anthropic-compatible:\n' ;;
+      router) printf 'OpenAI-compatible (via ccx-router):\n' ;;
+      native) printf 'Native CLI:\n' ;;
+    esac
+    for i in "${!t_items[@]}"; do
+      name="${t_items[$i]}"
+      case "$name" in *│*) continue ;; esac
+      case "$group" in
+        anthropic)
+          [ "$name" = codex ] && continue
+          tf="$(template_file "$name")"; [ -n "$tf" ] || continue
+          [ -z "$(kv_get "$tf" CCX_ROUTER)" ] || continue ;;
+        router)
+          tf="$(template_file "$name")"; [ -n "$tf" ] || continue
+          [ -n "$(kv_get "$tf" CCX_ROUTER)" ] || continue ;;
+        native)
+          case "$name" in codex|kimi-cli|mcode) ;; *) continue ;; esac ;;
+      esac
+      menu+=("$name")
+      printf '  %2d) %-12s %s\n' "${#menu[@]}" "$name" "${tui_subtitles[$i]}"
+    done
+  done
+  custom_idx=$((${#menu[@]} + 1))
+  printf 'Other:\n'
+  printf '  %2d) Custom / type manually\n' "$custom_idx"
+  printf 'Provider [1]: '
+  read -r ans || true
+  [ -n "$ans" ] || ans=1
+  case "$ans" in
+    *[!0-9]*) provider="$ans" ;;
+    *)
+      if [ "$ans" -ge 1 ] && [ "$ans" -lt "$custom_idx" ]; then
+        provider="${menu[$((ans - 1))]}"
+      elif [ "$ans" -eq "$custom_idx" ]; then
+        printf 'Provider name: '
+        read -r provider || true
+      else
+        die "invalid provider choice: $ans"
+      fi
+      ;;
+  esac
 }
 
 fetch_models() { # url mode token — print model ids (one per line); nonzero on failure
@@ -415,21 +488,30 @@ tui_filter_select() { # type-to-filter picker; sets tui_selected (0-based into a
   fs_draw
 
   local saved_stty; saved_stty="$(stty -g)"
-  stty raw -echo isig min 0 time 1 2>/dev/null || { tui_selected=-1; return 1; }
+  stty raw -echo isig min 1 time 0 2>/dev/null || { tui_selected=-1; return 1; }
   trap 'stty "$saved_stty" 2>/dev/null; trap - INT TERM' INT TERM
 
-  local key c1 c2 ok=0
+  local key c1 c2 ok=0 pending=''
   while true; do
-    IFS= read -rsn1 key || { ok=-1; break; }
+    if [ -n "$pending" ]; then
+      key="$pending"; pending=''
+    else
+      IFS= read -rsn1 key || { ok=-1; break; }
+    fi
     case "$key" in
       $'\x1b')
-        IFS= read -rsn1 -t 0.1 c1
+        c1=''; c2=''
+        IFS= read -rsn1 -t 0.2 c1 || c1=''
         if [ "$c1" = '[' ] || [ "$c1" = 'O' ]; then
-          IFS= read -rsn1 -t 0.1 c2
+          IFS= read -rsn1 -t 0.2 c2 || c2=''
           case "$c2" in
             A) if [ "$cur" -gt 0 ]; then cur=$((cur - 1)); [ "$cur" -lt "$top" ] && top="$cur"; fs_redraw; fi ;;
             B) if [ "$cur" -lt $(( ${#filt[@]} - 1 )) ]; then cur=$((cur + 1)); [ "$cur" -ge $((top + vis)) ] && top=$((cur - vis + 1)); fs_redraw; fi ;;
+            '' | A | B) ;;
+            *) pending="$c2" ;;
           esac
+        elif [ -n "$c1" ]; then
+          pending="$c1"
         else
           ok=-1; break   # bare ESC cancels
         fi
@@ -1423,8 +1505,11 @@ cmd_list() {
     for d in "$pd"/*/; do
       [ -d "$d" ] || continue
       if [ -f "$d/workflow.env" ]; then
-        printf '%-16s loop       planner=%s builder=%s reviewer=%s\n' "$(basename "$d")" \
+        printf '%-16s loop       planner=%s builder=%s reviewer=%s' "$(basename "$d")" \
           "$(kv_get "$d/workflow.env" CCX_PLANNER)" "$(kv_get "$d/workflow.env" CCX_BUILDER)" "$(kv_get "$d/workflow.env" CCX_REVIEWER)"
+        local orchestrator_name; orchestrator_name="$(kv_get "$d/workflow.env" CCX_ORCHESTRATOR)"
+        [ -z "$orchestrator_name" ] || printf ' orchestrator=%s' "$orchestrator_name"
+        printf '\n'
         found=1; continue
       fi
       penv="$d/profile.env"; [ -f "$penv" ] || continue
@@ -1434,12 +1519,14 @@ cmd_list() {
       router="$(kv_get "$penv" CCX_ROUTER)"
       model="$(kv_get "$penv" ANTHROPIC_MODEL)"
       [ "$prov" != codex ] || model="$(kv_get "$penv" CODEX_MODEL)"
+      case "$prov" in kimi-cli|mcode) model="$(kv_get "$penv" CCX_NATIVE_MODEL)" ;; esac
       if [ -n "$router" ]; then
         url="$(kv_get "$penv" CCX_UPSTREAM_BASE_URL)"
       else
         url="$(kv_get "$penv" ANTHROPIC_BASE_URL)"
       fi
       [ "$prov" != codex ] || url='(Codex login)'
+      case "$prov" in kimi-cli|mcode) url="(native CLI login)" ;; esac
       printf '%-16s %-10s %-34s %s\n' "$name" "${prov:-?}" "${url:-(anthropic login)}" "${model:-}"
     done
   fi
@@ -1454,9 +1541,9 @@ cmd_new() {
         pin_only="" pin_order="" pin_require="" fb_pin_only="" fb_pin_order="" \
         fb_pin_require="" fb_pin_only_args=0 fb_pin_order_args=0 fb_pin_require_args=0 \
         login="" device_auth="" \
-        profile_type="" planner="" builder="" reviewer="" proof="" rounds=3 fix_rounds=2 timeout=600 \
-        planner_effort="" builder_effort="" reviewer_effort="" \
-        planner_model="" builder_model="" reviewer_model=""
+        profile_type="" orchestrator="" planner="" builder="" reviewer="" proof="" rounds=3 fix_rounds=2 timeout=600 \
+        orchestrator_effort="" planner_effort="" builder_effort="" reviewer_effort="" \
+        orchestrator_model="" planner_model="" builder_model="" reviewer_model=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -1533,12 +1620,15 @@ cmd_new() {
       --login) login=1; shift ;;
       --device-auth) login=1; device_auth=1; shift ;;
       --type) profile_type="$2"; shift 2 ;;
+      --orchestrator) orchestrator="$2"; shift 2 ;;
       --planner) planner="$2"; shift 2 ;;
       --builder) builder="$2"; shift 2 ;;
       --reviewer) reviewer="$2"; shift 2 ;;
+      --orchestrator-model) orchestrator_model="$2"; shift 2 ;;
       --planner-model) planner_model="$2"; shift 2 ;;
       --builder-model) builder_model="$2"; shift 2 ;;
       --reviewer-model) reviewer_model="$2"; shift 2 ;;
+      --orchestrator-effort) orchestrator_effort="$2"; shift 2 ;;
       --planner-effort) planner_effort="$2"; shift 2 ;;
       --builder-effort) builder_effort="$2"; shift 2 ;;
       --reviewer-effort) reviewer_effort="$2"; shift 2 ;;
@@ -1553,6 +1643,8 @@ Usage: ccx new [--name NAME] [--provider PROVIDER] [--model MODEL] [--yes]
                [--base-url URL] [--token TOKEN|--token-stdin]
                [--upstream-url URL] [--upstream-key KEY|--upstream-key-stdin]
                [--fallback-url URL ...] [--fallback-key KEY|--fallback-key-stdin ...]
+               [--type loop --orchestrator PROFILE --planner PROFILE --builder PROFILE --reviewer PROFILE]
+               [--orchestrator-model MODEL] [--orchestrator-effort LEVEL]
                [--router-attempts 1..10]
                [--provider-only SLUGS] [--provider-order SLUGS] [--require-parameters]
                [--fallback-provider-only SLUGS ...] [--fallback-provider-order SLUGS ...]
@@ -1585,12 +1677,26 @@ EOF
     loop)
       [ -z "$provider$token$model$base_url$upstream_url$upstream_key$login$device_auth$isolate$m_opus$m_sonnet$m_haiku" ] || die 'loop profiles use --planner/--builder/--reviewer, not provider options'
       create_workflow; return ;;
-    single) [ -z "$planner$builder$reviewer$proof$planner_effort$builder_effort$reviewer_effort$planner_model$builder_model$reviewer_model" ] || die 'workflow options require --type loop' ;;
+    single) [ -z "$orchestrator$planner$builder$reviewer$proof$orchestrator_effort$planner_effort$builder_effort$reviewer_effort$orchestrator_model$planner_model$builder_model$reviewer_model" ] || die 'workflow options require --type loop' ;;
     *) die "unknown profile type: $profile_type" ;;
   esac
   [ -n "$provider" ] || choose_provider
   [ -n "$provider" ] || die "provider is required"
   valid_profile_name "$provider" || die 'provider name must contain only letters, digits, _ or -'
+
+  if [ "$provider" = kimi-cli ] || [ "$provider" = mcode ]; then
+    [ -z "$token$base_url$upstream_url$upstream_key$fallback_urls$fallback_keys$router_attempts$pin_only$pin_order$pin_require$fb_pin_only$fb_pin_order$fb_pin_require$m_opus$m_sonnet$m_haiku$login$device_auth" ] || die 'native CLI profiles do not accept API, router, or Codex login options'
+    [ -z "$isolate" ] || [ "$isolate" = false ] || die 'isolation is not supported for this native CLI profile'
+    [[ "$model" != *$'\n'* && "$model" != *$'\r'* ]] || die 'model must be a single line'
+    local native_dir; native_dir="$(profile_dir "$name")"
+    mkdir -p "$native_dir"; chmod 700 "$native_dir"
+    { printf '# ccx profile: %s\nCCX_PROVIDER=%s\nCCX_ISOLATE=false\n' "$name" "$provider"
+      [ -z "$model" ] || printf 'CCX_NATIVE_MODEL=%s\n' "$model"
+    } > "$native_dir/profile.env"
+    chmod 600 "$native_dir/profile.env"
+    printf 'Created native %s profile "%s". Login if needed: ccx %s login\n' "$provider" "$name" "$name"
+    return 0
+  fi
 
   if [ "$provider" = codex ]; then
     [ -z "$token$base_url$upstream_url$upstream_key$m_opus$m_sonnet$m_haiku" ] || die "codex profiles use native CLI login, not API/router options or Claude model slots"
@@ -1954,6 +2060,9 @@ cmd_run() {
   profile_syntax_valid "$penv" \
     || die "profile '$name' is malformed or contains duplicate environment keys; run: ccx doctor $name --no-network"
 
+  case "$(kv_get "$penv" CCX_PROVIDER)" in
+    kimi-cli|mcode) run_native_cli "$name" "$@"; return ;;
+  esac
   if [ "$(kv_get "$penv" CCX_PROVIDER)" = codex ]; then
     run_codex "$name" "$@"
     return
@@ -1985,7 +2094,11 @@ cmd_run() {
 
   case "$isolate" in true | false) ;; *) die "profile '$name' has invalid CCX_ISOLATE (expected true or false)" ;; esac
   require_single_line 'profile provider' "$provider"
-  require_single_line 'profile model' "$model"
+  if [ "$provider" = claude ]; then
+    require_single_line 'profile model' "$model" true
+  else
+    require_single_line 'profile model' "$model"
+  fi
 
   if [ "$isolate" = "true" ]; then
     local home; home="$(profile_dir "$name")/home"
@@ -2018,6 +2131,29 @@ cmd_run() {
   command -v "$CCX_CLAUDE_BIN" >/dev/null 2>&1 \
     || die "claude not found (looked for '$CCX_CLAUDE_BIN'). Install Claude Code or set CCX_CLAUDE_BIN."
   exec "$CCX_CLAUDE_BIN" "$@"
+}
+
+run_native_cli() {
+  local name="$1"; shift
+  local penv provider model executable arg
+  penv="$(profile_env "$name")"; provider="$(kv_get "$penv" CCX_PROVIDER)"
+  model="$(kv_get "$penv" CCX_NATIVE_MODEL)"
+  case "$provider" in kimi-cli) executable="$CCX_KIMI_BIN" ;; mcode) executable="$CCX_MCODE_BIN" ;; *) die 'unsupported native CLI' ;; esac
+  for arg in "$@"; do
+    case "$arg" in --) break ;; --model|--model=*|-m|-m?*) model=""; break ;; esac
+  done
+  local -a args=("$@")
+  case "${1:-}" in
+    login|logout|--version|-V|--help|-h|help|provider|info) ;;
+    exec) [ -z "$model" ] || args=(exec --model "$model" "${@:2}") ;;
+    *) [ -z "$model" ] || args=(--model "$model" "$@") ;;
+  esac
+  if [ "${CCX_DRY_RUN:-}" = 1 ]; then
+    printf 'CCX_DRY_RUN profile=%s provider=%s\nexec: %s' "$name" "$provider" "$executable"
+    printf ' %s' "${args[@]}"; printf '\n'; return 0
+  fi
+  command -v "$executable" >/dev/null 2>&1 || die "$provider CLI not found: $executable"
+  exec "$executable" "${args[@]}"
 }
 
 run_codex() {

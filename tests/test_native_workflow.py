@@ -1,34 +1,54 @@
 """Exercise real ccx dispatch with disposable profiles/repos and fake CLIs."""
 import json
 import importlib.util
+import io
 import os
 import pty
+import re
+import select
 from pathlib import Path
 import subprocess
 import tempfile
 import termios
 import time
+import tomllib
 import unittest
+from unittest import mock
 
 
 CCX = Path(__file__).resolve().parents[1] / 'bin' / 'ccx'
 SPEC = importlib.util.spec_from_file_location('workflow', CCX.parent.parent / 'lib/workflow.py')
 workflow_module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(workflow_module)
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+
+
+def visible(line):
+    """Strip SGR styling so a styled frame can still be measured in columns."""
+    return ANSI.sub('', line)
 FAKE = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
 args = sys.argv[1:]
 if os.environ.get('FAKE_ARGS_LOG'):
     with open(os.environ['FAKE_ARGS_LOG'], 'a') as log: log.write(json.dumps(args)+'\n')
 if args[:3] == ['mcp', 'list', '--json']:
-    print('[]'); sys.exit(0)
+    print(os.environ.get('FAKE_MCP_SERVERS', '[]')); sys.exit(0)
 if 'exec' not in args and '-p' not in args:
     print(json.dumps({'args':args, 'home':os.environ.get('CODEX_HOME'),
                       'claude_home':os.environ.get('CLAUDE_CONFIG_DIR')})); sys.exit(0)
-prompt = sys.stdin.read()
+kimi = '-p' in args and '--verbose' not in args
+mcode = '--permission' in args and 'smart' in args
+if mcode and os.environ.get('FAKE_CHECK_TMP'):
+    pathlib.Path(os.environ['TMPDIR'], 'scratch-test').write_text('ok')
+prompt = args[args.index('-p')+1] if kimi else sys.stdin.read()
+if os.environ.get('FAKE_PROMPT_LOG'):
+    with open(os.environ['FAKE_PROMPT_LOG'], 'a') as log: log.write(json.dumps(prompt) + '\n')
+if mcode and '--output-schema' in args and 'Return only a JSON object matching this schema' not in prompt:
+    print('missing structured output instruction', file=sys.stderr)
+    sys.exit(2)
 case = os.environ.get('FAKE_CASE', '')
 if case == 'empty': sys.exit(0)
-codex = 'exec' in args
+codex = 'exec' in args and not mcode
 if case == 'stream':
     if codex:
         print(json.dumps({'type':'item.started','item':{'type':'command_execution','command':'rg security'}}),flush=True)
@@ -39,14 +59,19 @@ if case == 'stream':
     time.sleep(0.6)
 schema = None
 if '--output-schema' in args:
-    schema = json.loads(pathlib.Path(args[args.index('--output-schema')+1]).read_text())
+    schema_arg = args[args.index('--output-schema')+1]
+    schema = json.loads(schema_arg if mcode else pathlib.Path(schema_arg).read_text())
 elif '--json-schema' in args:
     schema = json.loads(args[args.index('--json-schema')+1])
-if schema and 'plan' in schema['properties']:
+elif kimi and 'Return only a JSON object matching this schema' in prompt:
+    schema = json.loads(prompt.rsplit('Return only a JSON object matching this schema, without Markdown:\n', 1)[1])
+if schema and 'route' in schema['properties']:
+    value = {'route':os.environ.get('FAKE_ROUTE', 'plan'), 'reason':'Fixture routing.'}
+elif schema and 'plan' in schema['properties']:
     value = {'plan':'Create implemented.py; verify with the configured command.'}
 elif schema and 'status' in schema['properties']:
     pathlib.Path('implemented.py').write_text('print(42)\n')
-    feedback = json.loads(prompt.split('PREVIOUS ROUND / FIX REQUEST:\n',1)[1])
+    feedback = json.loads(prompt.split('PREVIOUS ROUND / FIX REQUEST:\n',1)[1].split('\nReturn only a JSON object',1)[0])
     findings = (feedback.get('checker') or {}).get('findings',[]) if feedback else []
     if feedback and not feedback.get('checker'):
         findings = feedback.get('previous_findings',[])
@@ -83,10 +108,17 @@ elif schema:
     if case == 'mutate_inspection' and 'CHANGE MANIFEST' in prompt:
         pathlib.Path('implemented.py').write_text('modified during inspection')
 else:
-    pathlib.Path('implemented.py').write_text('print(42)\n')
-    value = 'Created implemented.py.'
+    if prompt.startswith('Inspect the repository'):
+        value = 'Read-only inspection completed.'
+    else:
+        pathlib.Path('implemented.py').write_text('print(42)\n')
+        value = 'Created implemented.py.'
 session = '12345678-1234-4567-8123-123456789abc'
-if codex:
+if kimi:
+    print(json.dumps({'role':'assistant','content':json.dumps(value) if schema else value}))
+elif mcode:
+    print(json.dumps({'type':'exec.completed','result':{'status':'succeeded','output':value}}))
+elif codex:
     pathlib.Path(args[args.index('-o')+1]).write_text(json.dumps(value) if schema else value)
     print(json.dumps({'type':'thread.started','thread_id':session}))
     print(json.dumps({'type':'turn.failed' if case == 'failed_turn' else 'turn.completed'}))
@@ -107,7 +139,11 @@ class IntegrationTests(unittest.TestCase):
         self.fake.write_text(FAKE)
         self.fake.chmod(0o755)
         self.env = {**os.environ, 'CCX_HOME':str(self.root / 'config'),
-                    'CCX_CLAUDE_BIN':str(self.fake), 'CCX_CODEX_BIN':str(self.fake)}
+                    'CCX_CLAUDE_BIN':str(self.fake), 'CCX_CODEX_BIN':str(self.fake),
+                    'CCX_KIMI_BIN':str(self.fake), 'CCX_MCODE_BIN':str(self.fake)}
+        self.kimi_data = self.root / 'kimi-data'; self.kimi_data.mkdir()
+        self.mcode_data = self.root / 'mcode-data'; self.mcode_data.mkdir()
+        self.env.update(KIMI_CODE_HOME=str(self.kimi_data), MINIMAX_DATA_DIR=str(self.mcode_data))
         for key in ('CCX_DRY_RUN', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'FAKE_CASE'):
             self.env.pop(key, None)
         for args in (('init','-q'), ('config','user.email','test@example.invalid'),
@@ -129,6 +165,883 @@ class IntegrationTests(unittest.TestCase):
 
     def result(self):
         return json.loads(next((self.root / 'config' / 'runs').glob('team-*/result.json')).read_text())
+
+    def test_additional_native_cli_profiles(self):
+        for provider in ('kimi-cli', 'mcode'):
+            self.ccx('new', '--name', provider, '--provider', provider, '--model', 'chosen', '--yes')
+            login = json.loads(self.ccx(provider, 'login').stdout)
+            self.assertEqual(login['args'], ['login'])
+            run = json.loads(self.ccx(provider, 'hello').stdout)
+            self.assertEqual(run['args'], ['--model', 'chosen', 'hello'])
+            override = json.loads(self.ccx(provider, '--model', 'other', 'hello').stdout)
+            self.assertEqual(override['args'], ['--model', 'other', 'hello'])
+            self.assertIn(provider, self.ccx('list').stdout)
+            self.ccx('new', '--name', 'team-' + provider, '--type', 'loop',
+                     '--planner', provider, '--builder', provider, '--reviewer', provider,
+                     '--proof', 'test -f implemented.py', '--yes')
+            run = self.ccx('team-' + provider, 'Implement the fixture')
+            self.assertIn('finished', run.stdout)
+            (self.repo / 'implemented.py').unlink()
+
+
+    def test_undo_redo_restores_files_and_rejects_external_changes(self):
+        source = self.repo / 'source.txt'
+        source.write_text('original\n')
+        (self.repo / 'binary.bin').write_bytes(b'\x00old\xff')
+        (self.repo / 'link').symlink_to('source.txt')
+        self.commit_fixture()
+        before = self.root / 'before.zip'
+        after = self.root / 'after.zip'
+        workflow_module.capture_checkpoint(self.repo, before)
+        source.write_text('changed\n')
+        (self.repo / 'binary.bin').write_bytes(b'\x00new\xff')
+        (self.repo / 'link').unlink()
+        (self.repo / 'new.txt').write_text('added')
+        workflow_module.capture_checkpoint(self.repo, after)
+        workflow_module.restore_checkpoint(self.repo, after, before)
+        self.assertEqual(source.read_text(), 'original\n')
+        self.assertEqual((self.repo / 'binary.bin').read_bytes(), b'\x00old\xff')
+        self.assertEqual(os.readlink(self.repo / 'link'), 'source.txt')
+        self.assertFalse((self.repo / 'new.txt').exists())
+        workflow_module.restore_checkpoint(self.repo, before, after)
+        self.assertEqual(source.read_text(), 'changed\n')
+        self.assertEqual((self.repo / 'new.txt').read_text(), 'added')
+        source.write_text('external edit\n')
+        with self.assertRaisesRegex(workflow_module.WorkflowError, 'project changed'):
+            workflow_module.restore_checkpoint(self.repo, after, before)
+        self.assertEqual(source.read_text(), 'external edit\n')
+
+    def test_undo_refuses_staged_changes_and_ignored_collisions(self):
+        before = self.root / 'before.zip'
+        after = self.root / 'after.zip'
+        workflow_module.capture_checkpoint(self.repo, before)
+        target = self.repo / 'new.txt'
+        target.write_text('created')
+        workflow_module.capture_checkpoint(self.repo, after)
+        subprocess.run(['git', 'add', 'new.txt'], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(workflow_module.WorkflowError, 'staged'):
+            workflow_module.restore_checkpoint(self.repo, after, before)
+        self.assertEqual(target.read_text(), 'created')
+
+        subprocess.run(['git', 'restore', '--staged', 'new.txt'], cwd=self.repo, check=True)
+        workflow_module.restore_checkpoint(self.repo, after, before)
+        (self.repo / '.git' / 'info' / 'exclude').write_text('new.txt\n')
+        target.write_text('ignored user file')
+        with self.assertRaisesRegex(workflow_module.WorkflowError, 'untracked or ignored'):
+            workflow_module.restore_checkpoint(self.repo, before, after)
+        self.assertEqual(target.read_text(), 'ignored user file')
+
+    def test_undo_rolls_back_if_restore_fails(self):
+        (self.repo / 'a').write_text('old a')
+        (self.repo / 'b').write_text('old b')
+        self.commit_fixture()
+        before, after = self.root / 'before.zip', self.root / 'after.zip'
+        workflow_module.capture_checkpoint(self.repo, before)
+        (self.repo / 'a').write_text('new a')
+        (self.repo / 'b').write_text('new b')
+        workflow_module.capture_checkpoint(self.repo, after)
+        replace = os.replace
+        calls = 0
+        def fail_once(source, target):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError('simulated failure')
+            return replace(source, target)
+        with mock.patch.object(workflow_module.os, 'replace', side_effect=fail_once):
+            with self.assertRaisesRegex(OSError, 'simulated failure'):
+                workflow_module.restore_checkpoint(self.repo, after, before)
+        self.assertEqual((self.repo / 'a').read_text(), 'new a')
+        self.assertEqual((self.repo / 'b').read_text(), 'new b')
+
+    def test_theme_persists_without_overwriting_other_settings(self):
+        config = {'CCX_PLANNER': 'a', 'CCX_BUILDER': 'b', 'CCX_REVIEWER': 'c'}
+        settings = self.root / 'tui.json'
+        settings.write_text(json.dumps({'other': 'preserve'}))
+        with mock.patch.dict(os.environ, {'CCX_HOME': str(self.root)}):
+            ui = workflow_module.TeamUI(config, None)
+            ui.set_theme('ocean')
+            self.assertEqual(json.loads(settings.read_text()), {'other': 'preserve', 'theme': 'ocean'})
+            self.assertEqual(settings.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(workflow_module.TeamUI(config, None).theme, 'ocean')
+            with self.assertRaises(workflow_module.WorkflowError):
+                ui.set_theme('unknown')
+            self.assertEqual(json.loads(settings.read_text())['theme'], 'ocean')
+
+    def test_file_references_confined_to_workspace(self):
+        (self.repo / 'source.txt').write_text('useful context')
+        result = workflow_module.attach_file_context('Review @source.txt', self.repo)
+        self.assertIn('FILE @source.txt', result)
+        self.assertIn('useful context', result)
+        (self.root / 'outside.txt').write_text('private')
+        (self.repo / 'escape').symlink_to(self.root / 'outside.txt')
+        for task in ('Review @../outside.txt', 'Review @escape'):
+            with self.assertRaises(workflow_module.WorkflowError):
+                workflow_module.attach_file_context(task, self.repo)
+        (self.repo / 'binary').write_bytes(b'\x00data')
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.attach_file_context('Review @binary', self.repo)
+
+    def test_explicit_file_context_reaches_the_agent(self):
+        source = self.repo / 'source.txt'
+        source.write_text('specific context for review')
+        self.commit_fixture()
+        self.workflow()
+        log = self.root / 'prompts.jsonl'
+        self.ccx('team', '--review-only', 'Review @source.txt',
+                 env={**self.env, 'FAKE_PROMPT_LOG': str(log)})
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('specific context for review' in prompt for prompt in prompts))
+
+    def test_checkpoint_size_limit_leaves_no_partial_archive(self):
+        (self.repo / 'big').write_bytes(b'123456')
+        destination = self.root / 'limited.zip'
+        with mock.patch.object(workflow_module, 'CHECKPOINT_LIMIT', 4):
+            with self.assertRaisesRegex(workflow_module.WorkflowError, '64 MiB'):
+                workflow_module.capture_checkpoint(self.repo, destination)
+        self.assertFalse(destination.exists())
+
+    def test_workflow_records_normalized_events(self):
+        self.workflow()
+        self.ccx('team', '--review-only', 'Inspect fixture')
+        path = next((self.root / 'config' / 'runs').glob('team-*/events.jsonl'))
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual([e['sequence'] for e in events], list(range(1, len(events) + 1)))
+        self.assertEqual(events[0]['type'], 'task_started')
+        self.assertEqual(events[-1]['type'], 'task_finished')
+        self.assertTrue(any(e['type'] == 'agent_started' for e in events))
+        self.assertTrue(any(e['type'] == 'agent_finished' for e in events))
+        self.assertTrue(any(e['type'] == 'activity' for e in events))
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_codex_mcp_override_preserves_literal_server_names(self):
+        names = ['gamersbego', 'server.with.dot', 'server "quote"']
+        servers = [{'name': name} for name in names]
+        override = workflow_module.disable_codex_mcp(servers)
+        parsed = tomllib.loads(override[1])
+        self.assertEqual(override[0], '-c')
+        self.assertEqual(set(parsed['mcp_servers']), set(names))
+        self.assertTrue(all(entry == {'enabled': False} for entry in parsed['mcp_servers'].values()))
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.disable_codex_mcp([{'name': 'bad\nname'}])
+
+    def test_codex_workflow_passes_one_complete_mcp_override(self):
+        self.workflow(planner='codex', builder='codex', reviewer='codex')
+        log = self.root / 'mcp-args.jsonl'
+        servers = [{'name': 'gamersbego'}, {'name': 'server.with.dot'}]
+        env = {**self.env, 'FAKE_MCP_SERVERS': json.dumps(servers), 'FAKE_ARGS_LOG': str(log)}
+        self.ccx('team', '--review-only', 'Review fixture', env=env)
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        turns = [args for args in calls if 'exec' in args]
+        self.assertGreaterEqual(len(turns), 2)
+        for args in turns:
+            settings = [args[i + 1] for i, arg in enumerate(args[:-1]) if arg == '-c']
+            overrides = [value for value in settings if value.startswith('mcp_servers=')]
+            self.assertEqual(len(overrides), 1)
+            self.assertEqual(set(tomllib.loads(overrides[0])['mcp_servers']), {'gamersbego', 'server.with.dot'})
+
+    def test_orchestrator_routes_and_manual_override(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop', '--orchestrator', 'codex',
+                 '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex',
+                 '--proof', 'test -f implemented.py', '--yes')
+        self.assertIn('CCX_ORCHESTRATOR=codex', self.ccx('show', 'team').stdout)
+        env = {**self.env, 'FAKE_ROUTE': 'inspect'}
+        result = self.ccx('team', 'Inspect the project', env=env)
+        self.assertIn('Read-only inspection completed', result.stdout)
+        self.assertFalse((self.repo / 'implemented.py').exists())
+        result = self.ccx('team', '--route', 'direct', 'Implement fixture', env=env)
+        self.assertTrue((self.repo / 'implemented.py').exists())
+        self.assertIn('route selected by user: direct', result.stdout)
+        self.assertNotIn('orchestrate (', result.stdout)
+
+    def test_four_distinct_cli_roles_complete_a_workflow(self):
+        self.ccx('new', '--name', 'kimi', '--provider', 'kimi-cli', '--yes')
+        self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
+        self.ccx('new', '--name', 'team', '--type', 'loop', '--orchestrator', 'kimi',
+                 '--planner', 'codex', '--builder', 'mcode', '--reviewer', 'claude',
+                 '--proof', 'test -f implemented.py', '--yes')
+        result = self.ccx('team', 'Implement fixture')
+        for expected in ('orchestrate (kimi', 'plan (codex', 'build (mcode', 'review (claude'):
+            self.assertIn(expected, result.stdout)
+        self.assertTrue((self.repo / 'implemented.py').is_file())
+
+    def test_orchestrator_read_only_route_requires_no_proof(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop', '--orchestrator', 'codex',
+                 '--planner', 'claude', '--reviewer', 'codex', '--yes')
+        result = self.ccx('team', 'Explain the project', env={**self.env, 'FAKE_ROUTE': 'inspect'})
+        self.assertIn('Read-only inspection completed', result.stdout)
+        self.assertFalse((self.repo / 'implemented.py').exists())
+
+    def test_orchestrator_plan_route_and_invalid_route(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop', '--orchestrator', 'claude',
+                 '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex',
+                 '--proof', 'test -f implemented.py', '--yes')
+        invalid = self.ccx('team', 'Implement fixture', ok=False,
+                           env={**self.env, 'FAKE_ROUTE': 'invalid'})
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn('invalid route', invalid.stderr)
+        self.assertFalse((self.repo / 'implemented.py').exists())
+        result = self.ccx('team', 'Implement fixture')
+        self.assertIn('orchestrator chose plan', result.stdout)
+        self.assertTrue((self.repo / 'implemented.py').exists())
+
+    def test_mcode_initializes_missing_data_directory(self):
+        self.mcode_data.rmdir()
+        self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
+        self.workflow(planner='mcode', builder='mcode', reviewer='mcode')
+        self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CHECK_TMP': '1'})
+        self.assertTrue(self.mcode_data.is_dir())
+
+    def test_team_tui_layout_adapts_to_terminal_width(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'z', 'CCX_PLANNER': 'a', 'CCX_BUILDER': 'b', 'CCX_REVIEWER': 'c'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['orchestrate']
+            ui.select_route('plan')
+            lines = terminal.getvalue().splitlines()
+            plan = next(i for i, line in enumerate(lines) if 'PLAN' in line)
+            execute = next(i for i, line in enumerate(lines) if 'EXECUTE' in line)
+            review = next(i for i, line in enumerate(lines) if 'REVIEW' in line)
+            orchestrator = next(i for i, line in enumerate(lines) if 'ORCHESTRATOR' in line)
+            self.assertLess(orchestrator, plan)
+            self.assertLess(plan, execute)
+            self.assertLess(execute, review)
+            self.assertEqual(len(visible(lines[review])), 100)
+            self.assertIn('CONVERSATION', terminal.getvalue())
+            self.assertIn('waiting', lines[orchestrator])
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((60, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['orchestrate']
+            ui.select_route('plan')
+            lines = terminal.getvalue().splitlines()
+            positions = [next(i for i, line in enumerate(lines) if label in line)
+                         for label in ('ORCHESTRATOR', 'PLAN', 'EXECUTE', 'REVIEW')]
+            self.assertEqual(positions, sorted(set(positions)))
+
+    def test_dynamic_panels_follow_route(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal), \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            self.assertEqual(ui.visible, [])
+            ui.begin('orchestrate', 'a', '', 'default')
+            self.assertEqual(ui.visible, ['orchestrate'])
+            ui.select_route('inspect')
+            self.assertEqual(ui.visible, ['orchestrate', 'review'])
+            ui.select_route('direct')
+            self.assertEqual(ui.visible, ['orchestrate', 'build', 'review'])
+            ui.select_route('plan')
+            self.assertEqual(ui.visible, ['orchestrate', 'plan', 'build', 'review'])
+            ui.select_route('plan', review_only=True)
+            self.assertEqual(ui.visible, ['orchestrate', 'plan', 'review'])
+
+    def test_orchestrator_panel_shows_activity(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'kimi', 'CCX_PLANNER': 'a', 'CCX_BUILDER': 'b', 'CCX_REVIEWER': 'c'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.begin('orchestrate', 'kimi', '', 'default')
+            ui.update('orchestrate', 'Choosing route')
+            ui.done('orchestrate')
+            self.assertEqual(ui.panels['orchestrate']['status'], 'done')
+            self.assertIn('Choosing route', terminal.getvalue())
+            self.assertIn('CLI: kimi', terminal.getvalue())
+
+    def test_result_preview_is_rendered_in_place(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['review']
+            ui.result = 'Plan approved and the build verified.'
+            ui.result_status = 'completed'
+            ui.render()
+            frame = terminal.getvalue()
+            self.assertIn('RESULT', frame)
+            self.assertIn('Plan approved and the build verified.', frame)
+            self.assertIn('completed', frame)
+            self.assertIn('\x1b[', frame)
+
+    def test_colour_can_be_disabled_and_status_stays_readable(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm', 'NO_COLOR': '1'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['review']
+            ui.begin('review', 'codex', 'gpt-6.1-sol', 'medium')
+            ui.done('review')
+            frame = terminal.getvalue()
+            self.assertIsNone(ANSI.search(frame))
+            self.assertIn('REVIEW', frame)
+            self.assertIn('done', frame)
+
+    def test_agent_drill_down_lists_agents_and_opens_one(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['review']
+            ui.begin('review', 'codex', 'gpt-6.1-sol', 'medium')
+            ui.update('review', 'tool: glob')
+            with mock.patch('builtins.input', side_effect=['1', '', 'q']):
+                ui.show_agents()
+            frame = terminal.getvalue()
+            self.assertIn('AGENTS', frame)
+            self.assertIn('REVIEW', frame)
+            self.assertIn('tool: glob', frame)
+
+    def test_team_tui_session_and_persisted_history(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        try:
+            prompt_log = self.root / 'session-prompts.jsonl'
+            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(prompt_log)},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r} in output: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                initial = read_until(b'Task (/history')
+                self.assertIn(b'What would you like', initial)
+                for label in (b'ORCHESTRATOR', b'PLAN |', b'EXECUTE', b'REVIEW'):
+                    self.assertNotIn(label, initial)
+                os.write(master, b'\x10')
+                self.assertIn(b'COMMAND PALETTE', read_until(b'Search/number: '))
+                os.write(master, b'files\n')
+                read_until(b'Search/number: ')
+                os.write(master, b'1\n')
+                self.assertIn(b'WORKSPACE FILES', read_until(b'[n] next'))
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'Fixture task\n')
+                completed = read_until(b'[n] next')
+                self.assertIn(b'PLAN', completed)
+                self.assertIn(b'REVIEW', completed)
+                self.assertNotIn(b'EXECUTE', completed)
+                self.assertIn(b'CONCLUSION', completed)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/result\n')
+                detail = read_until(b'[n] next')
+                self.assertIn(b'Plan approved', detail)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/history\n')
+                history = read_until(b'History: ')
+                self.assertIn(b'Fixture task', history)
+                os.write(master, b'1\n')
+                detail = read_until(b'[n] next')
+                self.assertIn(b'Fixture task', detail)
+                self.assertIn(b'Plan approved', detail)
+                os.write(master, b'\n')
+                read_until(b'History: ')
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'Follow-up task\n')
+                second = read_until(b'[n] next')
+                self.assertIn(b'CONCLUSION', second)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                proc.wait(timeout=10)
+                self.assertEqual(proc.returncode, 0)
+            runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
+            self.assertEqual({json.loads(run.read_text())['task'] for run in runs}, {'Fixture task', 'Follow-up task'})
+            prompts = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+            self.assertTrue(any('PREVIOUS TASK:\nFixture task' in prompt and
+                                'CURRENT USER TASK (follow this):\nFollow-up task' in prompt
+                                for prompt in prompts))
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_legacy_team_orchestrates_and_displays_only_required_panels(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop',
+                 '--planner', 'claude', '--reviewer', 'codex', '--yes')
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'inspect'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                initial = read_until(b'Task (/history')
+                self.assertNotIn(b'ORCHESTRATOR |', initial)
+                os.write(master, b'Inspect the project\n')
+                output = read_until(b'[n] next')
+                self.assertIn(b'ORCHESTRATOR', output)
+                self.assertIn(b'REVIEW', output)
+                self.assertNotIn(b'PLAN |', output)
+                self.assertNotIn(b'EXECUTE |', output)
+                self.assertIn(b'Read-only inspection completed', output)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            saved = (self.root / 'config' / 'profiles' / 'team' / 'workflow.env').read_text()
+            self.assertNotIn('CCX_ORCHESTRATOR=', saved)
+            effective = next((self.root / 'config' / 'runs').glob('team-*/workflow.json'))
+            self.assertEqual(json.loads(effective.read_text())['CCX_ORCHESTRATOR'], 'claude')
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_missing_verification_command_prompts_in_the_tui(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop',
+                 '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex', '--yes')
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'plan'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r} in output: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+
+                read_until(b'Task (/history')
+                os.write(master, b'Fixture task\n')
+                self.assertIn(b'Verification command', read_until(b'Verification command'))
+                os.write(master, b'true\n')
+                output = read_until(b'[n] next')
+                self.assertIn(b'CONCLUSION', output)
+                self.assertIn(b'Verification: true', output)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_empty_verification_prompt_points_at_the_proof_command(self):
+        self.ccx('new', '--name', 'team', '--type', 'loop',
+                 '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex', '--yes')
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'plan'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r} in output: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+
+                read_until(b'Task (/history')
+                os.write(master, b'Fixture task\n')
+                read_until(b'Verification command')
+                os.write(master, b'\n')
+                output = read_until(b'[n] next')
+                self.assertIn(b'/proof', output)
+                self.assertIn(b'No verification command', output)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_provider_picker_lists_every_template(self):
+        master, slave = pty.openpty()
+        # No `with` block: Popen.__exit__ waits without a timeout, so a failed
+        # assertion would leave the menu alive and block the whole suite.
+        proc = subprocess.Popen([str(CCX), 'new', '--name', 'pick'], cwd=self.repo,
+                                env={**self.env, 'TERM': 'xterm'},
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        slave = None
+        try:
+            def read_until(token):
+                data = b''
+                deadline = time.monotonic() + 12
+                while token not in data:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                        proc.kill()
+                        self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                    data += os.read(master, 65536)
+                return data
+
+            read_until(b'Choose profile type')
+            os.write(master, b'\r')
+            read_until(b'Choose provider')
+            # The box is drawn top-down; let the remaining rows arrive.
+            picker = b''
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.2)[0]:
+                    chunk = os.read(master, 65536)
+                    if not chunk:
+                        break
+                    picker += chunk
+            for provider in (b'claude', b'codex', b'custom-oai', b'deepseek', b'glm',
+                             b'kimi', b'lmstudio', b'minimax', b'ollama', b'openai',
+                             b'openrouter', b'sakana', b'vllm', b'kimi-cli', b'mcode'):
+                self.assertIn(provider, picker, f'picker must offer {provider!r}')
+            self.assertIn(b'Custom / type manually', picker)
+            self.assertIn(b'Anthropic-compatible', picker)
+            self.assertIn(b'OpenAI-compatible', picker)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_queue_and_stop_while_agent_runs(self):
+        self.workflow()
+        def start():
+            master, slave = pty.openpty()
+            proc = subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+                                    env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'stream'},
+                                    stdin=slave, stdout=slave, stderr=slave)
+            os.close(slave)
+            return master, proc
+        def read_until(master, proc, token):
+            data = b''
+            deadline = time.monotonic() + 15
+            while token not in data:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                    proc.kill()
+                    self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                data += os.read(master, 65536)
+            return data
+        master, proc = start()
+        try:
+            read_until(master, proc, b'Task (/history')
+            os.write(master, b'First task\n')
+            read_until(master, proc, b'Queue: ')
+            os.write(master, b'Follow-up queued\n')
+            read_until(master, proc, b'[n] next')
+            os.write(master, b'\n')
+            second = read_until(master, proc, b'[n] next')
+            self.assertIn(b'CONCLUSION', second)
+            os.write(master, b'\n')
+            read_until(master, proc, b'Task (/history')
+            os.write(master, b'/quit\n')
+            self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+        runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
+        self.assertEqual({json.loads(p.read_text())['task'] for p in runs}, {'First task', 'Follow-up queued'})
+        master, proc = start()
+        try:
+            read_until(master, proc, b'Task (/history')
+            os.write(master, b'Stop test\n')
+            read_until(master, proc, b'Queue: ')
+            time.sleep(0.2)
+            os.write(master, b'\x1b')
+            output = read_until(master, proc, b'[n] next')
+            self.assertIn(b'stopped by user', output)
+            os.write(master, b'\n')
+            read_until(master, proc, b'Task (/history')
+            os.write(master, b'/quit\n')
+            self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            os.close(master)
+
+    def test_failed_build_can_be_undone(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team', '--route', 'direct'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'builder_blocked'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Task (/history')
+                os.write(master, b'Attempt task\n')
+                self.assertIn(b'FAILED', read_until(b'[n] next'))
+                self.assertTrue((self.repo / 'implemented.py').exists())
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/undo\n')
+                self.assertIn(b'Undo complete', read_until(b'Task (/history'))
+                self.assertFalse((self.repo / 'implemented.py').exists())
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_session_continues_unchanged_results_and_rejects_external_edits(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Task (/history')
+                os.write(master, b'/route direct\n')
+                self.assertIn(b'Route set to direct', read_until(b'Task (/history'))
+                os.write(master, b'/proof test -f implemented.py\n')
+                self.assertIn(b'Verification command updated', read_until(b'Task (/history'))
+                os.write(master, b'First task\n')
+                read_until(b'[n] next')
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'Second task\n')
+                second = read_until(b'[n] next')
+                self.assertIn(b'CONCLUSION', second)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/undo\n')
+                self.assertIn(b'Undo complete', read_until(b'Task (/history'))
+                self.assertFalse((self.repo / 'implemented.py').exists())
+                os.write(master, b'/redo\n')
+                self.assertIn(b'Redo complete', read_until(b'Task (/history'))
+                self.assertTrue((self.repo / 'implemented.py').exists())
+                (self.repo / 'implemented.py').write_text('external edit\n')
+                os.write(master, b'/undo\n')
+                refused = read_until(b'[n] next')
+                self.assertIn(b'project changed', refused)
+                self.assertEqual((self.repo / 'implemented.py').read_text(), 'external edit\n')
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'Third task\n')
+                failure = read_until(b'[n] next')
+                self.assertIn(b'clean Git checkout', failure)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
+            self.assertEqual(len(runs), 2)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_history_survives_restarting_the_terminal_session(self):
+        self.workflow()
+        self.ccx('team', '--review-only', 'Previous run')
+        root = self.root / 'config' / 'runs'
+        older = root / 'team-abcdefgh'
+        older.mkdir()
+        (older / 'workflow.json').write_text('{}')
+        (older / 'result.json').write_text(json.dumps({'status': 'completed', 'summary': 'Old run'}))
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 10
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Task (/history')
+                os.write(master, b'/history\n')
+                output = read_until(b'History: ')
+                self.assertIn(b'Previous run', output)
+                self.assertIn(b'task not recorded in earlier run', output)
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_resume_session_uses_context_and_rejects_changed_checkout(self):
+        self.workflow()
+        self.ccx('team', '--review-only', 'Previous run')
+        prompt_log = self.root / 'resume-prompts.jsonl'
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(prompt_log)},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Task (/history')
+                os.write(master, b'/history\n')
+                read_until(b'History: ')
+                os.write(master, b'1\n')
+                detail = read_until(b'[r] resume')
+                self.assertIn(b'Previous run', detail)
+                os.write(master, b'r\n')
+                self.assertIn(b'Session restored', read_until(b'Task (/history'))
+                os.write(master, b'Follow-up\n')
+                read_until(b'[n] next')
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            prompts = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+            self.assertTrue(any('PREVIOUS TASK:\nPrevious run' in prompt for prompt in prompts))
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_resume_refuses_changed_project(self):
+        self.workflow()
+        self.ccx('team', '--review-only', 'Previous run')
+        (self.repo / 'external.txt').write_text('external change')
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Task (/history')
+                os.write(master, b'/history\n')
+                read_until(b'History: ')
+                os.write(master, b'1\n')
+                read_until(b'[r] resume')
+                os.write(master, b'r\n')
+                self.assertIn(b'project or its files changed', read_until(b'[n] next'))
+                os.write(master, b'\n')
+                read_until(b'Task (/history')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertEqual((self.repo / 'external.txt').read_text(), 'external change')
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_kimi_structured_response_with_prose(self):
+        schema = workflow_module.schema({'plan': {'type': 'string'}})
+        self.assertEqual(workflow_module.extract_json_response(
+            'Here is the result:\n```json\n{"plan":"Add tests"}\n```', schema),
+            {'plan': 'Add tests'})
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.extract_json_response('No structured result', schema)
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.extract_json_response('{"plan":"one"} {"plan":"two"}', schema)
+
+    def test_native_reviewer_cannot_write_project(self):
+        self.ccx('new', '--name', 'kimi-native', '--provider', 'kimi-cli', '--yes')
+        self.workflow(planner='kimi-native', builder='claude', reviewer='kimi-native')
+        result = self.ccx('team', 'Review fixture', ok=False,
+                          env={**self.env, 'FAKE_CASE': 'mutate_review'})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.repo / 'unexpected.py').exists())
+        self.assertIn('Read-only file system', result.stdout + result.stderr)
 
     def test_codex_login_and_model_args(self):
         self.ccx('new','--name','native','--provider','codex','--model','chosen-model','--yes')
@@ -277,7 +1190,10 @@ class IntegrationTests(unittest.TestCase):
                         proc.kill()
                         self.fail('Profile-type menu did not enable arrow-key input')
                     time.sleep(0.01)
-                os.write(master,keys)
+                # The first menu chooses loop; select default orchestrator,
+                # model and effort before the existing per-role inputs.
+                first = keys.index(b'\r') + 1
+                os.write(master, keys[:first] + b'\r' * 3 + keys[first:])
                 out, err = proc.communicate(timeout=10)
                 return proc.returncode,out,err
         finally:
@@ -290,6 +1206,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('Created workflow "wizard"',out)
         self.assertIn('Choose profile type',out)
         self.assertIn('↑↓ move',out)
+        self.assertIn('Choose orchestrator',out)
         self.assertIn('Choose planner',out)
         self.assertIn('Choose builder',out)
         self.assertIn('Choose checker (reviewer)',out)
@@ -360,7 +1277,8 @@ class IntegrationTests(unittest.TestCase):
                  env={**self.env,'FAKE_ARGS_LOG':str(log)})
         calls = [json.loads(line) for line in log.read_text().splitlines()]
         turns = [args for args in calls if '-p' in args or 'exec' in args]
-        self.assertEqual([args[args.index('--model')+1] for args in turns],
+        self.assertNotIn('--model', turns[0])  # Orchestrator uses the CLI default.
+        self.assertEqual([args[args.index('--model')+1] for args in turns[1:]],
                          ['sonnet','haiku','gpt-6.1-sol','haiku'])
         self.assertIn('ANTHROPIC_MODEL=opusplan',self.ccx('show','claude').stdout)
         self.assertNotIn('CODEX_MODEL=gpt-6.1-sol',self.ccx('show','codex').stdout)
@@ -612,6 +1530,21 @@ class IntegrationTests(unittest.TestCase):
                              env={**self.env,'CCX_HOME':'../../config'},
                              capture_output=True,text=True,timeout=20)
         self.assertEqual(run.returncode,0,run.stderr)
+
+    def test_non_git_directory_runs_in_degraded_mode(self):
+        self.workflow()
+        outside = self.root / 'not a repo'
+        outside.mkdir()
+        args_log = self.root / 'fake-args.log'
+        run = subprocess.run([str(CCX),'team','fixture'],cwd=outside,
+                             env={**self.env,'FAKE_ARGS_LOG':str(args_log)},
+                             capture_output=True,text=True,timeout=60)
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+        self.assertTrue(args_log.exists(),
+                        'the agent must still run outside a git repository')
+        self.assertIn('no git repository',run.stdout)
+        self.assertTrue((outside / 'implemented.py').exists(),
+                        'the build must land in the workspace')
 
 
 if __name__ == '__main__':
