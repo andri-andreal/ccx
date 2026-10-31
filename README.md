@@ -38,6 +38,13 @@ behind each.*
 - **CLI + desktop GUI** - manage profiles from the terminal or a [Tauri](https://tauri.app) app.
 - **Native Codex profiles** - use Codex CLI with its own ChatGPT login and optional isolated home.
 - **Saved workflows** - configure planner, builder, reviewer and verification once in `ccx new`, then launch by name.
+- **Interactive clarification** - when a request is ambiguous, the orchestrator asks up to
+  three questions with concrete options; the team shows them as a picker and the answers
+  travel with the plan instead of becoming another guess.
+- **Verification command picker** - if no test/build command is detected, the team offers
+  the detected command plus the ones that fit the checkout, instead of an empty text prompt.
+- **Codex in any checkout** - Codex refuses to start outside a trusted git repository, so
+  ccx registers the project and skips that check; planning works in a plain folder too.
 - **Builder/checker consensus** - exchange fixes and evidence, rerun verification,
   and require both `READY` and `APPROVED` on the same code before completion.
 - **Bounded retries and records** - configure revision budgets/timeouts, preserve

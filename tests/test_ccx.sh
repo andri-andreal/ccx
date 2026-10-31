@@ -687,4 +687,30 @@ if command -v python3 >/dev/null 2>&1; then
   assert_exit "$?" 0 "certify output is valid JSON"
 fi
 
+# --- Task 3c: codex starts in a checkout it does not trust ---
+codex_home="$(mktemp -d)"
+non_git="$(mktemp -d)"
+trap 'rm -rf "$CCX_HOME" "$codex_home" "$non_git"' EXIT
+export CCX_CODEX_BIN=true
+"$CCX" new --name codexfix --provider codex --yes >/dev/null 2>&1
+
+out="$(cd "$non_git" && CODEX_HOME="$codex_home" CCX_DRY_RUN=1 "$CCX" codexfix exec --input - 2>&1)"
+assert_contains "$out" "--skip-git-repo-check" "codex skips the repository check outside a git checkout"
+assert_contains "$out" "exec: true exec" "the codex command is still assembled"
+out="$(cd "$REPO" && CODEX_HOME="$codex_home" CCX_DRY_RUN=1 "$CCX" codexfix exec --input - 2>&1)"
+assert_not_contains "$out" "--skip-git-repo-check" "codex keeps its repository check inside a git checkout"
+
+out="$(cd "$non_git" && CODEX_HOME="$codex_home" "$CCX" codexfix exec --input - 2>&1)"
+assert_contains "$out" "registered $non_git" "codex registers the project as trusted"
+assert_contains "$(cat "$codex_home/config.toml")" "[projects.\"$non_git\"]" "the trust entry names the project"
+assert_contains "$(cat "$codex_home/config.toml")" 'trust_level = "trusted"' "the trust entry marks the project trusted"
+before="$(wc -l < "$codex_home/config.toml" | tr -d ' ')"
+out="$(cd "$non_git" && CODEX_HOME="$codex_home" "$CCX" codexfix exec --input - 2>&1)"
+after="$(wc -l < "$codex_home/config.toml" | tr -d ' ')"
+assert_eq "$before" "$after" "the trust entry is written only once"
+assert_not_contains "$out" "registered $non_git" "a trusted project is not registered twice"
+
+out="$(cd "$non_git" && CODEX_HOME="$codex_home" CCX_CODEX_TRUST=off CCX_DRY_RUN=1 "$CCX" codexfix exec --input - 2>&1)"
+assert_not_contains "$out" "would register" "CCX_CODEX_TRUST=off skips the trust registration"
+
 finish

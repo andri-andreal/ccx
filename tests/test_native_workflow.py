@@ -67,6 +67,8 @@ elif kimi and 'Return only a JSON object matching this schema' in prompt:
     schema = json.loads(prompt.rsplit('Return only a JSON object matching this schema, without Markdown:\n', 1)[1])
 if schema and 'route' in schema['properties']:
     value = {'route':os.environ.get('FAKE_ROUTE', 'plan'), 'reason':'Fixture routing.'}
+    if os.environ.get('FAKE_QUESTIONS'):
+        value['questions'] = json.loads(os.environ['FAKE_QUESTIONS'])
 elif schema and 'plan' in schema['properties']:
     value = {'plan':'Create implemented.py; verify with the configured command.'}
 elif schema and 'status' in schema['properties']:
@@ -162,6 +164,12 @@ class IntegrationTests(unittest.TestCase):
     def workflow(self, planner='claude', builder='claude', reviewer='codex', proof='test -f implemented.py'):
         return self.ccx('new','--name','team','--type','loop','--planner',planner,
                         '--builder',builder,'--reviewer',reviewer,'--proof',proof,'--yes')
+
+    def orchestrator_team(self, name='team-orch'):
+        """A loop team whose orchestrator runs first and can ask the user."""
+        return self.ccx('new','--name',name,'--type','loop','--orchestrator','claude',
+                        '--planner','claude','--builder','claude','--reviewer','codex',
+                        '--proof','test -f implemented.py','--yes')
 
     def result(self):
         return json.loads(next((self.root / 'config' / 'runs').glob('team-*/result.json')).read_text())
@@ -651,7 +659,12 @@ class IntegrationTests(unittest.TestCase):
 
                 read_until(b'Task (/history')
                 os.write(master, b'Fixture task\n')
-                self.assertIn(b'Verification command', read_until(b'Verification command'))
+                picker = read_until(b'Type another command')
+                self.assertIn(b'Verification command', picker)
+                # Jump to the escape hatch and type a command of our own.
+                os.write(master, b'5')
+                os.write(master, b'\r')
+                read_until(b'Command: ')
                 os.write(master, b'true\n')
                 output = read_until(b'[n] next')
                 self.assertIn(b'CONCLUSION', output)
@@ -690,7 +703,8 @@ class IntegrationTests(unittest.TestCase):
                 read_until(b'Task (/history')
                 os.write(master, b'Fixture task\n')
                 read_until(b'Verification command')
-                os.write(master, b'\n')
+                # Cancelling the picker is the same as leaving the answer empty.
+                os.write(master, b'q')
                 output = read_until(b'[n] next')
                 self.assertIn(b'/proof', output)
                 self.assertIn(b'No verification command', output)
@@ -1545,6 +1559,178 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('no git repository',run.stdout)
         self.assertTrue((outside / 'implemented.py').exists(),
                         'the build must land in the workspace')
+
+    def test_proof_candidates_lead_with_the_detected_command(self):
+        go = self.root / 'go-project'
+        go.mkdir()
+        (go / 'go.mod').write_text('module example.com/demo\n')
+        candidates = workflow_module.proof_candidates(go)
+        self.assertEqual(candidates[0][0], 'go test ./...')
+        self.assertIn('detected', candidates[0][1])
+        self.assertIn('go build ./...', [command for command, _ in candidates])
+        python = self.root / 'python-project'
+        python.mkdir()
+        (python / 'pyproject.toml').write_text('[tool.pytest.ini_options]\n')
+        commands = [command for command, _ in workflow_module.proof_candidates(python)]
+        self.assertEqual(commands[0], 'python3 -m pytest')
+        empty = self.root / 'empty-project'
+        empty.mkdir()
+        commands = [command for command, _ in workflow_module.proof_candidates(empty)]
+        self.assertIn('go test ./...', commands)
+        self.assertIn('python3 -m pytest', commands)
+
+    def test_require_proof_uses_the_picked_command(self):
+        class FakeUI:
+            enabled = True
+
+            def __init__(self):
+                self.picked = None
+
+            def select_choice(self, title, options, subtitle=''):
+                self.title = title
+                self.options = options
+                return self.picked
+
+            def read_command(self, prompt='Task: '):
+                return ''
+
+        ui = FakeUI()
+        with mock.patch.object(workflow_module, 'team_ui', ui):
+            config = {'CCX_PROOF': ''}
+            ui.picked = 'go test ./...'
+            self.assertEqual(workflow_module.require_proof(config, self.repo), 'go test ./...')
+            self.assertEqual(config['CCX_PROOF'], 'go test ./...')
+            self.assertEqual(config['CCX_PROOF_SOURCE'], 'prompt')
+            self.assertEqual(ui.title, 'Verification command')
+            labels = [label for label, _value, _note in ui.options]
+            self.assertIn('Type another command', labels)
+            ui.picked = None
+            with self.assertRaisesRegex(workflow_module.WorkflowError, '/proof COMMAND'):
+                workflow_module.require_proof({'CCX_PROOF': ''}, self.repo)
+
+    def test_validate_questions_rejects_unusable_questions(self):
+        self.assertEqual(workflow_module.validate_questions(None), [])
+        self.assertEqual(workflow_module.validate_questions([]), [])
+        kept = workflow_module.validate_questions([
+            {'question': 'Which framework?', 'options': ['net/http', 'gin']}])
+        self.assertEqual(kept[0]['options'], ['net/http', 'gin'])
+        for broken in ([{'question': 'Which?', 'options': []}],
+                       [{'question': 'Which?', 'options': ['']}],
+                       [{'question': '', 'options': ['a']}],
+                       [{'question': 'Which?'}]):
+            with self.assertRaises(workflow_module.WorkflowError):
+                workflow_module.validate_questions(broken)
+
+    def test_clarification_answers_reach_the_planner(self):
+        self.orchestrator_team()
+        questions = json.dumps([{'question': 'Which framework?', 'options': ['net/http', 'gin']}])
+        prompt_log = self.root / 'prompts.log'
+        run = subprocess.run([str(CCX),'team-orch','Build an API'],cwd=self.repo,
+                             env={**self.env,'FAKE_QUESTIONS':questions,
+                                  'FAKE_PROMPT_LOG':str(prompt_log)},
+                             capture_output=True,text=True,timeout=60)
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+        run_dir = next((self.root / 'config' / 'runs').glob('team-orch-*'))
+        saved = json.loads((run_dir / 'clarifications.json').read_text())
+        self.assertEqual(saved['questions'][0]['question'], 'Which framework?')
+        self.assertEqual(saved['answers'][0]['answer'], '')
+        prompts = [json.loads(line) for line in prompt_log.read_text().splitlines() if line.strip()]
+        plan_prompt = next(prompt for prompt in prompts if 'USER ANSWERS' in prompt)
+        self.assertIn('Which framework?', plan_prompt)
+        self.assertIn('(no answer given)', plan_prompt)
+
+    def test_verification_picker_offers_commands_before_the_task_runs(self):
+        self.ccx('new','--name','team-noproof','--type','loop','--planner','claude',
+                 '--builder','claude','--reviewer','codex','--yes')
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([str(CCX), 'team-noproof'], cwd=self.repo,
+                                env={**self.env, 'TERM': 'xterm'},
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        slave = None
+        try:
+            def read_until(token):
+                data = b''
+                deadline = time.monotonic() + 15
+                while token not in data:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                        proc.kill()
+                        self.fail(f'Missing {token!r}: {data[-1200:]!r}')
+                    data += os.read(master, 65536)
+                return data
+
+            read_until(b'Task (/history')
+            os.write(master, b'Build an API\n')
+            picker = read_until(b'move')
+            self.assertIn(b'Verification command', picker)
+            self.assertIn(b'go test ./...', picker)
+            self.assertIn(b'python3 -m pytest', picker)
+            self.assertIn(b'Type another command', picker)
+            os.write(master, b'\r')
+            read_until(b'verification command set for this session')
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                runs = list((self.root / 'config' / 'runs').glob('team-noproof-*'))
+                if runs and json.loads((runs[0] / 'workflow.json').read_text()).get('CCX_PROOF'):
+                    break
+                time.sleep(0.2)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+        run_dir = next((self.root / 'config' / 'runs').glob('team-noproof-*'))
+        saved = json.loads((run_dir / 'workflow.json').read_text())
+        self.assertEqual(saved['CCX_PROOF'], 'go test ./...')
+        self.assertEqual(saved['CCX_PROOF_SOURCE'], 'prompt')
+        events = (run_dir / 'events.jsonl').read_text()
+        self.assertIn('verification command set for this session: go test ./...', events)
+
+    def test_clarification_picker_shows_the_question_and_options(self):
+        self.orchestrator_team()
+        questions = json.dumps([{'question': 'Which framework?', 'options': ['net/http', 'gin']}])
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([str(CCX), 'team-orch'], cwd=self.repo,
+                                env={**self.env, 'TERM': 'xterm', 'FAKE_QUESTIONS':questions},
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        slave = None
+        try:
+            def read_until(token):
+                data = b''
+                deadline = time.monotonic() + 15
+                while token not in data:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                        proc.kill()
+                        self.fail(f'Missing {token!r}: {data[-1200:]!r}')
+                    data += os.read(master, 65536)
+                return data
+
+            read_until(b'Task (/history')
+            os.write(master, b'Build an API\n')
+            picker = read_until(b'net/http')
+            self.assertIn(b'Which framework?', picker)
+            self.assertIn(b'gin', picker)
+            os.write(master, b'\r')
+            read_until(b'[n] next')
+            os.write(master, b'\n')
+            read_until(b'Task (/history')
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=10)
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+        run_dir = next((self.root / 'config' / 'runs').glob('team-orch-*'))
+        saved = json.loads((run_dir / 'clarifications.json').read_text())
+        self.assertEqual(saved['answers'][0]['answer'], 'net/http')
 
 
 if __name__ == '__main__':

@@ -2156,6 +2156,37 @@ run_native_cli() {
   exec "$executable" "${args[@]}"
 }
 
+codex_config_file() {
+  printf '%s\n' "${CODEX_HOME:-$HOME/.codex}/config.toml"
+}
+
+ensure_codex_trust() {
+  # Codex only starts in a directory it trusts. Registering the checkout keeps
+  # every later codex call in the same project working; the entry is appended
+  # once so an existing configuration file is never rewritten.
+  local dir config escaped header
+  if [ "${CCX_CODEX_TRUST:-auto}" = off ]; then return 0; fi
+  dir="$(pwd -P)"
+  config="$(codex_config_file)"
+  escaped="${dir//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  header="[projects.\"$escaped\"]"
+  if [ -f "$config" ] && grep -Fq "$header" "$config"; then
+    return 0
+  fi
+  if [ "${CCX_DRY_RUN:-}" = "1" ]; then
+    printf 'ccx: would register %s as a trusted codex project\n' "$dir" >&2
+    return 0
+  fi
+  mkdir -p "$(dirname "$config")" 2>/dev/null || return 0
+  {
+    printf '\n%s\n' "$header"
+    printf 'trust_level = "trusted"\n'
+  } >>"$config" 2>/dev/null || return 0
+  printf 'ccx: registered %s as a trusted codex project\n' "$dir" >&2
+  return 0
+}
+
 run_codex() {
   local name="$1"; shift
   local penv model codex_home
@@ -2178,7 +2209,17 @@ run_codex() {
   # invocation options follow the profile default and take precedence.
   case "${1:-}" in
     login|logout|--version|-V|--help|-h|help|doctor|mcp|completion|features|update) ;;
-    exec|e|review|resume|fork)
+    exec|e)
+      ensure_codex_trust
+      if [ -n "$model" ]; then args=("$1" --model "$model" "${@:2}"); fi
+      # Codex refuses to start outside a trusted git checkout. ccx already runs
+      # the agent inside its own sandbox, so that repository gate is the only
+      # thing standing between a plain directory and a working plan.
+      if [ ${#args[@]} -gt 0 ] && ! git rev-parse --git-dir >/dev/null 2>&1; then
+        args=("${args[@]:0:1}" --skip-git-repo-check "${args[@]:1}")
+      fi
+      ;;
+    review|resume|fork)
       if [ -n "$model" ]; then args=("$1" --model "$model" "${@:2}"); fi ;;
     *) [ -z "$model" ] || args=(--model "$model" "$@") ;;
   esac
