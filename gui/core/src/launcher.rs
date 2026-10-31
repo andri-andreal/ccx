@@ -203,6 +203,16 @@ mod tests {
     }
 
     #[test]
+    fn child_command_for_codex_delegates_to_ccx() {
+        let p = Profile {
+            name: "codex-work".into(),
+            provider: "codex".into(),
+            ..Default::default()
+        };
+        assert_eq!(child_command(&p), vec!["ccx", "codex-work"]);
+    }
+
+    #[test]
     fn child_command_for_router_delegates_to_ccx() {
         let mut p = prof(true);
         p.provider = "ollama".into();

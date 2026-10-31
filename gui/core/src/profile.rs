@@ -66,7 +66,7 @@ impl Profile {
                 "CCX_ISOLATE" => p.isolate = v == "true",
                 "ANTHROPIC_BASE_URL" => p.base_url = Some(v.to_string()),
                 "ANTHROPIC_AUTH_TOKEN" => p.token = Some(v.to_string()),
-                "ANTHROPIC_MODEL" => p.model = Some(v.to_string()),
+                "ANTHROPIC_MODEL" | "CODEX_MODEL" => p.model = Some(v.to_string()),
                 "ANTHROPIC_DEFAULT_OPUS_MODEL" => p.opus = Some(v.to_string()),
                 "ANTHROPIC_DEFAULT_SONNET_MODEL" => p.sonnet = Some(v.to_string()),
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL" => p.haiku = Some(v.to_string()),
@@ -96,6 +96,12 @@ impl Profile {
         s.push_str(&format!("# ccx profile: {}\n", self.name));
         s.push_str(&format!("CCX_PROVIDER={}\n", self.provider));
         s.push_str(&format!("CCX_ISOLATE={}\n", self.isolate));
+        if self.provider == "codex" {
+            if let Some(v) = &self.model {
+                s.push_str(&format!("CODEX_MODEL={}\n", v));
+            }
+            return s;
+        }
         if self.is_router() {
             // Router-specific keys (CCX_* — never exported to claude). The model
             // is written via the shared ANTHROPIC_* slots below.
@@ -496,6 +502,21 @@ mod tests {
             haiku: Some("MiniMax-M2".into()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn codex_round_trip_uses_native_model_key() {
+        let p = Profile {
+            name: "codex-work".into(),
+            provider: "codex".into(),
+            model: Some("chosen-model".into()),
+            isolate: true,
+            ..Default::default()
+        };
+        let content = p.to_env_str();
+        assert!(content.contains("CODEX_MODEL=chosen-model"));
+        assert!(!content.contains("ANTHROPIC_"));
+        assert_eq!(Profile::from_env_str(&p.name, &content), p);
     }
 
     #[test]

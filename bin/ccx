@@ -4,10 +4,18 @@ umask 077
 
 CCX_HOME="${CCX_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/ccx}"
 CCX_CLAUDE_BIN="${CCX_CLAUDE_BIN:-claude}"
+CCX_CODEX_BIN="${CCX_CODEX_BIN:-codex}"
 CCX_ROUTER_BIN="${CCX_ROUTER_BIN:-ccx-router}"
 CCX_CURL_BIN="${CCX_CURL_BIN:-curl}"
 CCX_VERSION="0.1.0"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_BASE="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+  [[ "$SCRIPT_PATH" = /* ]] || SCRIPT_PATH="$SCRIPT_BASE/$SCRIPT_PATH"
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+source "$SCRIPT_DIR/../lib/workflow.sh"
 
 die() { printf 'ccx: %s\n' "$1" >&2; exit "${2:-1}"; }
 
@@ -41,7 +49,7 @@ kv_get() { # file key -> value (first match)
 }
 
 print_provider_names() { # list provider template names, user templates overriding bundled ones
-  local -a preferred=(claude minimax glm deepseek kimi openai openrouter ollama vllm lmstudio sakana custom-oai)
+  local -a preferred=(claude codex minimax glm deepseek kimi openai openrouter ollama vllm lmstudio sakana custom-oai)
   local seen="" n dir t base
   for n in "${preferred[@]}"; do
     if [ -n "$(template_file "$n")" ]; then
@@ -149,6 +157,13 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
     printf '\033[2B\r'                       # back down to the blank line below the box
   }
 
+  # Draw on the terminal's temporary screen so completed menus never accumulate
+  # in the main screen or its scrollback, including menus taller than the window.
+  local temporary_screen=0
+  if [ -t 0 ] && command -v stty >/dev/null 2>&1; then
+    temporary_screen=1
+    printf '\033[?1049h\033[H\033[2J'
+  fi
   printf '\n'
   tui_draw
 
@@ -158,8 +173,11 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   fi
 
   local saved_stty; saved_stty="$(stty -g)"
-  stty raw -echo isig min 0 time 1 2>/dev/null || { printf '\n'; tui_selected=-1; return 1; }
-  trap 'stty "$saved_stty" 2>/dev/null; trap - INT TERM' INT TERM
+  stty raw -echo isig min 0 time 1 2>/dev/null || {
+    [ "$temporary_screen" -eq 0 ] || printf '\033[?1049l'
+    printf '\n'; tui_selected=-1; return 1;
+  }
+  trap 'stty "$saved_stty" 2>/dev/null; printf "\033[?1049l"; trap - INT TERM' INT TERM
 
   local key ok=0
   while true; do
@@ -185,11 +203,14 @@ tui_select() { # interactive arrow-key selector; sets tui_selected (0-based inde
   stty "$saved_stty" 2>/dev/null
   trap - INT TERM
 
-  # The cursor rests on the blank line just below the box; clear it so the next
-  # prompt starts cleanly there.
-  printf '\r\033[2K'
+  [ "$temporary_screen" -eq 0 ] || printf '\033[?1049l'
 
-  if [ "$ok" -eq 1 ]; then tui_selected="$cur"; return 0
+  if [ "$ok" -eq 1 ]; then
+    tui_selected="$cur"
+    printf '%s: %s' "$title" "${it_name[$cur]}"
+    [ -z "${it_sub[$cur]}" ] || printf ' (%s)' "${it_sub[$cur]}"
+    printf '\n'
+    return 0
   else tui_selected=-1; return 1; fi
 }
 
@@ -202,6 +223,7 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
   t_items+=("│ Anthropic-compatible")
   t_subs+=("")
   for p in "${providers[@]}"; do
+    [ "$p" != codex ] || continue
     tf="$(template_file "$p")"
     router="$(kv_get "$tf" CCX_ROUTER)"
     [ -z "$router" ] || continue
@@ -219,6 +241,8 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
     t_items+=("$p")
     t_subs+=("${model:+($model)}")
   done
+  t_items+=("│ Native CLI (ChatGPT login)" "codex")
+  t_subs+=("" "OAuth via Codex CLI")
   t_items+=("Custom / type manually")
   t_subs+=("")
   tui_subtitles=("${t_subs[@]}")
@@ -236,6 +260,7 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
     printf 'Choose provider (or type a provider name):\n'
     printf 'Anthropic-compatible:\n'
     for p in "${providers[@]}"; do
+      [ "$p" != codex ] || continue
       tf="$(template_file "$p")"
       router="$(kv_get "$tf" CCX_ROUTER)"
       [ -z "$router" ] || continue
@@ -252,6 +277,9 @@ choose_provider() { # set caller's $provider from interactive menu or typed name
       menu+=("$p")
       printf '  %2d) %-12s %s\n' "${#menu[@]}" "$p" "${model:+($model)}"
     done
+    printf 'Native CLI (ChatGPT login):\n'
+    menu+=(codex)
+    printf '  %2d) codex        OAuth via Codex CLI\n' "${#menu[@]}"
     custom_idx=$((${#menu[@]} + 1))
     printf '  %2d) Custom / type manually\n' "$custom_idx"
     printf 'Provider [1]: '
@@ -1372,7 +1400,11 @@ router_teardown() {
 cmd_help() {
   cat <<'EOF'
 Usage: ccx <profile> [claude args...]   launch claude with a profile
+       ccx <codex-profile> [args...]    launch native Codex CLI
+       ccx <codex-profile> login       sign in with ChatGPT (OAuth)
        ccx new                          create a profile (wizard / flags)
+       ccx new --type loop               save a plan/build/review workflow
+       ccx <workflow> "task"              run a saved workflow
        ccx list                         list profiles
        ccx doctor [profile]             diagnose setup/profile (--json)
        ccx certify <profile>            run opt-in capability probes
@@ -1390,17 +1422,24 @@ cmd_list() {
   if [ -d "$pd" ]; then
     for d in "$pd"/*/; do
       [ -d "$d" ] || continue
+      if [ -f "$d/workflow.env" ]; then
+        printf '%-16s loop       planner=%s builder=%s reviewer=%s\n' "$(basename "$d")" \
+          "$(kv_get "$d/workflow.env" CCX_PLANNER)" "$(kv_get "$d/workflow.env" CCX_BUILDER)" "$(kv_get "$d/workflow.env" CCX_REVIEWER)"
+        found=1; continue
+      fi
       penv="$d/profile.env"; [ -f "$penv" ] || continue
       found=1
       name="$(basename "$d")"
       prov="$(kv_get "$penv" CCX_PROVIDER)"
       router="$(kv_get "$penv" CCX_ROUTER)"
       model="$(kv_get "$penv" ANTHROPIC_MODEL)"
+      [ "$prov" != codex ] || model="$(kv_get "$penv" CODEX_MODEL)"
       if [ -n "$router" ]; then
         url="$(kv_get "$penv" CCX_UPSTREAM_BASE_URL)"
       else
         url="$(kv_get "$penv" ANTHROPIC_BASE_URL)"
       fi
+      [ "$prov" != codex ] || url='(Codex login)'
       printf '%-16s %-10s %-34s %s\n' "$name" "${prov:-?}" "${url:-(anthropic login)}" "${model:-}"
     done
   fi
@@ -1413,7 +1452,11 @@ cmd_new() {
         router="" upstream_url="" upstream_key="" fallback_urls="" \
         fallback_keys="" router_attempts="" fallback_key_args=0 \
         pin_only="" pin_order="" pin_require="" fb_pin_only="" fb_pin_order="" \
-        fb_pin_require="" fb_pin_only_args=0 fb_pin_order_args=0 fb_pin_require_args=0
+        fb_pin_require="" fb_pin_only_args=0 fb_pin_order_args=0 fb_pin_require_args=0 \
+        login="" device_auth="" \
+        profile_type="" planner="" builder="" reviewer="" proof="" rounds=3 fix_rounds=2 timeout=600 \
+        planner_effort="" builder_effort="" reviewer_effort="" \
+        planner_model="" builder_model="" reviewer_model=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --name) name="$2"; shift 2 ;;
@@ -1487,6 +1530,22 @@ cmd_new() {
         fb_pin_require_args=$((fb_pin_require_args + 1)); shift 2 ;;
       --isolate) isolate=true; shift ;;
       --no-isolate) isolate=false; shift ;;
+      --login) login=1; shift ;;
+      --device-auth) login=1; device_auth=1; shift ;;
+      --type) profile_type="$2"; shift 2 ;;
+      --planner) planner="$2"; shift 2 ;;
+      --builder) builder="$2"; shift 2 ;;
+      --reviewer) reviewer="$2"; shift 2 ;;
+      --planner-model) planner_model="$2"; shift 2 ;;
+      --builder-model) builder_model="$2"; shift 2 ;;
+      --reviewer-model) reviewer_model="$2"; shift 2 ;;
+      --planner-effort) planner_effort="$2"; shift 2 ;;
+      --builder-effort) builder_effort="$2"; shift 2 ;;
+      --reviewer-effort) reviewer_effort="$2"; shift 2 ;;
+      --proof) proof="$2"; shift 2 ;;
+      --rounds) rounds="$2"; shift 2 ;;
+      --fix-rounds) fix_rounds="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
       --yes | -y) yes=1; shift ;;
       -h | --help)
         cat <<'EOF'
@@ -1517,9 +1576,51 @@ EOF
   [ -n "$name" ] || { printf 'Profile name: '; read -r name; }
   valid_profile_name "$name" || die "invalid name: $name"
   [ -e "$(profile_dir "$name")" ] && die "profile already exists: $name"
+  if [ -z "$profile_type" ] && [ -z "$provider$yes" ] && [ -t 0 ]; then
+    tui_subtitles=('Launch one CLI/model profile' 'Plan, build and check until both models agree')
+    tui_select 'Choose profile type:' 'Single model' 'Plan/build/review loop' || die 'profile creation cancelled'
+    case "$tui_selected" in 0) profile_type=single ;; 1) profile_type=loop ;; esac
+  fi
+  case "${profile_type:-single}" in
+    loop)
+      [ -z "$provider$token$model$base_url$upstream_url$upstream_key$login$device_auth$isolate$m_opus$m_sonnet$m_haiku" ] || die 'loop profiles use --planner/--builder/--reviewer, not provider options'
+      create_workflow; return ;;
+    single) [ -z "$planner$builder$reviewer$proof$planner_effort$builder_effort$reviewer_effort$planner_model$builder_model$reviewer_model" ] || die 'workflow options require --type loop' ;;
+    *) die "unknown profile type: $profile_type" ;;
+  esac
   [ -n "$provider" ] || choose_provider
   [ -n "$provider" ] || die "provider is required"
   valid_profile_name "$provider" || die 'provider name must contain only letters, digits, _ or -'
+
+  if [ "$provider" = codex ]; then
+    [ -z "$token$base_url$upstream_url$upstream_key$m_opus$m_sonnet$m_haiku" ] || die "codex profiles use native CLI login, not API/router options or Claude model slots"
+    [ -n "$isolate" ] || isolate=false
+    if [ -z "$yes" ] && [ -z "$model_set" ]; then
+      printf 'Codex model (empty = CLI default): '; read -r model || true
+    fi
+    local codex_dir; codex_dir="$(profile_dir "$name")"
+    mkdir -p "$codex_dir"
+    {
+      printf '# ccx profile: %s\nCCX_PROVIDER=codex\nCCX_ISOLATE=%s\n' "$name" "$isolate"
+      [ -z "$model" ] || printf 'CODEX_MODEL=%s\n' "$model"
+    } > "$codex_dir/profile.env"
+    chmod 600 "$codex_dir/profile.env"
+    printf 'Created Codex profile "%s". Run it: ccx %s\n' "$name" "$name"
+    if [ -z "$yes" ] && [ -z "$login" ]; then
+      printf 'Sign in with ChatGPT now? [y/N] '
+      local answer; read -r answer || true
+      case "$answer" in y|Y) login=1 ;; esac
+    fi
+    if [ -n "$login" ]; then
+      local -a auth_args=(login)
+      [ -z "$device_auth" ] || auth_args+=(--device-auth)
+      cmd_run "$name" "${auth_args[@]}"
+    else
+      printf 'Login if needed: ccx %s login (or login --device-auth)\n' "$name"
+    fi
+    return 0
+  fi
+  [ -z "$login$device_auth" ] || die "--login/--device-auth requires --provider codex"
 
   local tf has_opus="" has_sonnet="" has_haiku=""
   tf="$(template_file "$provider")"
@@ -1840,6 +1941,11 @@ cmd_run() {
   valid_profile_name "$name" || die "invalid profile name: $name"
   shift || true
   local penv; penv="$(profile_env "$name")"
+  if [ -f "$(profile_dir "$name")/workflow.env" ]; then
+    command -v python3 >/dev/null 2>&1 || die 'workflows require Python 3.10+'
+    exec python3 "$SCRIPT_DIR/../lib/workflow.py" --ccx "$SCRIPT_DIR/ccx" \
+      --config "$(profile_dir "$name")/workflow.env" "$@"
+  fi
   if [ ! -f "$penv" ]; then
     printf 'ccx: unknown profile: %s\n\nAvailable profiles:\n' "$name" >&2
     cmd_list >&2
@@ -1847,6 +1953,11 @@ cmd_run() {
   fi
   profile_syntax_valid "$penv" \
     || die "profile '$name' is malformed or contains duplicate environment keys; run: ccx doctor $name --no-network"
+
+  if [ "$(kv_get "$penv" CCX_PROVIDER)" = codex ]; then
+    run_codex "$name" "$@"
+    return
+  fi
 
   local mode; mode="$(stat -c '%a' "$penv" 2>/dev/null || stat -f '%Lp' "$penv")"
   if [ "$mode" != "600" ]; then
@@ -1909,10 +2020,49 @@ cmd_run() {
   exec "$CCX_CLAUDE_BIN" "$@"
 }
 
+run_codex() {
+  local name="$1"; shift
+  local penv model codex_home
+  penv="$(profile_env "$name")"
+  model="$(kv_get "$penv" CODEX_MODEL)"
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --) break ;;
+      --model|--model=*|-m|-m?*) model=""; break ;;
+    esac
+  done
+  if [ "$(kv_get "$penv" CCX_ISOLATE)" = true ]; then
+    codex_home="$(profile_dir "$name")/home"
+    mkdir -p "$codex_home"; chmod 700 "$codex_home"
+    export CODEX_HOME="$codex_home"
+  fi
+  local -a args=("$@")
+  # Keep auth and diagnostic subcommands free of model options. Explicit
+  # invocation options follow the profile default and take precedence.
+  case "${1:-}" in
+    login|logout|--version|-V|--help|-h|help|doctor|mcp|completion|features|update) ;;
+    exec|e|review|resume|fork)
+      if [ -n "$model" ]; then args=("$1" --model "$model" "${@:2}"); fi ;;
+    *) [ -z "$model" ] || args=(--model "$model" "$@") ;;
+  esac
+  if [ "${CCX_DRY_RUN:-}" = 1 ]; then
+    printf 'CCX_DRY_RUN profile=%s provider=codex\n' "$name"
+    [ -z "${CODEX_HOME:-}" ] || printf 'env: CODEX_HOME=%s\n' "$CODEX_HOME"
+    printf 'exec: %s' "$CCX_CODEX_BIN"
+    printf ' %s' "${args[@]}"
+    printf '\n'
+    return 0
+  fi
+  command -v "$CCX_CODEX_BIN" >/dev/null 2>&1 || die "codex not found (looked for '$CCX_CODEX_BIN'). Install Codex CLI or set CCX_CODEX_BIN."
+  exec "$CCX_CODEX_BIN" "${args[@]}"
+}
+
 cmd_show() {
   local name="${1:-}"; [ -n "$name" ] || die "show: profile name required"
   valid_profile_name "$name" || die "invalid profile name: $name"
   local penv; penv="$(profile_env "$name")"
+  [ ! -f "$(profile_dir "$name")/workflow.env" ] || penv="$(profile_dir "$name")/workflow.env"
   [ -f "$penv" ] || die "unknown profile: $name"
   profile_syntax_valid "$penv" || die "profile '$name' is malformed or contains duplicate keys"
   while IFS= read -r line || [ -n "$line" ]; do
@@ -1951,6 +2101,7 @@ cmd_edit() {
   local name="${1:-}"; [ -n "$name" ] || die "edit: profile name required"
   valid_profile_name "$name" || die "invalid profile name: $name"
   local penv; penv="$(profile_env "$name")"
+  [ ! -f "$(profile_dir "$name")/workflow.env" ] || penv="$(profile_dir "$name")/workflow.env"
   [ -f "$penv" ] || die "unknown profile: $name"
   "${EDITOR:-vi}" "$penv"
   chmod 600 "$penv"
@@ -1985,6 +2136,12 @@ cmd_version() {
     printf 'claude: %s\n' "${cv:-found}"
   else
     printf 'claude: not found\n'
+  fi
+  if command -v "$CCX_CODEX_BIN" >/dev/null 2>&1; then
+    local cv; cv="$("$CCX_CODEX_BIN" --version 2>/dev/null | head -1)" || cv=""
+    printf 'codex: %s\n' "${cv:-found}"
+  else
+    printf 'codex: not found\n'
   fi
 }
 
