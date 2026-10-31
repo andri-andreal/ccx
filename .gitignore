@@ -6,6 +6,10 @@ target/
 node_modules/
 dist/
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+
 # Editors / OS
 .DS_Store
 *.swp
