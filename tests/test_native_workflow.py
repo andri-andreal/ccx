@@ -927,6 +927,18 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([(e['message'], e['category']) for e in events],
                          [('uses skill pdf', 'status'), ('delegates to agent Explore: find handlers', 'status')])
 
+    def test_sandbox_keeps_hook_scripts_named_in_cli_config(self):
+        home = self.root / 'home2'
+        (home / 'tools' / 'park').mkdir(parents=True)
+        (home / 'tools' / 'park' / 'hook.py').write_text('print(1)\n')
+        (home / 'Projects' / 'secret').mkdir(parents=True)
+        data = home / '.cli'
+        data.mkdir()
+        (data / 'hooks.json').write_text(json.dumps({'command': f'python3 {home.resolve()}/tools/park/hook.py mcode'}))
+        (data / 'config.toml').write_text(f'projects = ["{home.resolve()}/Projects/secret"]\n')
+        found = workflow_module.configured_home_paths(data, home)
+        self.assertEqual(found, [(home / 'tools' / 'park').resolve()])
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')

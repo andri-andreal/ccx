@@ -3075,6 +3075,34 @@ CURL_ARG_LONG = {'request', 'header', 'data', 'data-raw', 'data-binary', 'data-a
 CURL_ARG_SHORT = set('XHduwoFbmAeEKrxTUz')
 
 
+def configured_home_paths(data, home=None):
+    """Folders under $HOME that a CLI's own config refers to, such as hook scripts.
+
+    kimi and mcode run hooks from their config (config.toml, hooks.json); a hook
+    that lives in a hidden folder would fail and take the whole turn with it.
+    """
+    home = (home or Path.home()).resolve()
+    found = []
+    try:
+        files = [path for path in Path(data).iterdir()
+                 if path.is_file() and path.suffix in ('.json', '.toml', '.yaml', '.yml') and path.stat().st_size < 1048576]
+    except OSError:
+        files = []
+    pattern = re.compile(re.escape(str(home)) + r'/[^\s"\',;\]\)]+')
+    for config in files:
+        try:
+            text = config.read_text(errors='replace')
+        except OSError:
+            continue
+        for match in pattern.findall(text):
+            # Only files (hook scripts, helpers) count; folder paths in a config are
+            # usually project lists and would undo the isolation.
+            path = Path(match)
+            if path.is_file() and path.parent != home and path.parent not in found:
+                found.append(path.parent)
+    return found
+
+
 def home_isolation(repo, keep=()):
     """bwrap arguments that hide the home directory except what an agent needs.
 
@@ -3101,6 +3129,8 @@ def home_isolation(repo, keep=()):
         path = Path(item).resolve()
         if path.is_file():
             path = path.parent.parent if path.parent.name == 'bin' else path.parent
+        if not path.exists():
+            continue
         if home in path.parents and not path.relative_to(home).parts[0].startswith('.'):
             args += ['--ro-bind-try', str(path), str(path)]
     project = Path(repo).resolve()
@@ -4490,9 +4520,13 @@ class Loop:
                 raise WorkflowError(f'{provider} data directory missing: {data}; sign in first.')
             sandbox = ['bwrap', '--die-with-parent', '--ro-bind', '/', '/',
                        '--dev-bind', '/dev', '/dev', '--proc', '/proc']
+            hooks = configured_home_paths(data)
+            for folder in hooks:
+                if not folder.relative_to(Path.home().resolve()).parts[0].startswith('.'):
+                    status(f'sandbox: {provider} config refers to {folder}; shown read-only')
             sandbox += home_isolation(self.repo, [Path(self.ccx).resolve().parent.parent,
                                                   shutil.which(os.environ.get('CCX_KIMI_BIN', 'kimi')),
-                                                  shutil.which(os.environ.get('CCX_MCODE_BIN', 'mcode'))])
+                                                  shutil.which(os.environ.get('CCX_MCODE_BIN', 'mcode'))] + hooks)
             sandbox += ['--bind', str(data), str(data)]
             if provider == 'mcode':
                 scratch = directory / 'tmp'
