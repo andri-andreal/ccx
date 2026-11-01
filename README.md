@@ -352,7 +352,10 @@ full-width highlight, so they stand apart from agent output. Agent replies are l
 as Markdown in the conversation, and each run of tool calls folds into one summary
 (`⏺ 6 tool calls · read 3 · grep 2 · bash 1`) with the latest call beneath it; Ctrl+O
 expands every call and folds them again. Heartbeats stay in the status row instead of
-the conversation. The conversation scrolls with the mouse wheel and PgUp/PgDn at any
+the conversation. When the rail has room, a **FLOW** panel at its bottom draws the four
+agents as boxes coloured by status; each hand-off of this task (orchestrator to planner,
+planner to reviewer, reviewer back to the planner or builder) appears as a line, and a
+dot travels along the live one while the receiving agent works. The conversation scrolls with the mouse wheel and PgUp/PgDn at any
 time, with ↑/↓ while an agent runs, and with Home/End while the input line is empty; it
 holds its place as new output arrives, and End (or scrolling to the bottom) follows
 again. The team asks the terminal for mouse reports so the wheel scrolls instead of

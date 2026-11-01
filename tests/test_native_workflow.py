@@ -637,6 +637,44 @@ class IntegrationTests(unittest.TestCase):
             if slave is not None:
                 os.close(slave)
 
+    def test_flow_panel_draws_hand_offs_and_animates_the_live_one(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((120, 36))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.color = False
+            for phase in ('orchestrate', 'plan'):
+                ui.begin(phase, 'cli', 'm', 'medium')
+                ui.done(phase)
+            ui.begin('review', 'cli', 'm', 'medium')
+            self.assertEqual(ui.flow_edge, ('plan', 'review'))
+            self.assertEqual(ui.flow_used, {frozenset({'orchestrate', 'plan'}), frozenset({'plan', 'review'})})
+            first = ui.flow_rows(34, ui.flow_started)
+            later = ui.flow_rows(34, ui.flow_started + 0.25)
+            text = '\n'.join(first)
+            for label in ('✓ ORCH', '✓ PLAN', '○ EXEC', '● REVIEW'):
+                self.assertIn(label, text)
+            self.assertIn('──────', first[1])
+            self.assertIn('▼', text)
+            # The dot moves along the live hand-off between frames.
+            self.assertNotEqual(first, later)
+            self.assertEqual(sum(row.count('●') for row in first), 2)
+            # The panel sits at the bottom of the agent rail when there is room.
+            ui._previous_rows = None
+            ui.render()
+            frame = terminal.getvalue()
+            self.assertIn('FLOW', frame)
+            self.assertIn('┌────────────┐', frame)
+            # Once the reviewer finishes, the hand-off stops animating.
+            ui.done('review')
+            self.assertEqual(sum(row.count('●') for row in ui.flow_rows(34)), 0)
+            ui.reset_task()
+            self.assertIsNone(ui.flow_edge)
+            self.assertEqual(ui.flow_used, set())
+
     def test_answer_lands_in_the_conversation_from_its_first_line(self):
         class Terminal(io.StringIO):
             def isatty(self): return True

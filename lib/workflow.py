@@ -65,6 +65,13 @@ THEMES = {
 STATUS_GLYPHS = {'running': '●', 'done': '✓', 'failed': '✗', 'waiting': '○',
                  'not configured': '·'}
 
+# FLOW panel: canvas height, narrowest rail it fits, dot speed (cells/second).
+FLOW_HEIGHT = 9
+FLOW_MIN_WIDTH = 26
+FLOW_MAX_WIDTH = 40
+FLOW_SPEED = 8
+FLOW_LABELS = {'orchestrate': 'ORCH', 'plan': 'PLAN', 'build': 'EXEC', 'review': 'REVIEW'}
+
 # Short transcript tags, so every cell keeps the same gutter width.
 ROLE_TAGS = {'YOU': 'you', 'CCX': 'ccx', 'ORCHESTRATOR': 'orch', 'PLAN': 'plan',
              'EXECUTE': 'exec', 'REVIEW': 'review'}
@@ -419,6 +426,11 @@ class TeamUI:
         self._transcript_view = (0, 1)
         # Ctrl+O shows every tool call instead of one summary per run of calls.
         self.expand_tools = False
+        # FLOW panel: the hand-off being animated and every hand-off seen this task.
+        self.flow_edge = None
+        self.flow_started = 0.0
+        self.flow_used = set()
+        self._last_tick = 0.0
         # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
         # recalling input. CCX_MOUSE=0 leaves the mouse to the terminal.
         self.mouse = os.environ.get('CCX_MOUSE', '1') != '0'
@@ -1364,6 +1376,8 @@ class TeamUI:
         self.started_at = None
         self.current_task = ''
         self.transcript_top = None
+        self.flow_edge = None
+        self.flow_used = set()
         self.footer = 'Enter a task, /history, or /quit'
         for key, panel in self.panels.items():
             panel['status'] = 'not configured' if key == 'orchestrate' and not self.orchestrator else 'waiting'
@@ -1641,6 +1655,10 @@ class TeamUI:
         key = self.panel_for(phase)
         if not key:
             return
+        if self.active and self.active != key:
+            self.flow_edge = (self.active, key)
+            self.flow_started = time.monotonic()
+            self.flow_used.add(frozenset(self.flow_edge))
         self.active = key
         if key not in self.visible:
             self.visible.append(key)
@@ -1664,6 +1682,14 @@ class TeamUI:
             if started:
                 panel['lines'].append(f'finished in {time.monotonic() - started:.1f}s')
         self.render()
+
+    def tick(self):
+        """Redraw a few times a second while an agent runs: spinner and FLOW animation."""
+        now = time.monotonic()
+        if (self.enabled and self.active and self.panels[self.active]['status'] == 'running'
+                and now - self._last_tick >= 0.15):
+            self._last_tick = now
+            self.render()
 
     def update(self, label, message, kind=None):
         key = self.panel_for(label)
@@ -1922,6 +1948,13 @@ class TeamUI:
         for panel in panels:
             summary, details = self._agent_block(panel, width)
             blocks.append([summary] + details)
+        flow = []
+        if width >= FLOW_MIN_WIDTH and body_rows >= len(blocks) + 1 + FLOW_HEIGHT + 2:
+            canvas = min(width, FLOW_MAX_WIDTH)
+            pad = ' ' * ((width - canvas) // 2)
+            flow = ([''] + [self._fit(self._paint('FLOW', 'accentb'), width)]
+                    + [pad + row for row in self.flow_rows(canvas)])
+            body_rows -= len(flow)
         rows = [head]
         for block in blocks:
             rows.extend(block)
@@ -1934,8 +1967,122 @@ class TeamUI:
             rows = [head]
             for block in blocks:
                 rows.extend(block)
-        rows = rows[:body_rows] + [''] * max(0, body_rows - len(rows))
-        return [self._fit(row, width) for row in rows[:body_rows]]
+        rows = rows[:body_rows] + [''] * max(0, body_rows - len(rows)) + flow
+        return [self._fit(row, width) for row in rows]
+
+    def flow_layout(self, width):
+        """Box origins and the path of every hand-off on a FLOW_HEIGHT x width canvas."""
+        box = max(10, min(14, (width - 6) // 2))
+        left, right = 0, width - box
+        boxes = {'orchestrate': (0, left), 'plan': (0, right), 'build': (6, left), 'review': (6, right)}
+        mid_left, mid_right = left + box // 2, right + box // 2
+        inner_left, inner_right = left + box - 3, right + 2
+        paths = {
+            ('orchestrate', 'plan'): [(1, c) for c in range(left + box, right)],
+            ('build', 'review'): [(7, c) for c in range(left + box, right)],
+            ('orchestrate', 'build'): [(r, mid_left) for r in (3, 4, 5)],
+            ('plan', 'review'): [(r, mid_right) for r in (3, 4, 5)],
+            ('plan', 'build'): ([(3, inner_right), (4, inner_right)]
+                                + [(4, c) for c in range(inner_right - 1, inner_left, -1)]
+                                + [(4, inner_left), (5, inner_left)]),
+            ('orchestrate', 'review'): ([(3, inner_left), (4, inner_left)]
+                                        + [(4, c) for c in range(inner_left + 1, inner_right)]
+                                        + [(4, inner_right), (5, inner_right)]),
+        }
+        return box, boxes, paths
+
+    def flow_path(self, source, target, paths):
+        """Cells from source to target, whichever way the path was defined."""
+        if (source, target) in paths:
+            return paths[(source, target)]
+        if (target, source) in paths:
+            return list(reversed(paths[(target, source)]))
+        return []
+
+    def flow_rows(self, width, now=None):
+        """Four agent boxes with the hand-offs of this task; a dot travels the live one."""
+        now = time.monotonic() if now is None else now
+        box, boxes, paths = self.flow_layout(width)
+        chars = [[' '] * width for _ in range(FLOW_HEIGHT)]
+        styles = [[None] * width for _ in range(FLOW_HEIGHT)]
+
+        def put(row, column, char, style):
+            if 0 <= row < FLOW_HEIGHT and 0 <= column < width:
+                chars[row][column] = char
+                styles[row][column] = style
+
+        def draw(path, style, arrow):
+            for index, (row, column) in enumerate(path):
+                before = path[index - 1] if index else None
+                after = path[index + 1] if index + 1 < len(path) else None
+                ends = [cell for cell in (before, after) if cell]
+                vertical = all(cell[1] == column for cell in ends) if ends else False
+                horizontal = all(cell[0] == row for cell in ends) if ends else True
+                char = '│' if vertical else '─' if horizontal else self._corner((row, column), before, after)
+                put(row, column, char, style)
+            if arrow and len(path) > 1:
+                (row, column), (prev_row, prev_column) = path[-1], path[-2]
+                char = ('▶' if column > prev_column else '◀' if column < prev_column
+                        else '▼' if row > prev_row else '▲')
+                put(row, column, char, style)
+
+        live = self.flow_edge
+        running = bool(live and self.panels[live[1]]['status'] == 'running')
+        for pair in self.flow_used:
+            if live and pair == frozenset(live):
+                continue
+            first, second = sorted(pair)
+            draw(self.flow_path(first, second, paths), 'muted', False)
+        if live:
+            path = self.flow_path(live[0], live[1], paths)
+            draw(path, 'accent' if running else 'muted', True)
+            if running and path:
+                row, column = path[int((now - self.flow_started) * FLOW_SPEED) % len(path)]
+                put(row, column, '●', 'accentb')
+        for key, (top, left) in boxes.items():
+            panel = self.panels[key]
+            status = panel.get('status', 'waiting')
+            style = ('ok' if status == 'done' else 'err' if status == 'failed'
+                     else 'accent' if status == 'running' else 'muted')
+            label = f"{STATUS_GLYPHS.get(status, '○')} {FLOW_LABELS[key]}"[:box - 2].center(box - 2)
+            for column, char in enumerate('┌' + '─' * (box - 2) + '┐'):
+                put(top, left + column, char, style)
+            put(top + 1, left, '│', style)
+            for column, char in enumerate(label):
+                put(top + 1, left + 1 + column, char, style + 'b' if status == 'running' else style)
+            put(top + 1, left + box - 1, '│', style)
+            for column, char in enumerate('└' + '─' * (box - 2) + '┘'):
+                put(top + 2, left + column, char, style)
+        rows = []
+        for row in range(FLOW_HEIGHT):
+            text, run, current = '', '', None
+            for column in range(width):
+                if styles[row][column] != current:
+                    text += self._paint(run, current) if current else run
+                    run, current = '', styles[row][column]
+                run += chars[row][column]
+            text += self._paint(run, current) if current else run
+            rows.append(text)
+        return rows
+
+    @staticmethod
+    def _corner(cell, before, after):
+        """Box-drawing corner joining the two neighbours of a path cell."""
+        row, column = cell
+        sides = set()
+        for other in (before, after):
+            if not other:
+                continue
+            if other[0] < row:
+                sides.add('up')
+            elif other[0] > row:
+                sides.add('down')
+            elif other[1] < column:
+                sides.add('left')
+            else:
+                sides.add('right')
+        return {frozenset({'up', 'right'}): '└', frozenset({'up', 'left'}): '┘',
+                frozenset({'down', 'right'}): '┌', frozenset({'down', 'left'}): '┐'}.get(frozenset(sides), '┼')
 
     def _agent_block(self, panel, width):
         """Return the agent's one-line summary plus its optional detail lines."""
@@ -2556,6 +2703,8 @@ def _execute_child(command, cwd, prompt, timeout, output, error, progress, start
                     except subprocess.TimeoutExpired:
                         initial_input = None
                         drain()
+                        if team_ui:
+                            team_ui.tick()
                         if input_fd is not None and read_running_input(team_ui, input_fd, decoder):
                             os.killpg(process.pid, signal.SIGKILL)
                             process.wait()
