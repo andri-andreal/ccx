@@ -939,6 +939,99 @@ class IntegrationTests(unittest.TestCase):
         found = workflow_module.configured_home_paths(data, home)
         self.assertEqual(found, [(home / 'tools' / 'park').resolve()])
 
+    def test_workflow_env_is_rewritten_in_place_and_stays_private(self):
+        path = self.root / 'workflow.env'
+        path.write_text('# my team\nCCX_TYPE=loop\nCCX_PLANNER=codex\nCCX_ROUNDS=3\nCUSTOM_KEY=keep me\n')
+        config = {'CCX_PLANNER': 'claude', 'CCX_ROUNDS': '5', 'CCX_PLANNER_EFFORT': 'high', 'CCX_PROOF_SOURCE': 'session'}
+        workflow_module.write_workflow_env(path, config)
+        self.assertEqual(path.read_text().splitlines(),
+                         ['# my team', 'CCX_TYPE=loop', 'CCX_PLANNER=claude', 'CCX_ROUNDS=5', 'CUSTOM_KEY=keep me',
+                          'CCX_PLANNER_EFFORT=high'])
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.write_workflow_env(path, {'CCX_PROOF': 'true\nrm -rf /'})
+
+    def test_config_helpers_list_profiles_models_and_validate(self):
+        self.workflow()
+        profiles_dir = self.root / 'config' / 'profiles'
+        names = workflow_module.single_profiles(profiles_dir)
+        self.assertIn('claude', names)
+        self.assertIn('codex', names)
+        self.assertNotIn('team', names)
+        claude = workflow_module.model_choices(profiles_dir / 'claude' / 'profile.env', 'claude')
+        self.assertEqual([value for value, _ in claude][:3], ['opus', 'sonnet', 'haiku'])
+        codex_home = self.root / 'codex-home'
+        codex_home.mkdir(exist_ok=True)
+        (codex_home / 'models_cache.json').write_text(json.dumps({'models': [
+            {'slug': 'gpt-6.1-terra', 'visibility': 'list', 'description': 'balanced'},
+            {'slug': 'hidden-model', 'visibility': 'hide'}]}))
+        with mock.patch.dict(os.environ, {'CODEX_HOME': str(codex_home)}):
+            codex = workflow_module.model_choices(profiles_dir / 'codex' / 'profile.env', 'codex')
+        self.assertEqual(codex, [('gpt-6.1-terra', 'balanced')])
+        self.assertEqual(workflow_module.model_choices(profiles_dir / 'codex' / 'profile.env', 'kimi-cli'), [])
+        config = workflow_module.read_env(profiles_dir / 'team' / 'workflow.env')
+        self.assertIn('claude', workflow_module.load_role_profiles(dict(config), profiles_dir))
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.load_role_profiles({**config, 'CCX_PLANNER': 'missing'}, profiles_dir)
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.load_role_profiles({**config, 'CCX_PLANNER_EFFORT': 'turbo'}, profiles_dir)
+        self.assertEqual(workflow_module.role_efforts('kimi-cli'), ('default',))
+
+    def test_config_screen_saves_or_keeps_changes_for_the_session(self):
+        self.workflow()
+        env_path = self.root / 'config' / 'profiles' / 'team' / 'workflow.env'
+        args_log = self.root / 'config-args.jsonl'
+        master, proc, read_until = self.tui_session({**self.env, 'TERM': 'xterm', 'FAKE_ARGS_LOG': str(args_log)})
+        try:
+            with proc:
+                read_until(b'Describe a task')
+                os.write(master, b'/config\n')
+                menu = read_until(b'q cancel')
+                for label in (b'CONFIG', b'PLAN', b'Loop', b'Verification', b'API checks', b'Display', b'Save to workflow team'):
+                    self.assertIn(label, menu)
+
+                def choose(digit, screen):
+                    # Each picker drops keys typed before it opens, so wait for the next screen.
+                    os.write(master, digit)
+                    read_until(b'q cancel')
+                    os.write(master, b'\r')
+                    return read_until(screen)
+
+                choose(b'2', b'ROLE')          # planner
+                choose(b'3', b'EFFORT')        # effort
+                choose(b'4', b'ROLE')          # high
+                choose(b'4', b'CONFIG')        # back
+                os.write(master, b'9')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'Saved to workflow team: planner_effort', read_until(b'Describe a task'))
+                saved = workflow_module.read_env(env_path)
+                self.assertEqual(saved['CCX_PLANNER_EFFORT'], 'high')
+                self.assertEqual(saved.get('CCX_ORCHESTRATOR', ''), '')
+                # The next task in the same session already uses the new effort.
+                os.write(master, b'Fixture task\n')
+                self.assertIn(b'Completed in', read_until(b'Describe a task'))
+                calls = [json.loads(line) for line in args_log.read_text().splitlines()]
+                self.assertTrue(any('--effort' in call and call[call.index('--effort') + 1] == 'high' for call in calls))
+                # Session only: the file keeps its value.
+                os.write(master, b'/config\n')
+                read_until(b'q cancel')
+                choose(b'5', b'LOOP')
+                choose(b'1', b'PLAN REVIEW ROUNDS')
+                choose(b'5', b'LOOP')          # 5 rounds
+                choose(b'4', b'CONFIG')        # back
+                os.write(master, b'9')
+                read_until(b'q cancel')
+                os.write(master, b'\x1b[B')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'Changed for this session: rounds', read_until(b'Describe a task'))
+                self.assertEqual(workflow_module.read_env(env_path)['CCX_ROUNDS'], '3')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')

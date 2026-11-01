@@ -435,6 +435,33 @@ Tasks are typed into a bordered composer:
 | ←/→, Home/End, Ctrl+A/E/U/K/W | Shell-style editing; pasted text keeps its newlines |
 | Ctrl+P | Command palette |
 
+**Reconfigure without leaving the TUI.** `/config` opens the workflow's settings as
+pickers:
+
+```
+ CONFIG · test2
+ ❯ ORCH     claude          sonnet · effort medium
+   PLAN     codex           gpt-6.1-terra · effort medium
+   EXEC     kimi-native     CLI default · effort default
+   REVIEW   minimax-native  CLI default · effort medium
+   Loop          3 plan rounds · 2 fix rounds · timeout 600s
+   Verification  auto-detect
+   API checks    server: ask when needed · http://127.0.0.1:8080
+   Display       theme default · mouse on
+   Save to workflow test2 · Keep for this session only · Discard changes
+```
+
+A role opens its CLI profile (every single-CLI profile, or no orchestrator), model (CLI
+default, the Codex models from the local catalog, the opus/sonnet/haiku aliases and the
+profile's model for Claude-based profiles, or a typed name) and effort (the levels that
+provider accepts). Loop budgets take presets or a typed number; verification offers the
+detected commands or auto-detect; API checks take the server command and a local base
+URL; Display sets the theme and turns mouse reporting on or off. Changes are validated
+with the same rules as start-up and apply to the next task. **Save to workflow** rewrites
+`workflow.env` in place (other keys and comments kept, mode 600); **Keep for this
+session only** leaves the file alone. An orchestrator borrowed from the planner is not
+written to the file unless you change it.
+
 Every choice is a picker: ↑/↓ move, Enter selects, Esc or `q` goes back and 1-9 jump.
 `/route`, `/theme`, `/queue` and `/proof` sent without an argument open their choices;
 `/proof` lists the commands found in the project and ends with **Type a custom

@@ -312,6 +312,7 @@ COMMANDS = [
     ('/route', 'Show or set the route: auto, plan, direct, inspect'),
     ('/proof', 'Show or set the verification command'),
     ('/editor', 'Write a multiline task in $EDITOR'),
+    ('/config', 'Change role CLIs, models, efforts, budgets and display'),
     ('/theme', 'Show or change the colour theme'),
     ('/help', 'Keys and commands'),
     ('/quit', 'Exit ccx'),
@@ -345,6 +346,125 @@ KEY_TOKEN = re.compile(r'\x1b\[200~(.*?)\x1b\[201~|\x1b\[<[0-9;]*[Mm]|\x1b\[[0-9
                        r'|\x1b[\r\n]|\x1b[^\x1b]|\x1b|[\s\S]', re.S)
 # Inline Markdown the result view styles: **bold**, __bold__, *italic* and `code`.
 MD_INLINE = re.compile(r'(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|(?<![\w*])\*[^*\s](?:[^*\n]*[^*\s])?\*(?![\w*]))')
+
+
+def load_role_profiles(config, profiles_dir):
+    """Validate a workflow's roles, efforts and budgets; return the role profiles.
+
+    Shared by start-up and /config so both enforce the same rules. Efforts are
+    normalised in place ('' becomes 'default').
+    """
+    profiles = {}
+    roles = ('PLANNER', 'BUILDER', 'REVIEWER')
+    if config.get('CCX_ORCHESTRATOR'):
+        roles = ('ORCHESTRATOR', *roles)
+    for role in roles:
+        name = config.get('CCX_' + role, '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
+            raise WorkflowError(f'Invalid {role.lower()} profile.')
+        try:
+            profiles[name] = read_env(Path(profiles_dir) / name / 'profile.env')
+        except OSError:
+            raise WorkflowError(f'Unknown {role.lower()} profile: {name}')
+    for role in roles:
+        key = 'CCX_' + role + '_EFFORT'
+        config[key] = config.get(key) or 'default'
+        provider = profiles[config['CCX_' + role]].get('CCX_PROVIDER')
+        if provider == 'kimi-cli' and config[key] != 'default':
+            raise WorkflowError('Kimi CLI supports only default effort.')
+        if config[key] not in role_efforts(provider):
+            raise WorkflowError(f'Invalid {role.lower()} effort for this provider.')
+        model = config.get('CCX_' + role + '_MODEL', '')
+        if model and not re.fullmatch(r'[\w.:/@\[\]-]{1,120}', model):
+            raise WorkflowError(f'Invalid {role.lower()} model.')
+    for key in ('CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT'):
+        if not re.fullmatch(r'[1-9][0-9]*', config.get(key, '')):
+            raise WorkflowError(f'{key} must be a positive integer.')
+    return profiles
+
+
+def role_efforts(provider):
+    if provider == 'kimi-cli':
+        return ('default',)
+    if provider == 'codex':
+        return ('default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+    return ('default', 'low', 'medium', 'high', 'xhigh', 'max')
+
+
+# Keys /config may write back to workflow.env, in the order ccx new uses.
+WORKFLOW_KEYS = ('CCX_PLANNER', 'CCX_BUILDER', 'CCX_REVIEWER', 'CCX_ORCHESTRATOR', 'CCX_ORCHESTRATOR_MODEL',
+                 'CCX_ORCHESTRATOR_EFFORT', 'CCX_PROOF', 'CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT',
+                 'CCX_PLANNER_EFFORT', 'CCX_BUILDER_EFFORT', 'CCX_REVIEWER_EFFORT', 'CCX_PLANNER_MODEL',
+                 'CCX_BUILDER_MODEL', 'CCX_REVIEWER_MODEL')
+
+
+def write_workflow_env(path, config):
+    """Update workflow.env in place: known keys rewritten, others and comments kept.
+
+    The file is replaced atomically and stays private (0600) because it can
+    name local commands.
+    """
+    path = Path(path)
+    lines = path.read_text().splitlines() if path.exists() else []
+    written = set()
+    output = []
+    for line in lines:
+        key = line.split('=', 1)[0] if '=' in line and not line.startswith('#') else None
+        if key in WORKFLOW_KEYS:
+            value = str(config.get(key, ''))
+            if '\n' in value or '\r' in value:
+                raise WorkflowError(f'{key} cannot contain a line break.')
+            output.append(f'{key}={value}')
+            written.add(key)
+        else:
+            output.append(line)
+    for key in WORKFLOW_KEYS:
+        if key not in written and key in config:
+            value = str(config[key])
+            if '\n' in value or '\r' in value:
+                raise WorkflowError(f'{key} cannot contain a line break.')
+            output.append(f'{key}={value}')
+    temporary = path.with_suffix('.env.tmp')
+    temporary.write_text('\n'.join(output) + '\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def single_profiles(profiles_dir):
+    """CLI profiles a role can use: profiles with profile.env and no workflow.env."""
+    names = []
+    try:
+        entries = sorted(Path(profiles_dir).iterdir())
+    except OSError:
+        return names
+    for entry in entries:
+        if (entry / 'profile.env').is_file() and not (entry / 'workflow.env').is_file():
+            names.append(entry.name)
+    return names
+
+
+def model_choices(profile_path, provider):
+    """Models worth offering for a profile: Codex's local catalog, Claude aliases."""
+    choices = []
+    if provider == 'codex':
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            from model_catalog import codex_models
+            choices = [(model['slug'], model.get('description', '') or '') for model in codex_models(profile_path)]
+        except (ImportError, OSError, ValueError):
+            choices = []
+    elif provider not in ('kimi-cli', 'mcode'):
+        try:
+            values = read_env(profile_path)
+        except OSError:
+            values = {}
+        for alias in ('opus', 'sonnet', 'haiku'):
+            mapped = values.get(f'ANTHROPIC_DEFAULT_{alias.upper()}_MODEL', '')
+            choices.append((alias, mapped))
+        model = values.get('ANTHROPIC_MODEL', '')
+        if model and model not in [value for value, _ in choices]:
+            choices.append((model, 'profile model'))
+    return choices
 
 
 def read_env(path):
@@ -1024,6 +1144,198 @@ class TeamUI:
             if selection.isdigit() and 1 <= int(selection) <= min(len(matches), height - 6):
                 return matches[int(selection) - 1][0]
             query = selection
+
+    CONFIG_ROLES = (('ORCHESTRATOR', 'orchestrate'), ('PLANNER', 'plan'), ('BUILDER', 'build'), ('REVIEWER', 'review'))
+
+    def show_config(self, config, profiles_dir, repo, workflow):
+        """Settings screen. Returns ('save' | 'session', draft), or (None, None) to discard."""
+        draft = dict(config)
+        while True:
+            changed = sorted(key for key in set(draft) | set(config) if draft.get(key) != config.get(key))
+            options = []
+            for role, key in self.CONFIG_ROLES:
+                name = draft.get('CCX_' + role, '')
+                note = (f"{draft.get(f'CCX_{role}_MODEL') or 'CLI default'} · effort {draft.get(f'CCX_{role}_EFFORT') or 'default'}"
+                        if name else 'none: the planner picks the route')
+                options.append((f"{FLOW_LABELS[key]:<7} {name or 'not set'}", ('role', role), note))
+            options.append(('Loop', ('loop', None), f"{draft.get('CCX_ROUNDS')} plan rounds · {draft.get('CCX_FIX_ROUNDS')} fix rounds"
+                                                     f" · timeout {draft.get('CCX_TIMEOUT')}s"))
+            options.append(('Verification', ('proof', None), draft.get('CCX_PROOF') or 'auto-detect'))
+            server = draft.get('CCX_API_SERVER')
+            options.append(('API checks', ('api', None),
+                            f"server: {'ask when needed' if server is None else server or 'already running'}"
+                            f" · {draft.get('CCX_API_BASE') or API_DEFAULT_BASE}"))
+            options.append(('Display', ('display', None), f"theme {self.theme} · mouse {'on' if self.mouse else 'off'}"))
+            options.append((f'Save to workflow {workflow}', ('save', None), f'{len(changed)} change(s) · writes workflow.env'))
+            options.append(('Keep for this session only', ('session', None), ''))
+            options.append(('Discard changes', ('discard', None), ''))
+            chosen = self.select_choice(f'CONFIG · {workflow}', options,
+                                        subtitle='Changes apply to the next task. ' +
+                                                 ('Changed: ' + ', '.join(key[4:].lower() for key in changed) if changed else 'Nothing changed yet.'))
+            if chosen is None or chosen[0] == 'discard':
+                return None, None
+            kind, argument = chosen
+            if kind in ('save', 'session'):
+                try:
+                    load_role_profiles(dict(draft), profiles_dir)
+                except WorkflowError as error:
+                    self.show_text('CONFIG ERROR', str(error))
+                    continue
+                return kind, draft
+            if kind == 'role':
+                self._config_role(draft, argument, profiles_dir)
+            elif kind == 'loop':
+                self._config_loop(draft)
+            elif kind == 'proof':
+                options = [(command, command, note) for command, note in proof_candidates(Path(repo))]
+                options += [('Auto-detect', '-', 'detect per task'), ('Type a command', '', '')]
+                value = self._pick_or_type('VERIFICATION', options, 'Verification command: ')
+                if value is not None:
+                    draft['CCX_PROOF'] = '' if value == '-' else value
+                    draft['CCX_PROOF_SOURCE'] = 'session'
+            elif kind == 'api':
+                self._config_api(draft, repo)
+            elif kind == 'display':
+                self._config_display()
+
+    def _pick_or_type(self, title, options, prompt, subtitle=''):
+        """A picker whose '' option asks for typed text; None when cancelled or empty."""
+        value = self.select_choice(title, options, subtitle=subtitle)
+        if value == '':
+            try:
+                value = self.read_command(prompt).strip() or None
+            except (EOFError, KeyboardInterrupt):
+                value = None
+        return value
+
+    def _config_role(self, draft, role, profiles_dir):
+        while True:
+            name = draft.get('CCX_' + role, '')
+            try:
+                provider = read_env(Path(profiles_dir) / name / 'profile.env').get('CCX_PROVIDER', '') if name else ''
+            except OSError:
+                provider = ''
+            model, effort = draft.get(f'CCX_{role}_MODEL', ''), draft.get(f'CCX_{role}_EFFORT') or 'default'
+            options = [(f'CLI profile: {name or "none"}', 'profile', provider)]
+            if name:
+                options += [(f'Model: {model or "CLI default"}', 'model', ''), (f'Effort: {effort}', 'effort', '')]
+            options.append(('Back', None, ''))
+            chosen = self.select_choice(f'ROLE · {role.lower()}', options)
+            if chosen is None:
+                return
+            if chosen == 'profile':
+                names = single_profiles(profiles_dir)
+                picks = []
+                for candidate in names:
+                    try:
+                        kind = read_env(Path(profiles_dir) / candidate / 'profile.env').get('CCX_PROVIDER', '')
+                    except OSError:
+                        kind = ''
+                    picks.append((candidate, candidate, kind + (' · current' if candidate == name else '')))
+                if role == 'ORCHESTRATOR':
+                    picks.append(('No orchestrator', '-', 'every task uses the plan route'))
+                value = self.select_choice('CLI PROFILE', picks)
+                if value is None:
+                    continue
+                value = '' if value == '-' else value
+                if value != name:
+                    draft['CCX_' + role] = value
+                    draft[f'CCX_{role}_MODEL'] = ''
+                    draft[f'CCX_{role}_EFFORT'] = 'default'
+            elif chosen == 'model':
+                picks = [('CLI default', '-', 'the profile decides')]
+                picks += [(value, value, note) for value, note in model_choices(Path(profiles_dir) / name / 'profile.env', provider)]
+                picks.append(('Type a model', '', ''))
+                value = self._pick_or_type('MODEL', picks, 'Model: ')
+                if value is not None:
+                    if value != '-' and not re.fullmatch(r'[\w.:/@\[\]-]{1,120}', value):
+                        self.show_text('CONFIG ERROR', f'Invalid model name: {value}')
+                    else:
+                        draft[f'CCX_{role}_MODEL'] = '' if value == '-' else value
+            elif chosen == 'effort':
+                picks = [(level, level, 'current' if level == effort else '') for level in role_efforts(provider)]
+                value = self.select_choice('EFFORT', picks)
+                if value:
+                    draft[f'CCX_{role}_EFFORT'] = value
+
+    def _config_loop(self, draft):
+        fields = (('CCX_ROUNDS', 'Plan review rounds', ('1', '2', '3', '4', '5', '8')),
+                  ('CCX_FIX_ROUNDS', 'Fix rounds after the first build', ('1', '2', '3', '5', '10')),
+                  ('CCX_TIMEOUT', 'Timeout per agent (seconds)', ('300', '600', '900', '1800', '3600')))
+        while True:
+            options = [(f'{label}: {draft.get(key)}', key, '') for key, label, _ in fields] + [('Back', None, '')]
+            chosen = self.select_choice('LOOP', options)
+            if chosen is None:
+                return
+            key, label, presets = next(field for field in fields if field[0] == chosen)
+            picks = [(value, value, 'current' if value == draft.get(key) else '') for value in presets]
+            picks.append(('Type a number', '', ''))
+            value = self._pick_or_type(label.upper(), picks, f'{label}: ')
+            if value is not None:
+                if re.fullmatch(r'[1-9][0-9]{0,5}', value):
+                    draft[key] = value
+                else:
+                    self.show_text('CONFIG ERROR', f'{label} must be a positive whole number.')
+
+    def _config_api(self, draft, repo):
+        while True:
+            server = draft.get('CCX_API_SERVER')
+            options = [(f"Server command: {'ask when needed' if server is None else server or 'already running'}", 'server', ''),
+                       (f"Base URL: {draft.get('CCX_API_BASE') or API_DEFAULT_BASE}", 'base', 'local only'),
+                       ('Back', None, '')]
+            chosen = self.select_choice('API CHECKS', options, subtitle='.ccx/api.json in the project overrides the server command.')
+            if chosen is None:
+                return
+            if chosen == 'server':
+                picks = [(command, command, 'detected') for command in server_candidates(Path(repo))]
+                picks += [('Ask when needed', '-ask', ''), ('Server is already running', '-run', ''), ('Type a command', '', '')]
+                value = self._pick_or_type('API SERVER', picks, 'Server command: ')
+                if value == '-ask':
+                    draft.pop('CCX_API_SERVER', None)
+                    draft.pop('CCX_API_SKIP', None)
+                elif value is not None:
+                    draft['CCX_API_SERVER'] = '' if value == '-run' else value
+                    draft.pop('CCX_API_SKIP', None)
+            elif chosen == 'base':
+                picks = [(url, url, '') for url in ('http://127.0.0.1:8080', 'http://127.0.0.1:3000',
+                                                     'http://127.0.0.1:8000', 'http://localhost:5000')]
+                picks.append(('Type a URL', '', ''))
+                value = self._pick_or_type('BASE URL', picks, 'Base URL: ')
+                if value is not None:
+                    try:
+                        draft['CCX_API_BASE'] = local_base_url(value)[0]
+                    except WorkflowError as error:
+                        self.show_text('CONFIG ERROR', str(error))
+
+    def _config_display(self):
+        while True:
+            options = [(f'Theme: {self.theme}', 'theme', 'saved for every session'),
+                       (f"Mouse: {'on' if self.mouse else 'off'}", 'mouse', 'off lets the terminal select text; wheel acts as ↑↓'),
+                       ('Back', None, '')]
+            chosen = self.select_choice('DISPLAY', options)
+            if chosen is None:
+                return
+            if chosen == 'theme':
+                value = self.pick_subcommand('/theme', self.theme)
+                if value:
+                    self.set_theme(value)
+            elif chosen == 'mouse':
+                self.mouse = not self.mouse
+                sys.stdout.write('\x1b[?1000h\x1b[?1006h' if self.mouse else '\x1b[?1006l\x1b[?1000l')
+                sys.stdout.flush()
+
+    def apply_config(self, config):
+        """Show the roles a changed configuration names."""
+        self.orchestrator = config.get('CCX_ORCHESTRATOR', '')
+        for role, key in self.CONFIG_ROLES:
+            panel = self.panels[key]
+            panel['profile'] = config.get('CCX_' + role, '')
+            panel['auto'] = False
+        if not self.orchestrator:
+            self.panels['orchestrate']['status'] = 'not configured'
+        elif self.panels['orchestrate']['status'] == 'not configured':
+            self.panels['orchestrate']['status'] = 'waiting'
+        self._previous_rows = None
 
     def show_roles(self, repo):
         """Pick a role, read its effective definition, and edit a project copy."""
@@ -5148,30 +5460,7 @@ def main():
             config['CCX_ORCHESTRATOR_MODEL'] = config.get('CCX_PLANNER_MODEL', '')
             config['CCX_ORCHESTRATOR_EFFORT'] = config.get('CCX_PLANNER_EFFORT', 'default')
             orchestrator_auto = True
-        profiles = {}
-        roles = ('PLANNER', 'BUILDER', 'REVIEWER')
-        if config.get('CCX_ORCHESTRATOR'):
-            roles = ('ORCHESTRATOR', *roles)
-        for role in roles:
-            name = config.get('CCX_' + role, '')
-            if not re.fullmatch(r'[A-Za-z0-9_-]+', name):
-                raise WorkflowError(f'Invalid {role.lower()} profile.')
-            profiles[name] = read_env(config_path.parent.parent / name / 'profile.env')
-        for role in roles:
-            key = 'CCX_' + role + '_EFFORT'
-            config[key] = config.get(key) or 'default'
-            provider = profiles[config['CCX_' + role]].get('CCX_PROVIDER')
-            if provider == 'kimi-cli' and config[key] != 'default':
-                raise WorkflowError('Kimi CLI supports only default effort.')
-            codex = provider == 'codex'
-            allowed = {'default', 'low', 'medium', 'high', 'xhigh', 'max'}
-            if codex:
-                allowed.update(('minimal', 'ultra'))
-            if config[key] not in allowed:
-                raise WorkflowError(f'Invalid {role.lower()} effort for this provider.')
-        for key in ('CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT'):
-            if not re.fullmatch(r'[1-9][0-9]*', config.get(key, '')):
-                raise WorkflowError(f'{key} must be a positive integer.')
+        profiles = load_role_profiles(config, config_path.parent.parent)
         if os.environ.get('CCX_DRY_RUN') == '1':
             summary = {'workflow': config_path.parent.name, 'planner': config['CCX_PLANNER'],
                        'builder': config['CCX_BUILDER'], 'reviewer': config['CCX_REVIEWER'],
@@ -5298,6 +5587,37 @@ def main():
                         ui.footer = message
                     except (WorkflowError, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                         ui.show_text('UNDO/REDO FAILED', str(error))
+                    continue
+                if ui and task.lower() == '/config':
+                    try:
+                        config_repo, _ = resolve_workspace()
+                    except (WorkflowError, OSError):
+                        config_repo = Path.cwd()
+                    scope, draft = ui.show_config(config, config_path.parent.parent, config_repo, team_name)
+                    if scope:
+                        try:
+                            new_profiles = load_role_profiles(draft, config_path.parent.parent)
+                            if scope == 'save':
+                                stored = dict(draft)
+                                borrowed = ('CCX_ORCHESTRATOR', 'CCX_ORCHESTRATOR_MODEL', 'CCX_ORCHESTRATOR_EFFORT')
+                                if orchestrator_auto and all(draft.get(k) == config.get(k) for k in borrowed):
+                                    # The orchestrator was borrowed from the planner, not saved; keep it that way.
+                                    stored.update({key: '' for key in borrowed})
+                                    stored['CCX_ORCHESTRATOR_EFFORT'] = 'default'
+                                write_workflow_env(config_path, stored)
+                        except (WorkflowError, OSError) as error:
+                            ui.show_text('CONFIG ERROR', str(error))
+                            continue
+                        changed = sorted(key for key in set(draft) | set(config) if draft.get(key) != config.get(key))
+                        if any(key.startswith('CCX_ORCHESTRATOR') for key in changed):
+                            orchestrator_auto = False
+                        config.clear()
+                        config.update(draft)
+                        profiles = new_profiles
+                        ui.apply_config(config)
+                        what = ', '.join(key[4:].lower() for key in changed) or 'nothing'
+                        ui.footer = (f'Saved to workflow {team_name}: {what}' if scope == 'save'
+                                     else f'Changed for this session: {what}')
                     continue
                 if ui and task.lower() == '/roles':
                     try:
