@@ -443,6 +443,54 @@ session starts with a clean-checkout requirement unless a matching run is resume
 Follow-up tasks may use unchanged work from the same session; unrelated external
 edits require inspection. Redirected output remains a plain one-task log.
 
+### Agents and skills per role
+
+Each role (orchestrator, planner, builder, reviewer) has an editable definition: a
+Markdown file with a small header and the role's guidance. ccx ships defaults in
+`agents/` and `skills/`, so every clone starts from the same agents, and looks for each
+file in three places, most specific first:
+
+| Layer | Location | Use |
+|---|---|---|
+| Project | `<project>/.ccx/agents/<role>.md`, `.ccx/skills/<name>.md` | Commit with the project so the whole team runs the same agents |
+| User | `~/.config/ccx/agents/`, `~/.config/ccx/skills/` | Your own defaults for every project |
+| Built-in | `agents/`, `skills/` in the ccx checkout | Consistent starting point |
+
+```markdown
+---
+name: go-architect
+description: Plans Go services with hexagonal layout
+skills: [testing, go-api]   # skills/<name>.md, same three layers
+model: gpt-6.1-terra        # optional; used only when the workflow sets none
+effort: high                # optional; used only when the workflow leaves it at default
+---
+Prefer small packages under internal/. Every endpoint gets a table-driven test.
+```
+
+The guidance and skills are added to that role's prompt for every CLI (Claude, Codex,
+kimi, minimax). The loop protocol stays in ccx and takes precedence: JSON shapes,
+read-only rules, snapshot checks and approval rules cannot be changed from these files.
+Each run records the definitions it used, with their layer, path and SHA-256, in
+`agents.json`.
+
+Project definitions can carry instructions from whoever wrote the repository, so they
+are used only after you accept them. The team TUI shows **PROJECT AGENTS** on the first
+run (**Review the files**, **Trust and use them**, **Run without project agents**,
+**Stop**) and asks again whenever a file changes; the fingerprint is kept in
+`~/.config/ccx/trusted-agents.json`. Without a terminal they are skipped with a notice
+unless `CCX_TRUST_PROJECT_AGENTS=1` is set.
+
+- `ccx agents list` shows the effective agent per role, its layer, file, skills and an
+  estimate of the prompt it adds, plus whether the project files are trusted.
+- `ccx agents show ROLE` prints the effective file.
+- `ccx agents init [--force]` copies the effective agents and their skills into
+  `.ccx/` for editing and trusts them as written.
+- `/roles` in the team TUI lists the roles, opens a definition, and **Edit** opens a
+  project copy in `$VISUAL`/`$EDITOR`.
+
+A custom agent name appears in the agent rail (`PLAN (go-architect)`) and on its box in
+the FLOW panel. A profile named `agents` is shadowed by this command.
+
 Run `ccx new` in a terminal and choose **Plan/build/review loop**. Select
 existing CLI profiles for orchestrator, planner, builder and checker. The builder defaults to
 the planner profile. All roles may use the same profile and model. The wizard

@@ -2329,6 +2329,10 @@ main() {
     version | --version | -V) cmd_version ;;
     list | ls) cmd_list ;;
     new) shift; cmd_new "$@" ;;
+    agents)
+      shift
+      command -v python3 >/dev/null 2>&1 || die 'agents require Python 3.10+'
+      exec python3 "$SCRIPT_DIR/../lib/workflow.py" --agents "$@" ;;
     doctor) shift; cmd_doctor "$@" ;;
     certify) shift; cmd_certify "$@" ;;
     logs | log) shift; cmd_logs "$@" ;;

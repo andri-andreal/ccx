@@ -165,6 +165,14 @@ else:
 '''
 
 
+
+class KillOnErrorPopen(subprocess.Popen):
+    """A failed assertion inside `with` kills the child instead of waiting on it forever."""
+    def __exit__(self, exc_type, value, traceback):
+        if exc_type is not None and self.poll() is None:
+            self.kill()
+        return super().__exit__(exc_type, value, traceback)
+
 class IntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='ccx-loop-test-')
@@ -435,6 +443,136 @@ class IntegrationTests(unittest.TestCase):
         self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CHECK_TMP': '1'})
         self.assertTrue(self.mcode_data.is_dir())
 
+    def test_role_definitions_layer_project_over_user_over_builtin(self):
+        home = self.root / 'config'
+        (home / 'agents').mkdir(parents=True, exist_ok=True)
+        (home / 'agents' / 'reviewer.md').write_text('---\nname: my-reviewer\nskills: [testing, nope]\neffort: turbo\n---\nMine.\n')
+        project = self.repo / '.ccx' / 'agents'
+        project.mkdir(parents=True)
+        (project / 'planner.md').write_text('---\nname: go-architect  # comment\nskills: [go-api]\nmodel: gpt-x\neffort: high\n---\nPlan Go.\n')
+        (self.repo / '.ccx' / 'skills').mkdir()
+        (self.repo / '.ccx' / 'skills' / 'go-api.md').write_text('---\nname: go-api\n---\nUse net/http.\n')
+        with mock.patch.dict(os.environ, {'CCX_HOME': str(home)}):
+            agents, warnings = workflow_module.load_agents(self.repo)
+            plain, _ = workflow_module.load_agents(self.repo, use_project=False)
+        self.assertEqual((agents['planner']['name'], agents['planner']['layer']), ('go-architect', 'project'))
+        self.assertEqual((agents['planner']['model'], agents['planner']['effort']), ('gpt-x', 'high'))
+        self.assertEqual([skill['name'] for skill in agents['planner']['skills']], ['go-api'])
+        self.assertEqual((agents['reviewer']['name'], agents['reviewer']['layer']), ('my-reviewer', 'user'))
+        self.assertEqual([skill['layer'] for skill in agents['reviewer']['skills']], ['builtin'])
+        self.assertEqual(agents['builder']['layer'], 'builtin')
+        self.assertIn("reviewer: skill 'nope' not found", warnings)
+        self.assertIn("reviewer: ignored invalid effort 'turbo'", warnings)
+        self.assertEqual(plain['planner']['layer'], 'builtin')
+        guidance = workflow_module.role_guidance(agents['planner'])
+        self.assertIn('ROLE GUIDANCE (go-architect, project definition)', guidance)
+        self.assertIn('take precedence', guidance)
+        self.assertIn('SKILL go-api:\nUse net/http.', guidance)
+
+    def test_role_guidance_reaches_prompts_and_project_files_need_trust(self):
+        self.workflow()
+        log = self.root / 'role-prompts.jsonl'
+        args_log = self.root / 'role-args.jsonl'
+        env = {**self.env, 'FAKE_PROMPT_LOG': str(log), 'FAKE_ARGS_LOG': str(args_log)}
+        self.ccx('team', 'Implement fixture', env=env)
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('ROLE GUIDANCE (planner, builtin definition)' in p for p in prompts))
+        self.assertTrue(any('ROLE GUIDANCE (builder, builtin definition)' in p and 'SKILL testing:' in p for p in prompts))
+        self.assertTrue(all(p.startswith('PROJECT DIRECTORY: ') for p in prompts))
+        run_dir = sorted((self.root / 'config' / 'runs').glob('team-*/agents.json'))[-1]
+        recorded = json.loads(run_dir.read_text())
+        self.assertEqual(recorded['reviewer']['layer'], 'builtin')
+        self.assertTrue(recorded['reviewer']['sha256'])
+        self.assertNotIn('body', recorded['reviewer'])
+        # A project definition is ignored until trusted.
+        (self.repo / '.ccx' / 'agents').mkdir(parents=True)
+        (self.repo / '.ccx' / 'agents' / 'planner.md').write_text(
+            '---\nname: go-architect\neffort: high\n---\nPROJECT PLANNER RULE\n')
+        git_env = {**env}
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'agents'], cwd=self.repo, check=True)
+        log.unlink()
+        run = self.ccx('team', 'Implement fixture', env=git_env)
+        self.assertIn('project agents in .ccx/ are not trusted yet', run.stdout)
+        self.assertFalse(any('PROJECT PLANNER RULE' in p for p in map(json.loads, log.read_text().splitlines())))
+        # ccx agents init trusts the project files as they are now.
+        subprocess.run(['git', 'checkout', '-q', '--', '.'], cwd=self.repo, check=True)
+        (self.repo / 'implemented.py').unlink(missing_ok=True)
+        listing = self.ccx('agents', 'list', env=git_env)
+        self.assertIn('go-architect  [project]', listing.stdout)
+        self.assertIn('not trusted yet', listing.stdout)
+        self.ccx('agents', 'init', env=git_env)
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init'], cwd=self.repo, check=True)
+        log.unlink()
+        args_log.unlink()
+        self.ccx('team', 'Implement fixture', env=git_env)
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('PROJECT PLANNER RULE' in p and 'go-architect, project definition' in p for p in prompts))
+        # The agent's effort applies because the workflow left it at default.
+        self.assertTrue(any('--effort' in a and a[a.index('--effort') + 1] == 'high'
+                            for a in map(json.loads, args_log.read_text().splitlines())))
+        self.assertIn('trusted', self.ccx('agents', 'list', env=git_env).stdout)
+        self.assertIn('PROJECT PLANNER RULE', self.ccx('agents', 'show', 'planner', env=git_env).stdout)
+
+    def test_roles_view_lists_each_role_and_opens_its_definition(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        try:
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo, env={**self.env, 'TERM': 'xterm'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 12
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                try:
+                    read_until(b'Describe a task')
+                    os.write(master, b'/roles\n')
+                    picker = read_until(b'q cancel')
+                    for label in (b'ORCH', b'PLAN', b'EXEC', b'REVIEW', b'builtin'):
+                        self.assertIn(label, picker)
+                    os.write(master, b'4')
+                    read_until(b'q cancel')
+                    os.write(master, b'\r')
+                    detail = read_until(b'Enter select')
+                    self.assertIn(b'ROLE', detail)
+                    self.assertIn(b'reviewer', detail)
+                    self.assertIn(b'Edit (project copy', detail)
+                    os.write(master, b'\x1b')
+                    read_until(b'q cancel')
+                    os.write(master, b'q')
+                    read_until(b'Describe a task')
+                    os.write(master, b'/quit\n')
+                except BaseException:
+                    proc.kill()
+                    raise
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_agent_names_label_the_rail_and_flow_boxes(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = False
+        ui.on_event({'type': 'agents_loaded', 'agents': {'orchestrate': 'orchestrator', 'plan': 'go-architect',
+                                                         'build': 'builder', 'review': 'reviewer'}})
+        self.assertEqual(ui.custom_agent('plan'), 'go-architect')
+        self.assertEqual(ui.custom_agent('build'), '')
+        self.assertIn('PLAN (go-architect)', ui._agent_block(ui.panels['plan'], 60)[0])
+        rows = ui.flow_rows(36)
+        self.assertIn('┌ go-archit', rows[0])
+        self.assertIn('┌──────', rows[6])
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')
@@ -561,7 +699,7 @@ class IntegrationTests(unittest.TestCase):
         self.workflow()
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'revise'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -601,7 +739,7 @@ class IntegrationTests(unittest.TestCase):
         master, slave = pty.openpty()
         prompt_log = self.root / 'planner-prompts.jsonl'
         try:
-            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team', '--review-only'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'planner_questions',
                                        'FAKE_PROMPT_LOG': str(prompt_log)},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
@@ -744,11 +882,11 @@ class IntegrationTests(unittest.TestCase):
         keys = ui._compose_keys
         # A leading slash lists commands; the exact or first prefix match is highlighted.
         self.assertIsNone(keys('/r'))
-        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/route'])
+        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/route'])
         self.assertEqual(keys('\r'), '/result')
         # Arrow keys choose, Tab completes and leaves room for an argument.
         keys('/r')
-        keys('\x1b[B\x1b[B')
+        keys('\x1b[B\x1b[B\x1b[B')
         self.assertEqual(ui.suggestions[ui.suggestion_index][0], '/route')
         keys('\t')
         self.assertEqual(ui.input_buffer, '/route ')
@@ -1001,7 +1139,7 @@ class IntegrationTests(unittest.TestCase):
         master, slave = pty.openpty()
         try:
             prompt_log = self.root / 'session-prompts.jsonl'
-            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team', '--review-only'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(prompt_log)},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1022,7 +1160,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertNotIn(label, initial)
                 os.write(master, b'\x10')
                 self.assertIn(b'COMMAND PALETTE', read_until(b'q cancel'))
-                os.write(master, b'8')
+                os.write(master, b'9')
                 self.assertIn(b'/files', read_until(b'q cancel'))
                 os.write(master, b'\r')
                 self.assertIn(b'WORKSPACE FILES', read_until(b'Enter select'))
@@ -1089,7 +1227,7 @@ class IntegrationTests(unittest.TestCase):
                  '--planner', 'claude', '--reviewer', 'codex', '--yes')
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'inspect'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1129,7 +1267,7 @@ class IntegrationTests(unittest.TestCase):
                  '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex', '--yes')
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'plan'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1170,7 +1308,7 @@ class IntegrationTests(unittest.TestCase):
                  '--planner', 'claude', '--builder', 'claude', '--reviewer', 'codex', '--yes')
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_ROUTE': 'plan'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1309,7 +1447,7 @@ class IntegrationTests(unittest.TestCase):
         self.workflow()
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team', '--route', 'direct'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team', '--route', 'direct'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'builder_blocked'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1342,7 +1480,7 @@ class IntegrationTests(unittest.TestCase):
         self.workflow()
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1402,7 +1540,7 @@ class IntegrationTests(unittest.TestCase):
         (older / 'result.json').write_text(json.dumps({'status': 'completed', 'summary': 'Old run'}))
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1437,7 +1575,7 @@ class IntegrationTests(unittest.TestCase):
         prompt_log = self.root / 'resume-prompts.jsonl'
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team', '--review-only'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(prompt_log)},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1479,7 +1617,7 @@ class IntegrationTests(unittest.TestCase):
         (self.repo / 'external.txt').write_text('external change')
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
                                   env={**self.env, 'TERM': 'xterm'},
                                   stdin=slave, stdout=slave, stderr=slave) as proc:
                 os.close(slave)
@@ -1581,7 +1719,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_stream_activity_visible_before_process_completion(self):
         self.workflow()
-        with subprocess.Popen([str(CCX),'team','--review-only','Review fixture'], cwd=self.repo,
+        with KillOnErrorPopen([str(CCX),'team','--review-only','Review fixture'], cwd=self.repo,
                               env={**self.env,'FAKE_CASE':'stream'}, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
             import selectors
@@ -1674,7 +1812,7 @@ class IntegrationTests(unittest.TestCase):
     def interactive_new(self, name, keys):
         master, slave = pty.openpty()
         try:
-            with subprocess.Popen([str(CCX),'new','--name',name],cwd=self.repo,env=self.env,
+            with KillOnErrorPopen([str(CCX),'new','--name',name],cwd=self.repo,env=self.env,
                                   stdin=slave,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True) as proc:
                 deadline = time.monotonic() + 5
                 while termios.tcgetattr(slave)[3] & termios.ICANON:

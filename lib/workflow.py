@@ -36,6 +36,218 @@ RETRY_JSON_NOTE = ('\n\nYOUR PREVIOUS REPLY WAS NOT VALID JSON. Reply again with
                    'field short.')
 
 
+# Editable role definitions: agents/<role>.md and skills/<name>.md, looked up in
+# the project (.ccx/), then the user's config, then the copies shipped with ccx.
+AGENT_ROLES = ('orchestrator', 'planner', 'builder', 'reviewer')
+ROLE_PANELS = {'orchestrator': 'orchestrate', 'planner': 'plan', 'builder': 'build', 'reviewer': 'review'}
+BUILTIN_ROOT = Path(__file__).resolve().parent.parent
+DEFINITION_LIMIT = 65536
+EFFORTS = ('default', 'low', 'medium', 'high', 'xhigh', 'max')
+
+
+def ccx_home():
+    return Path(os.environ.get('CCX_HOME', str(Path.home() / '.config' / 'ccx')))
+
+
+def parse_frontmatter(text):
+    """Split a definition into its `key: value` header and Markdown body."""
+    meta, body = {}, text
+    if text.startswith('---\n'):
+        end = text.find('\n---', 4)
+        if end >= 0:
+            header, body = text[4:end], text[end + 4:]
+            for line in header.splitlines():
+                line = re.sub(r'\s+#.*$', '', line).rstrip()
+                if ':' not in line or line.lstrip().startswith('#'):
+                    continue
+                key, value = (part.strip() for part in line.split(':', 1))
+                if value.startswith('[') and value.endswith(']'):
+                    value = [item.strip().strip('\'"') for item in value[1:-1].split(',') if item.strip()]
+                else:
+                    value = value.strip('\'"')
+                meta[key] = value
+    return meta, body.strip()
+
+
+def definition_layers(repo, use_project=True):
+    layers = [('project', Path(repo) / '.ccx')] if use_project else []
+    return layers + [('user', ccx_home()), ('builtin', BUILTIN_ROOT)]
+
+
+def find_definition(kind, name, repo, use_project=True):
+    """Most specific file for agents/<name>.md or skills/<name>.md, with its layer."""
+    for layer, root in definition_layers(repo, use_project):
+        path = root / kind / f'{name}.md'
+        if path.is_file():
+            return layer, path
+    return None, None
+
+
+def project_definition_files(repo):
+    root = Path(repo) / '.ccx'
+    return sorted(path for kind in ('agents', 'skills') for path in (root / kind).glob('*.md') if path.is_file())
+
+
+def project_definitions_digest(repo):
+    """One fingerprint for every project agent and skill file, names included."""
+    digest = hashlib.sha256()
+    for path in project_definition_files(repo):
+        digest.update(path.relative_to(Path(repo)).as_posix().encode() + b'\0')
+        digest.update(path.read_bytes()[:DEFINITION_LIMIT] + b'\0')
+    return digest.hexdigest()
+
+
+def trusted_digest(repo):
+    try:
+        value = json.loads((ccx_home() / 'trusted-agents.json').read_text()).get(str(Path(repo).resolve()))
+        return value if isinstance(value, str) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def trust_project_definitions(repo):
+    """Record that the current project agent files were reviewed and accepted."""
+    path = ccx_home() / 'trusted-agents.json'
+    try:
+        record = json.loads(path.read_text())
+        record = record if isinstance(record, dict) else {}
+    except (OSError, ValueError):
+        record = {}
+    record[str(Path(repo).resolve())] = project_definitions_digest(repo)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(record, indent=2) + '\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def load_agents(repo, use_project=True):
+    """Effective agent per role with its skills; returns (agents, warnings)."""
+    agents, warnings = {}, []
+    for role in AGENT_ROLES:
+        layer, path = find_definition('agents', role, repo, use_project)
+        agent = {'role': role, 'name': role, 'description': '', 'body': '', 'skills': [],
+                 'model': '', 'effort': '', 'layer': layer or 'none', 'path': str(path or ''), 'sha256': ''}
+        if path:
+            text = path.read_text(errors='replace')[:DEFINITION_LIMIT]
+            meta, body = parse_frontmatter(text)
+            agent.update(name=str(meta.get('name') or role)[:40], description=str(meta.get('description', ''))[:200],
+                         body=body, sha256=sha(text.encode()))
+            model, effort = str(meta.get('model', '')), str(meta.get('effort', ''))
+            if model and re.fullmatch(r'[\w.:/@-]{1,80}', model):
+                agent['model'] = model
+            elif model:
+                warnings.append(f'{role}: ignored invalid model {model!r}')
+            if effort in EFFORTS:
+                agent['effort'] = effort
+            elif effort:
+                warnings.append(f'{role}: ignored invalid effort {effort!r}')
+            names = meta.get('skills') or []
+            for skill in [names] if isinstance(names, str) else names:
+                if not re.fullmatch(r'[A-Za-z0-9_.-]{1,60}', skill):
+                    warnings.append(f'{role}: ignored invalid skill name {skill!r}')
+                    continue
+                skill_layer, skill_path = find_definition('skills', skill, repo, use_project)
+                if not skill_path:
+                    warnings.append(f'{role}: skill {skill!r} not found')
+                    continue
+                skill_text = skill_path.read_text(errors='replace')[:DEFINITION_LIMIT]
+                agent['skills'].append({'name': skill, 'layer': skill_layer, 'path': str(skill_path),
+                                        'sha256': sha(skill_text.encode()),
+                                        'body': parse_frontmatter(skill_text)[1]})
+        agents[role] = agent
+    return agents, warnings
+
+
+def role_guidance(agent):
+    """Prompt section for an agent's editable guidance and skills."""
+    if not agent or not (agent.get('body') or agent.get('skills')):
+        return ''
+    parts = [f"ROLE GUIDANCE ({agent['name']}, {agent['layer']} definition). "
+             'The host instructions after this section take precedence over it.']
+    if agent.get('body'):
+        parts.append(agent['body'])
+    for skill in agent.get('skills', []):
+        parts.append(f"SKILL {skill['name']}:\n{skill['body']}")
+    return '\n\n'.join(parts) + '\n\n'
+
+
+def copy_definitions_to_project(repo, roles=AGENT_ROLES, force=False):
+    """Copy the effective agent files (and their skills) into <repo>/.ccx for editing."""
+    copied = []
+    agents, _ = load_agents(repo, use_project=True)
+    for role in roles:
+        agent = agents[role]
+        items = [('agents', role, agent['path'])] + [('skills', skill['name'], skill['path']) for skill in agent['skills']]
+        for kind, name, source in items:
+            if not source:
+                continue
+            target = Path(repo) / '.ccx' / kind / f'{name}.md'
+            if target.exists() and not force:
+                continue
+            if Path(source).resolve() == target.resolve():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(Path(source).read_text(errors='replace'))
+            copied.append(target)
+    return copied
+
+
+def agents_command(argv):
+    """`ccx agents list | show ROLE | init [--force]` for the current project."""
+    action = argv[0] if argv else 'list'
+    try:
+        repo, _ = resolve_workspace()
+    except (WorkflowError, OSError):
+        repo = Path.cwd()
+    if action in ('list', 'ls'):
+        files = project_definition_files(repo)
+        trusted = bool(files) and trusted_digest(repo) == project_definitions_digest(repo)
+        agents, warnings = load_agents(repo, use_project=True)
+        print(f'Project: {repo}')
+        if files:
+            print('Project agents: ' + ('trusted' if trusted else 'not trusted yet (asked on the next team run)'))
+        for role in AGENT_ROLES:
+            agent = agents[role]
+            size = len(role_guidance(agent))
+            print(f"\n{role:<12} {agent['name']}  [{agent['layer']}]  ~{(size + 3) // 4} tokens")
+            if agent['path']:
+                print(f"  file:   {agent['path']}")
+            if agent['description']:
+                print(f"  about:  {agent['description']}")
+            if agent['model'] or agent['effort']:
+                print(f"  model:  {agent['model'] or 'workflow default'} · effort {agent['effort'] or 'workflow default'}")
+            for skill in agent['skills']:
+                print(f"  skill:  {skill['name']} [{skill['layer']}] {skill['path']}")
+        for warning in warnings:
+            print('warning: ' + warning, file=sys.stderr)
+        return 0
+    if action == 'show':
+        role = argv[1] if len(argv) > 1 else ''
+        if role not in AGENT_ROLES:
+            print('usage: ccx agents show orchestrator|planner|builder|reviewer', file=sys.stderr)
+            return 2
+        layer, path = find_definition('agents', role, repo)
+        if not path:
+            print(f'no definition for {role}', file=sys.stderr)
+            return 1
+        print(f'# {path} [{layer}]')
+        print(path.read_text(errors='replace'))
+        return 0
+    if action == 'init':
+        copied = copy_definitions_to_project(repo, force='--force' in argv)
+        for path in copied:
+            print(f'created {path.relative_to(repo)}')
+        if not copied:
+            print('nothing to copy; .ccx/agents already has every role (use --force to overwrite)')
+        # The user just wrote these files, so they are trusted as they are now.
+        trust_project_definitions(repo)
+        print('Edit the files, commit .ccx/ with the project, and teammates get the same agents.')
+        return 0
+    print('usage: ccx agents [list | show ROLE | init [--force]]', file=sys.stderr)
+    return 2
+
+
 class StructuredOutputError(WorkflowError):
     """An agent finished but its JSON reply was malformed; asking again may help."""
 
@@ -88,6 +300,7 @@ COMMANDS = [
     ('/undo', "Undo the last run's file changes"),
     ('/redo', 'Redo the last undo'),
     ('/agents', "Read an agent's log"),
+    ('/roles', 'Show and edit the agent definition for each role'),
     ('/timeline', 'Show the whole conversation'),
     ('/files', 'List workspace files'),
     ('/queue', 'Show queued tasks'),
@@ -429,6 +642,8 @@ class TeamUI:
         # FLOW panel: the hand-off being animated and every hand-off seen this task.
         self.flow_edge = None
         self.flow_started = 0.0
+        # Agent definition names per panel, shown when they differ from the role.
+        self.agent_names = {}
         self.flow_used = set()
         self._last_tick = 0.0
         # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
@@ -570,6 +785,9 @@ class TeamUI:
             self.done(phase, event.get('ok', True))
         elif kind == 'activity':
             self.update(phase, event.get('message', ''), event.get('category'))
+        elif kind == 'agents_loaded':
+            names = event.get('agents')
+            self.agent_names = dict(names) if isinstance(names, dict) else {}
         elif kind == 'route_selected':
             self.select_route(event['route'], event.get('review_only', False))
         elif kind == 'status':
@@ -751,6 +969,42 @@ class TeamUI:
             if selection.isdigit() and 1 <= int(selection) <= min(len(matches), height - 6):
                 return matches[int(selection) - 1][0]
             query = selection
+
+    def show_roles(self, repo):
+        """Pick a role, read its effective definition, and edit a project copy."""
+        while True:
+            agents, warnings = load_agents(repo, use_project=True)
+            options = [(f"{FLOW_LABELS[ROLE_PANELS[role]]:<7} {agents[role]['name']}", role,
+                        f"{agents[role]['layer']} · {len(agents[role]['skills'])} skill(s)") for role in AGENT_ROLES]
+            chosen = self.select_choice('ROLES', options,
+                                        subtitle='Project files in .ccx/ win over yours, which win over the built-in ones.')
+            if chosen is None:
+                return
+            agent = agents[chosen]
+            text = (f"**{agent['name']}** · {agent['layer']} · `{agent['path'] or 'no file'}`\n\n"
+                    + (agent['description'] + '\n\n' if agent['description'] else '')
+                    + (agent['body'] or '_No guidance._')
+                    + ''.join(f"\n\n## Skill: {skill['name']} ({skill['layer']})\n\n{skill['body']}"
+                              for skill in agent['skills'])
+                    + ''.join(f'\n\n> warning: {warning}' for warning in warnings if warning.startswith(chosen)))
+            action = self.show_text(f'ROLE · {chosen}', text, markdown=True,
+                                    actions=[('Edit (project copy in .ccx/)', 'edit'), ('Back', None)])
+            if action == 'edit':
+                copy_definitions_to_project(repo, roles=(chosen,))
+                self.edit_file(Path(repo) / '.ccx' / 'agents' / f'{chosen}.md')
+                # The user wrote this content, so the new state is trusted.
+                trust_project_definitions(repo)
+
+    def edit_file(self, path):
+        """Open a file in $VISUAL/$EDITOR, leaving the full-screen view meanwhile."""
+        command = shlex.split(os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi')
+        if not command:
+            raise WorkflowError('EDITOR must name an executable.')
+        self.exit()
+        try:
+            subprocess.run([*command, str(path)], check=False)
+        finally:
+            self.enter()
 
     def show_timeline(self):
         content = '\n\n'.join(f'**{entry[0]}** · {entry[1]}' if (entry[2:] or ('text',))[0] == 'text'
@@ -1970,6 +2224,12 @@ class TeamUI:
         rows = rows[:body_rows] + [''] * max(0, body_rows - len(rows)) + flow
         return [self._fit(row, width) for row in rows]
 
+    def custom_agent(self, key):
+        """The agent name for a panel when it is not the plain role name."""
+        name = self.agent_names.get(key, '')
+        default = {value: role for role, value in ROLE_PANELS.items()}.get(key)
+        return name if name and name != default else ''
+
     def flow_layout(self, width):
         """Box origins and the path of every hand-off on a FLOW_HEIGHT x width canvas."""
         box = max(10, min(14, (width - 6) // 2))
@@ -2045,7 +2305,12 @@ class TeamUI:
             style = ('ok' if status == 'done' else 'err' if status == 'failed'
                      else 'accent' if status == 'running' else 'muted')
             label = f"{STATUS_GLYPHS.get(status, '○')} {FLOW_LABELS[key]}"[:box - 2].center(box - 2)
-            for column, char in enumerate('┌' + '─' * (box - 2) + '┐'):
+            custom = self.custom_agent(key)
+            border = '┌' + '─' * (box - 2) + '┐'
+            if custom and box >= 8:
+                name = ' ' + self._truncate(custom, box - 4) + ' '
+                border = '┌' + name + '─' * (box - 2 - len(name)) + '┐'
+            for column, char in enumerate(border):
                 put(top, left + column, char, style)
             put(top + 1, left, '│', style)
             for column, char in enumerate(label):
@@ -2091,7 +2356,9 @@ class TeamUI:
         style = ('okb' if status == 'done' else 'errb' if status == 'failed'
                  else 'accentb' if status == 'running' else 'muted')
         marker = ' (auto)' if panel.get('auto') else ''
-        prefix = f'{glyph} {panel["title"]} · {status}'
+        key = next((k for k, value in self.panels.items() if value is panel), '')
+        custom = self.custom_agent(key)
+        prefix = f'{glyph} {panel["title"]}' + (f' ({custom})' if custom else '') + f' · {status}'
         budget = max(6, width - len(prefix) - 2 - len(marker))
         summary = (self._paint(prefix, style)
                    + self._paint('  ' + self._truncate(f'CLI: {panel["profile"]}', budget), 'muted')
@@ -3236,6 +3503,7 @@ class Loop:
         scope = (f'PROJECT DIRECTORY: {self.repo}\nOnly files inside this directory belong to the project. '
                  'Do not read, cite or borrow conventions from other directories on this machine; an empty '
                  'project directory means a new project.\n\n')
+        scope += role_guidance(getattr(self, 'agents', {}).get(role))
         try:
             return self._call_once(role, phase, scope + prompt, output_schema)
         except StructuredOutputError as error:
@@ -3253,10 +3521,13 @@ class Loop:
         provider = self.profiles[name].get('CCX_PROVIDER')
         is_codex = provider == 'codex'
         is_extra = provider in ('kimi-cli', 'mcode')
+        agent = getattr(self, 'agents', {}).get(role) or {}
         effort = self.config.get('CCX_' + role.upper() + '_EFFORT', 'default')
+        if effort in ('', 'default') and agent.get('effort'):
+            effort = agent['effort']
         readonly = phase != 'build'
         command = [self.ccx, name]
-        model = self.config.get('CCX_' + role.upper() + '_MODEL', '')
+        model = self.config.get('CCX_' + role.upper() + '_MODEL', '') or agent.get('model', '')
         emit_event('agent_started', phase=phase, profile=name, model=model, effort=effort)
         if not (team_ui and team_ui.enabled):
             print(f'ccx: {phase} ({name}; model={model or "profile default"}; effort={effort})', flush=True)
@@ -3545,7 +3816,55 @@ class Loop:
                        message=f"Q: {item['question']} → A: {item['answer'] or '(skipped)'}")
         return answers
 
+    def prepare_agents(self):
+        """Load the role definitions; project files are used only once trusted."""
+        files = project_definition_files(self.repo)
+        use_project = False
+        if files:
+            digest = project_definitions_digest(self.repo)
+            if trusted_digest(self.repo) == digest:
+                use_project = True
+            elif team_ui and team_ui._can_pick():
+                use_project = self.ask_project_trust(files)
+            elif os.environ.get('CCX_TRUST_PROJECT_AGENTS') == '1':
+                use_project = True
+            else:
+                status('project agents in .ccx/ are not trusted yet; using user and built-in agents '
+                       '(review them in the team TUI or set CCX_TRUST_PROJECT_AGENTS=1)')
+        self.agents, warnings = load_agents(self.repo, use_project)
+        for warning in warnings:
+            status('agents: ' + warning)
+        save(self.run_dir / 'agents.json', {role: {key: value for key, value in agent.items() if key != 'body'}
+                                            | {'skills': [{k: v for k, v in skill.items() if k != 'body'}
+                                                          for skill in agent['skills']]}
+                                            for role, agent in self.agents.items()})
+        emit_event('agents_loaded', agents={ROLE_PANELS[role]: agent['name'] for role, agent in self.agents.items()})
+
+    def ask_project_trust(self, files):
+        """Show the project's agent files and let the user decide whether to use them."""
+        names = ', '.join(path.relative_to(self.repo).as_posix() for path in files)
+        options = [('Review the files', 'show', ''),
+                   ('Trust and use them', 'trust', 'remembered until a file changes'),
+                   ('Run without project agents', 'skip', 'use your own and the built-in agents'),
+                   ('Stop', 'stop', '')]
+        while True:
+            chosen = team_ui.select_choice('PROJECT AGENTS', options,
+                                           subtitle=f'This project defines agents and skills: {names}. They '
+                                                    'become part of every prompt, so review them before use.')
+            if chosen == 'show':
+                body = '\n\n'.join(f'## {path.relative_to(self.repo).as_posix()}\n\n```\n'
+                                    + path.read_text(errors='replace')[:DEFINITION_LIMIT] + '\n```' for path in files)
+                team_ui.show_text('PROJECT AGENTS', body, markdown=True)
+                continue
+            if chosen == 'trust':
+                trust_project_definitions(self.repo)
+                return True
+            if chosen == 'skip':
+                return False
+            raise WorkflowError('Stopped: project agents were not accepted.')
+
     def run(self, task, review_only, route_override='auto'):
+        self.prepare_agents()
         base = git(self.repo, 'rev-parse', 'HEAD').decode().strip() if self.tracked else ''
         original = project_snapshot(self.repo, base, self.tracked)
         route = 'plan'
@@ -3736,6 +4055,8 @@ class Loop:
 
 def main():
     global team_ui, event_journal
+    if sys.argv[1:2] == ['--agents']:
+        return agents_command(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--ccx', required=True)
     parser.add_argument('--config', required=True)
@@ -3914,6 +4235,16 @@ def main():
                         ui.footer = message
                     except (WorkflowError, OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as error:
                         ui.show_text('UNDO/REDO FAILED', str(error))
+                    continue
+                if ui and task.lower() == '/roles':
+                    try:
+                        roles_repo, _ = resolve_workspace()
+                    except (WorkflowError, OSError):
+                        roles_repo = Path.cwd()
+                    try:
+                        ui.show_roles(roles_repo)
+                    except (WorkflowError, OSError) as error:
+                        ui.show_text('ERROR', str(error))
                     continue
                 if ui and task.lower() == '/timeline':
                     ui.show_timeline()
