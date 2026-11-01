@@ -352,9 +352,12 @@ full-width highlight, so they stand apart from agent output. Agent replies are l
 as Markdown in the conversation, and each run of tool calls folds into one summary
 (`⏺ 6 tool calls · read 3 · grep 2 · bash 1`) with the latest call beneath it; Ctrl+O
 expands every call and folds them again. Heartbeats stay in the status row instead of
-the conversation. While an agent runs, the conversation scrolls with ↑/↓, the mouse
-wheel, PgUp/PgDn and Home/End; it holds its place as new output arrives, and End (or
-scrolling to the bottom) follows again. The layout redraws when the terminal is resized.
+the conversation. The conversation scrolls with the mouse wheel and PgUp/PgDn at any
+time, with ↑/↓ while an agent runs, and with Home/End while the input line is empty; it
+holds its place as new output arrives, and End (or scrolling to the bottom) follows
+again. The team asks the terminal for mouse reports so the wheel scrolls instead of
+recalling input; select text with Shift+drag, or set `CCX_MOUSE=0` to leave the mouse
+to the terminal (the wheel then acts as ↑/↓). The layout redraws when the terminal is resized.
 
 When a task finishes, the team goes straight back to the composer, like a chat. The
 answer stays in the conversation, laid out as Markdown, and the view jumps to its first
@@ -365,8 +368,7 @@ line so a long answer reads from the top; scroll for the rest. The status row re
 open a separate screen.
 
 `/result` opens the latest conclusion full screen with its run metadata. Full-screen
-views scroll with the mouse wheel, ←/→ and PgUp/PgDn; while one is open the terminal
-reports mouse events, so select text there with Shift+drag.
+views scroll with the mouse wheel, ←/→ and PgUp/PgDn.
 
 Tasks are typed into a bordered composer:
 

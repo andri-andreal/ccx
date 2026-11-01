@@ -710,6 +710,42 @@ class IntegrationTests(unittest.TestCase):
             stdin.close()
             os.close(master)
 
+    def test_idle_composer_scrolls_the_conversation_with_wheel_and_page_keys(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal), \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 20))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['review']
+            ui.timeline = [('review', f'line {n:03d}', 'text') for n in range(80)]
+            ui.input_history = ['earlier task']
+            ui.composing = True
+            ui.render()
+            self.assertIsNone(ui.transcript_top)
+            # Wheel up (SGR button 64) scrolls; the input line is untouched.
+            ui._compose_keys('\x1b[<64;10;5M')
+            self.assertIsNotNone(ui.transcript_top)
+            self.assertEqual(ui.input_buffer, '')
+            ui.render()
+            ui._compose_keys('\x1b[5~')
+            first = ui.transcript_top
+            ui.render()
+            ui._compose_keys('\x1b[5~')
+            self.assertLess(ui.transcript_top, first)
+            # Home and End scroll while the line is empty; ↑ still recalls input.
+            ui._compose_keys('\x1b[H')
+            self.assertEqual(ui.transcript_top, 0)
+            ui.render()
+            ui._compose_keys('\x1b[F')
+            self.assertIsNone(ui.transcript_top)
+            ui._compose_keys('\x1b[A')
+            self.assertEqual(ui.input_buffer, 'earlier task')
+            ui._compose_keys('\x1b[H')
+            self.assertEqual(ui.input_cursor, 0)
+            self.assertIsNone(ui.transcript_top)
+
     def test_running_view_scrolls_back_through_the_conversation(self):
         class Terminal(io.StringIO):
             def isatty(self): return True

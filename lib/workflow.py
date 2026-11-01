@@ -98,7 +98,7 @@ SUBCOMMANDS = {
 HISTORY_LIMIT = 500
 COMPOSER_PLACEHOLDER = 'Describe a task · / for commands · @ to attach a file'
 # One key or terminal sequence per match; group 1 is bracketed-paste text.
-KEY_TOKEN = re.compile(r'\x1b\[200~(.*?)\x1b\[201~|\x1b\[[0-9;?]*[~A-Za-z]|\x1bO[A-Za-z]'
+KEY_TOKEN = re.compile(r'\x1b\[200~(.*?)\x1b\[201~|\x1b\[<[0-9;]*[Mm]|\x1b\[[0-9;?]*[~A-Za-z]|\x1bO[A-Za-z]'
                        r'|\x1b[\r\n]|\x1b[^\x1b]|\x1b|[\s\S]', re.S)
 # Inline Markdown the result view styles: **bold**, __bold__, *italic* and `code`.
 MD_INLINE = re.compile(r'(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|(?<![\w*])\*[^*\s](?:[^*\n]*[^*\s])?\*(?![\w*]))')
@@ -404,6 +404,9 @@ class TeamUI:
         self._transcript_view = (0, 1)
         # Ctrl+O shows every tool call instead of one summary per run of calls.
         self.expand_tools = False
+        # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
+        # recalling input. CCX_MOUSE=0 leaves the mouse to the terminal.
+        self.mouse = os.environ.get('CCX_MOUSE', '1') != '0'
         self._focus_last = False
         self._entry_starts = []
         self._resized = False
@@ -563,7 +566,7 @@ class TeamUI:
     def enter(self):
         if self.enabled:
             if not self.entered:
-                sys.stdout.write('\x1b[?1049h\x1b[?25l')
+                sys.stdout.write('\x1b[?1049h\x1b[?25l' + ('\x1b[?1000h\x1b[?1006h' if self.mouse else ''))
                 self.entered = True
                 try:
                     self._previous_winch = signal.signal(signal.SIGWINCH, self._on_resize)
@@ -580,7 +583,7 @@ class TeamUI:
                 except (ValueError, OSError):
                     pass
                 self._previous_winch = None
-            sys.stdout.write('\x1b[?25h\x1b[?1049l')
+            sys.stdout.write('\x1b[?1006l\x1b[?1000l\x1b[?25h\x1b[?1049l')
             sys.stdout.flush()
             self.entered = False
             self._previous_rows = None
@@ -852,6 +855,7 @@ class TeamUI:
                 # Wait briefly for the rest of an escape sequence or a paste.
                 while select.select([fd], [], [], 0.03)[0] and (
                         pending.endswith(b'\x1b') or pending.endswith(b'\x1b[')
+                        or re.search(rb'\x1b\[<[0-9;]*$', pending)
                         or (b'\x1b[200~' in pending and b'\x1b[201~' not in pending)):
                     pending += os.read(fd, 65536)
                 text = decoder.decode(pending)
@@ -885,6 +889,17 @@ class TeamUI:
                     self._accept_suggestion()
                 self.history_search = False
                 self.suggestions = []
+                continue
+            if key.startswith('\x1b[<'):
+                button = key[3:].split(';', 1)[0]
+                if button in ('64', '65'):
+                    self.scroll_transcript(-3 if button == '64' else 3)
+                continue
+            if key in ('\x1b[5~', '\x1b[6~'):
+                self.scroll_transcript('-page' if key == '\x1b[5~' else 'page')
+                continue
+            if not buffer and key in ('\x1b[H', '\x1bOH', '\x1b[1~', '\x1b[F', '\x1bOF', '\x1b[4~'):
+                self.scroll_transcript('home' if key in ('\x1b[H', '\x1bOH', '\x1b[1~') else 'end')
                 continue
             if key == '\x12':
                 self.history_search = not self.history_search
@@ -1006,6 +1021,7 @@ class TeamUI:
             self.input_cursor = end + 1 + min(column, following - end - 1)
             return
         history = self.input_history
+        self._history_position = min(self._history_position, len(history))
         if direction < 0 and self._history_position > 0:
             if self._history_position == len(history):
                 self._history_draft = buffer
@@ -1210,9 +1226,9 @@ class TeamUI:
                 if key in ('\r', '\n'):
                     self._end_choice()
                     return options[index][1]
-                if key in ('up', 'k'):
+                if key in ('up', 'k', 'wheelup'):
                     index = (index - 1) % len(options)
-                elif key in ('down', 'j'):
+                elif key in ('down', 'j', 'wheeldown'):
                     index = (index + 1) % len(options)
                 elif key.isdigit() and 1 <= int(key) <= len(options):
                     index = int(key) - 1
@@ -1440,7 +1456,8 @@ class TeamUI:
                 elif key == 'end':
                     offset = last_offset
         finally:
-            sys.stdout.write('\x1b[?1006l\x1b[?1000l')
+            if not (self.mouse and self.entered):
+                sys.stdout.write('\x1b[?1006l\x1b[?1000l')
             if fd is not None and state is not None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, state)
             self._end_choice()
@@ -1768,13 +1785,13 @@ class TeamUI:
             top = max(0, self.transcript_top)
             self.transcript_top = top
             below = total - top - keep
-            above = (f'↑ {top} earlier lines · PgUp/Home' if top else '· beginning of conversation')
+            above = (f'↑ {top} earlier lines · wheel/PgUp' if top else '· beginning of conversation')
             lines = ([self._fit(self._paint(above, 'muted'), width)] + lines[top:top + keep]
                      + [self._fit(self._paint(f'↓ {below} newer lines · PgDn/End to follow', 'accent'), width)])
         elif overflow:
             self.transcript_top = None
             lines = lines[-max(1, room - 1):]
-            lines.insert(0, self._fit(self._paint(f'↑ {overflow} earlier lines · ↑/PgUp to scroll', 'muted'), width))
+            lines.insert(0, self._fit(self._paint(f'↑ {overflow} earlier lines · wheel/PgUp to scroll', 'muted'), width))
         else:
             lines = lines[:room] + [self._fit('', width)] * (room - len(lines))
         return [header] + [self._fit(line, width) for line in lines[:room]]
@@ -2169,7 +2186,7 @@ class TeamUI:
         if self.running:
             hints = 'type to queue a task · ↑↓ scroll · ctrl+o tools · esc interrupt'
         else:
-            hints = 'enter send · / commands · @ files · ↑↓ history · ctrl+r search · ctrl+o tools'
+            hints = 'enter send · / commands · @ files · ↑↓ history · wheel/pgup scroll · ctrl+r search · ctrl+o tools'
         artifacts = str(self.run_dir) if self.run_dir else ''
         left = self._paint(' ' + hints, 'muted')
         if artifacts and len(hints) + len(artifacts) + 5 < width:
@@ -2434,10 +2451,13 @@ def read_running_input(ui, fd, decoder):
             plain.append(text[position])
             position += 1
             continue
-        match = re.match(r'\x1b(\[[0-9;]*[~A-Za-z]|O[A-Za-z])?', text[position:])
+        match = re.match(r'\x1b(\[<[0-9;]*[Mm]|\[[0-9;]*[~A-Za-z]|O[A-Za-z])?', text[position:])
         sequence = match.group(0)
         position += max(1, len(sequence))
         step = RUNNING_SCROLL_KEYS.get(sequence)
+        if sequence.startswith('\x1b[<'):
+            button = sequence[3:].split(';', 1)[0]
+            step = -3 if button == '64' else 3 if button == '65' else None
         if step is not None and ui.scroll_transcript(step):
             changed = True
     for char in plain:
