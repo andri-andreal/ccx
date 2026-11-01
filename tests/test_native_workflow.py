@@ -9,6 +9,7 @@ import select
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import termios
 import time
 import tomllib
@@ -511,12 +512,166 @@ class IntegrationTests(unittest.TestCase):
             ui.visible = ['review']
             ui.begin('review', 'codex', 'gpt-6.1-sol', 'medium')
             ui.update('review', 'tool: glob')
-            with mock.patch('builtins.input', side_effect=['1', '', 'q']):
+            with mock.patch('builtins.input', side_effect=['1', '', 'q']), \
+                 mock.patch.object(workflow_module.sys, 'stdin', io.StringIO()):
                 ui.show_agents()
             frame = terminal.getvalue()
             self.assertIn('AGENTS', frame)
             self.assertIn('REVIEW', frame)
             self.assertIn('tool: glob', frame)
+
+    def test_composer_suggests_commands_and_files_and_edits_like_a_shell(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.completion_files = ['src/main.rs', 'src/lib.rs', 'README.md']
+        keys = ui._compose_keys
+        # A leading slash lists commands; the exact or first prefix match is highlighted.
+        self.assertIsNone(keys('/r'))
+        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/route'])
+        self.assertEqual(keys('\r'), '/result')
+        # Arrow keys choose, Tab completes and leaves room for an argument.
+        keys('/r')
+        keys('\x1b[B\x1b[B')
+        self.assertEqual(ui.suggestions[ui.suggestion_index][0], '/route')
+        keys('\t')
+        self.assertEqual(ui.input_buffer, '/route ')
+        self.assertEqual([name for name, _ in ui.suggestions],
+                         ['/route auto', '/route plan', '/route direct', '/route inspect'])
+        self.assertEqual(keys('direct\r'), '/route direct')
+        # Completing a command with choices lists them; no typing needed.
+        keys('/the\t')
+        self.assertEqual(ui.input_buffer, '/theme ')
+        self.assertEqual([name for name, _ in ui.suggestions], ['/theme default', '/theme ocean', '/theme contrast'])
+        self.assertEqual(keys('\x1b[B\r'), '/theme ocean')
+        keys('/queue c')
+        self.assertEqual([name for name, _ in ui.suggestions], ['/queue clear'])
+        keys('\x1b\x1b')
+        # @ lists workspace files and Enter inserts the highlighted one.
+        keys('fix @lib')
+        self.assertEqual(ui.suggestions[0][0], '@src/lib.rs')
+        self.assertIsNone(keys('\r'))
+        self.assertEqual(ui.input_buffer, 'fix @src/lib.rs ')
+        self.assertEqual(keys('now\r'), 'fix @src/lib.rs now')
+        # Alt+Enter, a trailing backslash and pasted text keep their newlines.
+        keys('one\x1b\rtwo\\\rthree')
+        self.assertEqual(ui.input_buffer, 'one\ntwo\nthree')
+        keys('\x15')
+        self.assertEqual(ui.input_buffer, 'one\ntwo\n')
+        keys('\x1b')
+        self.assertEqual(ui.input_buffer, '')
+        keys('\x1b[200~first line\r\nsecond line\x1b[201~')
+        self.assertEqual(keys('\r'), 'first line\nsecond line')
+        # Up recalls history; Esc clears; Ctrl+P opens the palette.
+        keys('\x1b[A')
+        self.assertEqual(ui.input_buffer, 'first line\nsecond line')
+        keys('\x1b')
+        self.assertEqual(ui.input_buffer, '')
+        self.assertEqual(keys('\x10'), '/commands')
+        # Editing keys: left, insert, Ctrl+W deletes the previous word.
+        keys('hello world')
+        keys('\x1b[D\x1b[D\x1b[D\x1b[D\x1b[DX')
+        self.assertEqual(ui.input_buffer, 'hello Xworld')
+        keys('\x05\x17')
+        self.assertEqual(ui.input_buffer, 'hello ')
+
+    def test_result_markdown_is_laid_out_for_the_terminal(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = True
+        text = ("Intro line.\n\n## Structure\n\n| Piece | Path |\n|---|---|\n"
+                "| Frontend | `src/` |\n| Backend | `src-tauri/src/` with a much longer description |\n\n"
+                "1. **CI covers only Laravel.** Nothing else runs.\n- *note* bullet\n")
+        rows = ui.markdown_rows(text, 40)
+        plain = [ui._plain(row) for row in rows]
+        self.assertTrue(all(len(row) <= 40 for row in plain), plain)
+        self.assertIn('Intro line.', plain[0])
+        self.assertIn('▍ Structure', plain)
+        header = next(row for row in plain if 'Piece' in row)
+        self.assertIn('│', header)
+        self.assertNotIn('|', ''.join(plain))
+        self.assertTrue(any('─┼─' in row for row in plain))
+        self.assertTrue(any(row.startswith(' 1. CI covers only Laravel.') for row in plain))
+        self.assertTrue(any(row.startswith(' • note bullet') for row in plain))
+        self.assertNotIn('**', ''.join(plain))
+        self.assertNotIn('`', ''.join(plain))
+        self.assertNotIn('##', ''.join(plain))
+        # Bold and code keep their own styles in colour terminals.
+        self.assertIn('\x1b[1mLaravel.\x1b[0m', ''.join(rows))
+
+    def test_result_view_wheel_scrolls_text_and_arrows_choose(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        master, slave = pty.openpty()
+        stdin = os.fdopen(slave, 'r')
+        try:
+            with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+                 mock.patch.object(workflow_module.sys, 'stdin', stdin), \
+                 mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+                 mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 20))):
+                ui = workflow_module.TeamUI(config, '/tmp/run')
+                body = '\n'.join(f'line {n:03d}' for n in range(60))
+                def press():
+                    # Keys sent after the view switched the terminal to cbreak:
+                    # two wheel notches down, then the down arrow and Enter.
+                    for keys in (b'\x1b[<65;10;5M', b'\x1b[<65;10;5M', b'\x1b[B', b'\r'):
+                        time.sleep(0.15)
+                        os.write(master, keys)
+                presser = threading.Thread(target=press, daemon=True)
+                presser.start()
+                choice = ui.show_text('CONCLUSION', body, actions=[('New task', None), ('Quit', '/quit')])
+                frames = terminal.getvalue()
+                presser.join(timeout=5)
+            self.assertEqual(choice, '/quit')
+            self.assertIn('(7-', frames)
+            self.assertIn('\x1b[?1000h', frames)
+            self.assertTrue(frames.rstrip().endswith('\x1b[?25l') or '\x1b[?1000l' in frames)
+        finally:
+            stdin.close()
+            os.close(master)
+
+    def test_running_view_scrolls_back_through_the_conversation(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+             mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+             mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 20))):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            ui.visible = ['review']
+            ui.timeline = [('review', f'line {n:03d}') for n in range(80)]
+            ui.render()
+            self.assertIn('earlier lines', terminal.getvalue())
+            self.assertIn('line 079', terminal.getvalue())
+            master, slave = pty.openpty()
+            try:
+                decoder = workflow_module.codecs.getincrementaldecoder('utf-8')('replace')
+                terminal.seek(0); terminal.truncate()
+                os.write(slave, b'\x1b[H')
+                self.assertFalse(workflow_module.read_running_input(ui, master, decoder))
+                frame = terminal.getvalue()
+                self.assertIn('line 000', frame)
+                self.assertIn('newer lines', frame)
+                self.assertNotIn('line 079', frame)
+                # New output while scrolled back keeps the view in place.
+                ui.timeline.append(('review', 'line 080'))
+                terminal.seek(0); terminal.truncate()
+                ui._previous_rows = None
+                ui.render()
+                self.assertIn('line 000', terminal.getvalue())
+                terminal.seek(0); terminal.truncate()
+                os.write(slave, b'\x1b[F')
+                workflow_module.read_running_input(ui, master, decoder)
+                self.assertIsNone(ui.transcript_top)
+                self.assertIn('line 080', terminal.getvalue())
+                # Arrow keys move one line at a time and never reach the task input.
+                os.write(slave, b'\x1b[A\x1b[A')
+                workflow_module.read_running_input(ui, master, decoder)
+                self.assertIsNotNone(ui.transcript_top)
+                self.assertEqual(ui.queue_input, '')
+            finally:
+                os.close(master)
+                os.close(slave)
 
     def test_team_tui_session_and_persisted_history(self):
         self.workflow()
@@ -538,48 +693,65 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r} in output: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                initial = read_until(b'Task (/history')
+                initial = read_until(b'Describe a task')
                 self.assertIn(b'What would you like', initial)
                 for label in (b'ORCHESTRATOR', b'PLAN |', b'EXECUTE', b'REVIEW'):
                     self.assertNotIn(label, initial)
                 os.write(master, b'\x10')
-                self.assertIn(b'COMMAND PALETTE', read_until(b'Search/number: '))
-                os.write(master, b'files\n')
-                read_until(b'Search/number: ')
-                os.write(master, b'1\n')
-                self.assertIn(b'WORKSPACE FILES', read_until(b'[n] next'))
+                self.assertIn(b'COMMAND PALETTE', read_until(b'q cancel'))
+                os.write(master, b'8')
+                self.assertIn(b'/files', read_until(b'q cancel'))
+                os.write(master, b'\r')
+                self.assertIn(b'WORKSPACE FILES', read_until(b'Enter select'))
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
+                os.write(master, b'/route\n')
+                picker = read_until(b'q cancel')
+                for label in (b'auto', b'plan', b'direct', b'inspect'):
+                    self.assertIn(label, picker)
+                os.write(master, b'3')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'Route set to direct', read_until(b'Describe a task'))
+                os.write(master, b'/route\n')
+                read_until(b'q cancel')
+                os.write(master, b'1')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'Route set to auto', read_until(b'Describe a task'))
                 os.write(master, b'Fixture task\n')
-                completed = read_until(b'[n] next')
+                completed = read_until(b'Enter select')
                 self.assertIn(b'PLAN', completed)
                 self.assertIn(b'REVIEW', completed)
                 self.assertNotIn(b'EXECUTE', completed)
                 self.assertIn(b'CONCLUSION', completed)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/result\n')
-                detail = read_until(b'[n] next')
+                detail = read_until(b'Enter select')
                 self.assertIn(b'Plan approved', detail)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/history\n')
-                history = read_until(b'History: ')
+                history = read_until(b'q cancel')
                 self.assertIn(b'Fixture task', history)
                 os.write(master, b'1\n')
-                detail = read_until(b'[n] next')
+                detail = read_until(b'Enter select')
                 self.assertIn(b'Fixture task', detail)
                 self.assertIn(b'Plan approved', detail)
                 os.write(master, b'\n')
-                read_until(b'History: ')
-                os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'q cancel')
+                os.write(master, b'q')
+                read_until(b'Describe a task')
                 os.write(master, b'Follow-up task\n')
-                second = read_until(b'[n] next')
+                second = read_until(b'Enter select')
                 self.assertIn(b'CONCLUSION', second)
-                os.write(master, b'\n')
-                read_until(b'Task (/history')
-                os.write(master, b'/quit\n')
+                for label in (b'New task', b'Show changes', b'Agent logs', b'Quit'):
+                    self.assertIn(label, second)
+                # Up from the first action wraps to Quit; no letters typed.
+                os.write(master, b'\x1b[A')
+                time.sleep(0.2)
+                os.write(master, b'\r')
                 proc.wait(timeout=10)
                 self.assertEqual(proc.returncode, 0)
             runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
@@ -613,17 +785,17 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                initial = read_until(b'Task (/history')
+                initial = read_until(b'Describe a task')
                 self.assertNotIn(b'ORCHESTRATOR |', initial)
                 os.write(master, b'Inspect the project\n')
-                output = read_until(b'[n] next')
+                output = read_until(b'Enter select')
                 self.assertIn(b'ORCHESTRATOR', output)
                 self.assertIn(b'REVIEW', output)
                 self.assertNotIn(b'PLAN |', output)
                 self.assertNotIn(b'EXECUTE |', output)
                 self.assertIn(b'Read-only inspection completed', output)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             saved = (self.root / 'config' / 'profiles' / 'team' / 'workflow.env').read_text()
@@ -657,7 +829,7 @@ class IntegrationTests(unittest.TestCase):
                         data += os.read(master, 65536)
                     return data
 
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'Fixture task\n')
                 picker = read_until(b'Type another command')
                 self.assertIn(b'Verification command', picker)
@@ -666,11 +838,11 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\r')
                 read_until(b'Command: ')
                 os.write(master, b'true\n')
-                output = read_until(b'[n] next')
+                output = read_until(b'Enter select')
                 self.assertIn(b'CONCLUSION', output)
                 self.assertIn(b'Verification: true', output)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -700,16 +872,16 @@ class IntegrationTests(unittest.TestCase):
                         data += os.read(master, 65536)
                     return data
 
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'Fixture task\n')
                 read_until(b'Verification command')
                 # Cancelling the picker is the same as leaving the answer empty.
                 os.write(master, b'q')
-                output = read_until(b'[n] next')
+                output = read_until(b'Enter select')
                 self.assertIn(b'/proof', output)
                 self.assertIn(b'No verification command', output)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -786,16 +958,16 @@ class IntegrationTests(unittest.TestCase):
             return data
         master, proc = start()
         try:
-            read_until(master, proc, b'Task (/history')
+            read_until(master, proc, b'Describe a task')
             os.write(master, b'First task\n')
             read_until(master, proc, b'Queue: ')
             os.write(master, b'Follow-up queued\n')
-            read_until(master, proc, b'[n] next')
+            read_until(master, proc, b'Enter select')
             os.write(master, b'\n')
-            second = read_until(master, proc, b'[n] next')
+            second = read_until(master, proc, b'Enter select')
             self.assertIn(b'CONCLUSION', second)
             os.write(master, b'\n')
-            read_until(master, proc, b'Task (/history')
+            read_until(master, proc, b'Describe a task')
             os.write(master, b'/quit\n')
             self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -807,15 +979,15 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual({json.loads(p.read_text())['task'] for p in runs}, {'First task', 'Follow-up queued'})
         master, proc = start()
         try:
-            read_until(master, proc, b'Task (/history')
+            read_until(master, proc, b'Describe a task')
             os.write(master, b'Stop test\n')
             read_until(master, proc, b'Queue: ')
             time.sleep(0.2)
             os.write(master, b'\x1b')
-            output = read_until(master, proc, b'[n] next')
+            output = read_until(master, proc, b'Enter select')
             self.assertIn(b'stopped by user', output)
             os.write(master, b'\n')
-            read_until(master, proc, b'Task (/history')
+            read_until(master, proc, b'Describe a task')
             os.write(master, b'/quit\n')
             self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -843,14 +1015,14 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'Attempt task\n')
-                self.assertIn(b'FAILED', read_until(b'[n] next'))
+                self.assertIn(b'FAILED', read_until(b'Enter select'))
                 self.assertTrue((self.repo / 'implemented.py').exists())
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/undo\n')
-                self.assertIn(b'Undo complete', read_until(b'Task (/history'))
+                self.assertIn(b'Undo complete', read_until(b'Describe a task'))
                 self.assertFalse((self.repo / 'implemented.py').exists())
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
@@ -878,38 +1050,38 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/route direct\n')
-                self.assertIn(b'Route set to direct', read_until(b'Task (/history'))
+                self.assertIn(b'Route set to direct', read_until(b'Describe a task'))
                 os.write(master, b'/proof test -f implemented.py\n')
-                self.assertIn(b'Verification command updated', read_until(b'Task (/history'))
+                self.assertIn(b'Verification command updated', read_until(b'Describe a task'))
                 os.write(master, b'First task\n')
-                read_until(b'[n] next')
+                read_until(b'Enter select')
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'Second task\n')
-                second = read_until(b'[n] next')
+                second = read_until(b'Enter select')
                 self.assertIn(b'CONCLUSION', second)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/undo\n')
-                self.assertIn(b'Undo complete', read_until(b'Task (/history'))
+                self.assertIn(b'Undo complete', read_until(b'Describe a task'))
                 self.assertFalse((self.repo / 'implemented.py').exists())
                 os.write(master, b'/redo\n')
-                self.assertIn(b'Redo complete', read_until(b'Task (/history'))
+                self.assertIn(b'Redo complete', read_until(b'Describe a task'))
                 self.assertTrue((self.repo / 'implemented.py').exists())
                 (self.repo / 'implemented.py').write_text('external edit\n')
                 os.write(master, b'/undo\n')
-                refused = read_until(b'[n] next')
+                refused = read_until(b'Enter select')
                 self.assertIn(b'project changed', refused)
                 self.assertEqual((self.repo / 'implemented.py').read_text(), 'external edit\n')
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'Third task\n')
-                failure = read_until(b'[n] next')
+                failure = read_until(b'Enter select')
                 self.assertIn(b'clean Git checkout', failure)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
@@ -944,13 +1116,13 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/history\n')
-                output = read_until(b'History: ')
+                output = read_until(b'q cancel')
                 self.assertIn(b'Previous run', output)
                 self.assertIn(b'task not recorded in earlier run', output)
-                os.write(master, b'\n')
-                read_until(b'Task (/history')
+                os.write(master, b'q')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -979,18 +1151,20 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/history\n')
-                read_until(b'History: ')
+                read_until(b'q cancel')
                 os.write(master, b'1\n')
-                detail = read_until(b'[r] resume')
+                detail = read_until(b'Resume this session')
                 self.assertIn(b'Previous run', detail)
-                os.write(master, b'r\n')
-                self.assertIn(b'Session restored', read_until(b'Task (/history'))
+                os.write(master, b'\x1b[B')
+                time.sleep(0.2)
+                os.write(master, b'\r')
+                self.assertIn(b'Session restored', read_until(b'Describe a task'))
                 os.write(master, b'Follow-up\n')
-                read_until(b'[n] next')
+                read_until(b'Enter select')
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             prompts = [json.loads(line) for line in prompt_log.read_text().splitlines()]
@@ -1021,15 +1195,20 @@ class IntegrationTests(unittest.TestCase):
                             self.fail(f'Missing {token!r}: {data[-1000:]!r}')
                         data += os.read(master, 65536)
                     return data
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/history\n')
-                read_until(b'History: ')
+                read_until(b'q cancel')
                 os.write(master, b'1\n')
-                read_until(b'[r] resume')
-                os.write(master, b'r\n')
-                self.assertIn(b'project or its files changed', read_until(b'[n] next'))
+                read_until(b'Resume this session')
+                os.write(master, b'\x1b[B')
+                time.sleep(0.2)
+                os.write(master, b'\r')
+                refused = read_until(b'CANNOT RESUME')
+                if b'Enter select' not in refused.split(b'CANNOT RESUME')[-1]:
+                    refused += read_until(b'Enter select')
+                self.assertIn(b'project or its files changed', refused)
                 os.write(master, b'\n')
-                read_until(b'Task (/history')
+                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             self.assertEqual((self.repo / 'external.txt').read_text(), 'external change')
@@ -1660,7 +1839,7 @@ class IntegrationTests(unittest.TestCase):
                     data += os.read(master, 65536)
                 return data
 
-            read_until(b'Task (/history')
+            read_until(b'Describe a task')
             os.write(master, b'Build an API\n')
             picker = read_until(b'move')
             self.assertIn(b'Verification command', picker)
@@ -1711,15 +1890,15 @@ class IntegrationTests(unittest.TestCase):
                     data += os.read(master, 65536)
                 return data
 
-            read_until(b'Task (/history')
+            read_until(b'Describe a task')
             os.write(master, b'Build an API\n')
             picker = read_until(b'net/http')
             self.assertIn(b'Which framework?', picker)
             self.assertIn(b'gin', picker)
             os.write(master, b'\r')
-            read_until(b'[n] next')
+            read_until(b'Enter select')
             os.write(master, b'\n')
-            read_until(b'Task (/history')
+            read_until(b'Describe a task')
         finally:
             if proc.poll() is None:
                 proc.kill()

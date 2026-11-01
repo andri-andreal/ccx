@@ -64,6 +64,44 @@ ROLE_STYLES = {'you': 'userb', 'ccx': 'okb', 'orch': 'accentb', 'plan': 'accentb
 
 ANSI_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
 
+# Slash commands offered by the composer and the command palette.
+COMMANDS = [
+    ('/history', 'Browse and resume previous runs'),
+    ('/result', 'Open the latest conclusion'),
+    ('/diff', 'Show file changes'),
+    ('/undo', "Undo the last run's file changes"),
+    ('/redo', 'Redo the last undo'),
+    ('/agents', "Read an agent's log"),
+    ('/timeline', 'Show the whole conversation'),
+    ('/files', 'List workspace files'),
+    ('/queue', 'Show queued tasks'),
+    ('/route', 'Show or set the route: auto, plan, direct, inspect'),
+    ('/proof', 'Show or set the verification command'),
+    ('/editor', 'Write a multiline task in $EDITOR'),
+    ('/theme', 'Show or change the colour theme'),
+    ('/help', 'Keys and commands'),
+    ('/quit', 'Exit ccx'),
+]
+# Commands that take an argument; completing them leaves room to type it.
+ARGUMENT_COMMANDS = {'/route', '/proof', '/theme', '/queue'}
+# Fixed choices for commands that take one; /proof's are found per project.
+SUBCOMMANDS = {
+    '/route': [('auto', 'the orchestrator picks the route per task'),
+               ('plan', 'plan, build, then review'),
+               ('direct', 'build straight away, then review'),
+               ('inspect', 'read-only review, no file changes')],
+    '/theme': [('default', 'magenta accents'), ('ocean', 'cyan and blue'),
+               ('contrast', 'bright, high contrast')],
+    '/queue': [('show', 'list queued tasks'), ('next', 'run the next queued task now'),
+               ('clear', 'discard every queued task')],
+}
+COMPOSER_PLACEHOLDER = 'Describe a task · / for commands · @ to attach a file'
+# One key or terminal sequence per match; group 1 is bracketed-paste text.
+KEY_TOKEN = re.compile(r'\x1b\[200~(.*?)\x1b\[201~|\x1b\[[0-9;?]*[~A-Za-z]|\x1bO[A-Za-z]'
+                       r'|\x1b[\r\n]|\x1b[^\x1b]|\x1b|[\s\S]', re.S)
+# Inline Markdown the result view styles: **bold**, __bold__, *italic* and `code`.
+MD_INLINE = re.compile(r'(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|(?<![\w*])\*[^*\s](?:[^*\n]*[^*\s])?\*(?![\w*]))')
+
 
 def read_env(path):
     values = {}
@@ -357,10 +395,26 @@ class TeamUI:
         self.timeline = deque(maxlen=2000)
         self.queued_tasks = deque()
         self.queue_input = ''
+        # First transcript line shown while scrolled back; None follows the newest.
+        self.transcript_top = None
+        self._transcript_view = (0, 1)
         self.running = False
         self.spinner_frame = 0
         self.entered = False
         self.completion_ready = False
+        self.completion_files = []
+        # Composer state: the line being edited, its suggestions and history.
+        self.composing = False
+        self.compose_label = ''
+        self.input_buffer = ''
+        self.input_cursor = 0
+        self.input_history = []
+        self._history_position = 0
+        self._history_draft = ''
+        self.suggestions = []
+        self.suggestion_index = 0
+        self.suggestions_closed = False
+        self._composer_cursor = None
         self.started_at = None
         self.branch = ''
         self.tracked = True
@@ -397,6 +451,11 @@ class TeamUI:
         palette = dict(base)
         for role in ('accent', 'ok', 'err', 'warn', 'muted', 'user'):
             palette[role + 'b'] = '1;' + base[role]
+        palette['bold'] = '1'
+        # A full-width band marks the user's own messages in the transcript.
+        palette['userrow'] = '1;' + base['user'] + ';48;5;236'
+        palette['italic'] = '3'
+        palette['code'] = base['user']
         return palette
 
     def _paint(self, text, role=None):
@@ -438,7 +497,8 @@ class TeamUI:
             out.append(text[index])
             visible += 1
             index += 1
-        out.append('\x1b[0m')
+        if ANSI_PATTERN.search(text):
+            out.append('\x1b[0m')
         return ''.join(out)
 
     def _elapsed(self):
@@ -554,8 +614,7 @@ class TeamUI:
             import readline
         except ImportError:
             return
-        commands = ['/commands', '/help', '/history', '/result', '/timeline', '/agents', '/queue', '/undo', '/redo', '/diff',
-                    '/files', '/editor', '/route', '/proof', '/theme', '/quit']
+        commands = ['/commands'] + [name for name, _ in COMMANDS]
         try:
             files = ['@' + name for name in workspace_files(repo) if not any(c.isspace() for c in name)]
         except (WorkflowError, OSError):
@@ -564,6 +623,8 @@ class TeamUI:
             options = files if text.startswith('@') else commands if text.startswith('/') else []
             matches = [candidate for candidate in options if candidate.startswith(text)]
             return matches[state] if state < len(matches) else None
+        self.completion_files = [name[1:] for name in files]
+        self.completion_repo = repo
         readline.set_completer_delims(' \t\n')
         readline.set_completer(complete)
         readline.parse_and_bind('tab: complete')
@@ -591,12 +652,9 @@ class TeamUI:
             return file.read()
 
     def command_palette(self):
-        commands = [('/history', 'Browse and resume sessions'), ('/result', 'Latest conclusion'),
-                    ('/timeline', 'Conversation history'), ('/agents', 'Agent details'), ('/queue', 'Queued tasks'),
-                    ('/files', 'Workspace files'), ('/diff', 'Inspect changes'),
-                    ('/undo', 'Undo last CCX file changes'), ('/redo', 'Redo last undo'),
-                    ('/editor', 'Write a multiline task'), ('/theme', 'Show themes'), ('/route', 'Show route'),
-                    ('/proof', 'Show or set verification'), ('/help', 'Help'), ('/quit', 'Exit')]
+        commands = COMMANDS
+        if self._can_pick():
+            return self.select_choice('COMMAND PALETTE', [(name, name, description) for name, description in commands])
         query = ''
         while True:
             width, height = shutil.get_terminal_size((100, 28))
@@ -640,36 +698,52 @@ class TeamUI:
             self.show_text('AGENT ACTIVITY', 'No agent has run yet.')
             return
         while True:
-            width, height = shutil.get_terminal_size((100, 28))
-            width, height = max(20, width), max(8, height)
-            rows = [self._fit(self._paint(' AGENTS', 'accentb'), width),
-                    self._fit(self._paint('─' * width, 'muted'), width)]
-            for index, panel in enumerate(agents, 1):
-                status = panel.get('status', 'waiting')
-                glyph = STATUS_GLYPHS.get(status, '○')
-                style = ('okb' if status == 'done' else 'errb' if status == 'failed'
-                         else 'accentb' if status == 'running' else 'muted')
-                identity = f"CLI: {panel['profile']}"
-                if panel.get('model'):
-                    identity += f" · {panel['model']}"
-                if panel.get('effort'):
-                    identity += f" · effort {panel['effort']}"
-                rows.append(self._fit(self._paint(f'  {index}. ', 'muted')
-                                      + self._paint(f'{glyph} {panel["title"]}', style)
-                                      + self._paint(f' · {status}  {identity}', 'muted'), width))
-            rows.append('')
-            rows.append(self._fit(self._paint('  Select an agent number · Enter goes back', 'muted'), width))
-            self._previous_rows = None
-            sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(rows))
-            sys.stdout.write(f'\x1b[{height};1H\x1b[2K\x1b[?25h' + self._paint('Agent number: ', 'accent'))
-            sys.stdout.flush()
-            try:
-                choice = input().strip()
-            except (EOFError, KeyboardInterrupt):
-                return
-            finally:
-                sys.stdout.write('\x1b[?25l')
+            if self._can_pick():
+                options = []
+                for number, panel in enumerate(agents):
+                    status = panel.get('status', 'waiting')
+                    identity = f"CLI: {panel['profile']}"
+                    if panel.get('model'):
+                        identity += f" · {panel['model']}"
+                    if panel.get('effort'):
+                        identity += f" · effort {panel['effort']}"
+                    glyph = STATUS_GLYPHS.get(status, '○')
+                    options.append((f'{glyph} {panel["title"]} · {status}', number, identity))
+                chosen = self.select_choice('AGENTS', options, subtitle='Choose an agent to read its log.')
+                if chosen is None:
+                    return
+                choice = str(chosen + 1)
+            else:
+                width, height = shutil.get_terminal_size((100, 28))
+                width, height = max(20, width), max(8, height)
+                rows = [self._fit(self._paint(' AGENTS', 'accentb'), width),
+                        self._fit(self._paint('─' * width, 'muted'), width)]
+                for index, panel in enumerate(agents, 1):
+                    status = panel.get('status', 'waiting')
+                    glyph = STATUS_GLYPHS.get(status, '○')
+                    style = ('okb' if status == 'done' else 'errb' if status == 'failed'
+                             else 'accentb' if status == 'running' else 'muted')
+                    identity = f"CLI: {panel['profile']}"
+                    if panel.get('model'):
+                        identity += f" · {panel['model']}"
+                    if panel.get('effort'):
+                        identity += f" · effort {panel['effort']}"
+                    rows.append(self._fit(self._paint(f'  {index}. ', 'muted')
+                                          + self._paint(f'{glyph} {panel["title"]}', style)
+                                          + self._paint(f' · {status}  {identity}', 'muted'), width))
+                rows.append('')
+                rows.append(self._fit(self._paint('  Select an agent number · Enter goes back', 'muted'), width))
+                self._previous_rows = None
+                sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(rows))
+                sys.stdout.write(f'\x1b[{height};1H\x1b[2K\x1b[?25h' + self._paint('Agent number: ', 'accent'))
                 sys.stdout.flush()
+                try:
+                    choice = input().strip()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                finally:
+                    sys.stdout.write('\x1b[?25l')
+                    sys.stdout.flush()
             if not choice or choice.lower() in ('q', 'back'):
                 return
             if choice.isdigit() and 1 <= int(choice) <= len(agents):
@@ -677,18 +751,287 @@ class TeamUI:
                 log = '\n'.join(panel['lines']) or 'No activity recorded.'
                 self.show_text(f"{panel['title']} · {panel['status']}", log)
 
-    def read_command(self, prompt='Task: '):
+    def read_command(self, prompt=None):
+        """Read one line of input; ``prompt`` None shows the task placeholder."""
         if not self.enabled:
-            return input(prompt)
+            return input(prompt or 'Task: ')
+        if sys.stdin.isatty():
+            try:
+                return self.compose(prompt)
+            except (termios.error, OSError, ValueError) as error:
+                if isinstance(error, OSError) and error.errno not in (None, 25):
+                    raise
         self.render()
         height = max(2, shutil.get_terminal_size((100, 28)).lines)
-        sys.stdout.write(f'\x1b[{height - 1};3H\x1b[?25h{prompt}')
+        sys.stdout.write(f'\x1b[{height - 1};3H\x1b[?25h{prompt or "Task: "}')
         sys.stdout.flush()
         try:
             return input()
         finally:
             sys.stdout.write('\x1b[?25l')
             sys.stdout.flush()
+
+    def compose(self, prompt=None):
+        """Interactive composer: live / and @ suggestions, history, paste.
+
+        Enter sends (or takes the highlighted suggestion), Tab completes,
+        Alt+Enter or a trailing backslash starts a new line, Esc closes the
+        suggestions or clears the line, Ctrl+P opens the command palette.
+        """
+        fd = sys.stdin.fileno()
+        state = termios.tcgetattr(fd)
+        mode = termios.tcgetattr(fd)
+        mode[3] &= ~(termios.ICANON | termios.ECHO)
+        mode[6][termios.VMIN] = 1
+        mode[6][termios.VTIME] = 0
+        # TCSANOW, not setcbreak's TCSAFLUSH: keys typed ahead are kept.
+        termios.tcsetattr(fd, termios.TCSANOW, mode)
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        self.composing = True
+        self.compose_label = prompt or ''
+        self.input_buffer = ''
+        self.input_cursor = 0
+        self.suggestions = []
+        self.suggestion_index = 0
+        self.suggestions_closed = False
+        self._history_position = len(self.input_history)
+        self._history_draft = ''
+        self._previous_rows = None
+        sys.stdout.write('\x1b[?2004h')
+        try:
+            self.render()
+            pending = b''
+            while True:
+                data = os.read(fd, 4096)
+                if not data:
+                    raise EOFError
+                pending += data
+                # Wait briefly for the rest of an escape sequence or a paste.
+                while select.select([fd], [], [], 0.03)[0] and (
+                        pending.endswith(b'\x1b') or pending.endswith(b'\x1b[')
+                        or (b'\x1b[200~' in pending and b'\x1b[201~' not in pending)):
+                    pending += os.read(fd, 65536)
+                text = decoder.decode(pending)
+                pending = b''
+                submitted = self._compose_keys(text)
+                if submitted is not None:
+                    return submitted
+                self.render()
+        finally:
+            sys.stdout.write('\x1b[?2004l\x1b[?25l')
+            termios.tcsetattr(fd, termios.TCSANOW, state)
+            self.composing = False
+            self.suggestions = []
+            self._composer_cursor = None
+            self._previous_rows = None
+            sys.stdout.flush()
+
+    def _compose_keys(self, text):
+        """Apply typed keys to the composer; return the line once it is sent."""
+        for match in KEY_TOKEN.finditer(text):
+            key = match.group(0)
+            if match.group(1) is not None:
+                pasted = match.group(1).replace('\r\n', '\n').replace('\r', '\n').replace('\t', '    ')
+                self._insert(re.sub(r'[\x00-\x09\x0b-\x1f\x7f]', '', pasted))
+                continue
+            buffer, cursor = self.input_buffer, self.input_cursor
+            if key in ('\r', '\n'):
+                if self.suggestions:
+                    name = self.suggestions[self.suggestion_index][0]
+                    if name.startswith('/'):
+                        return self._submit(name)
+                    self._accept_suggestion()
+                    continue
+                if buffer[:cursor].endswith('\\'):
+                    self.input_buffer = buffer[:cursor - 1] + '\n' + buffer[cursor:]
+                    self._changed()
+                    continue
+                return self._submit(buffer)
+            if key in ('\x1b\r', '\x1b\n'):
+                self._insert('\n')
+            elif key == '\t':
+                if self.suggestions:
+                    self._accept_suggestion()
+            elif key == '\x10':
+                return self._submit('/commands', remember=False)
+            elif key in ('\x7f', '\b'):
+                if cursor:
+                    self.input_buffer = buffer[:cursor - 1] + buffer[cursor:]
+                    self.input_cursor -= 1
+                    self._changed()
+            elif key in ('\x1b[3~', '\x04'):
+                if key == '\x04' and not buffer:
+                    raise EOFError
+                if cursor < len(buffer):
+                    self.input_buffer = buffer[:cursor] + buffer[cursor + 1:]
+                    self._changed()
+            elif key == '\x03':
+                raise KeyboardInterrupt
+            elif key in ('\x1b[D', '\x1bOD', '\x02'):
+                self.input_cursor = max(0, cursor - 1)
+            elif key in ('\x1b[C', '\x1bOC', '\x06'):
+                self.input_cursor = min(len(buffer), cursor + 1)
+            elif key in ('\x1b[H', '\x1bOH', '\x1b[1~', '\x01'):
+                self.input_cursor = buffer.rfind('\n', 0, cursor) + 1
+            elif key in ('\x1b[F', '\x1bOF', '\x1b[4~', '\x05'):
+                end = buffer.find('\n', cursor)
+                self.input_cursor = len(buffer) if end < 0 else end
+            elif key == '\x15':
+                start = buffer.rfind('\n', 0, cursor) + 1
+                self.input_buffer = buffer[:start] + buffer[cursor:]
+                self.input_cursor = start
+                self._changed()
+            elif key == '\x0b':
+                end = buffer.find('\n', cursor)
+                self.input_buffer = buffer[:cursor] + ('' if end < 0 else buffer[end:])
+                self._changed()
+            elif key in ('\x17', '\x1b\x7f'):
+                start = len(buffer[:cursor].rstrip(' ').rstrip('\n'))
+                while start and not buffer[start - 1].isspace():
+                    start -= 1
+                self.input_buffer = buffer[:start] + buffer[cursor:]
+                self.input_cursor = start
+                self._changed()
+            elif key == '\x0c':
+                self._previous_rows = None
+            elif key in ('\x1b[A', '\x1bOA', '\x1b[B', '\x1bOB', '\x10', '\x0e'):
+                self._vertical(-1 if key in ('\x1b[A', '\x1bOA') else 1)
+            elif key == '\x1b':
+                if self.suggestions:
+                    self.suggestions = []
+                    self.suggestions_closed = True
+                elif buffer:
+                    self.input_buffer, self.input_cursor = '', 0
+                    self._changed()
+            elif len(key) == 1 and key.isprintable():
+                self._insert(key)
+        return None
+
+    def _insert(self, text):
+        cursor = self.input_cursor
+        self.input_buffer = self.input_buffer[:cursor] + text + self.input_buffer[cursor:]
+        self.input_cursor = cursor + len(text)
+        self._changed()
+
+    def _changed(self):
+        """Recompute suggestions after an edit; Esc's dismissal lasts until then."""
+        self.suggestions_closed = False
+        self._refresh_suggestions()
+
+    def _submit(self, text, remember=True):
+        if remember and text.strip() and (not self.input_history or self.input_history[-1] != text):
+            self.input_history.append(text)
+        self._history_position = len(self.input_history)
+        self._history_draft = ''
+        self.input_buffer, self.input_cursor = '', 0
+        self.suggestions = []
+        return text
+
+    def _vertical(self, direction):
+        """Up/down: move through suggestions, lines of a multiline draft, or history."""
+        if self.suggestions:
+            self.suggestion_index = (self.suggestion_index + direction) % len(self.suggestions)
+            return
+        buffer, cursor = self.input_buffer, self.input_cursor
+        start = buffer.rfind('\n', 0, cursor) + 1
+        column = cursor - start
+        if direction < 0 and start > 0:
+            previous = buffer.rfind('\n', 0, start - 1) + 1
+            self.input_cursor = previous + min(column, start - 1 - previous)
+            return
+        end = buffer.find('\n', cursor)
+        if direction > 0 and end >= 0:
+            following = buffer.find('\n', end + 1)
+            following = len(buffer) if following < 0 else following
+            self.input_cursor = end + 1 + min(column, following - end - 1)
+            return
+        history = self.input_history
+        if direction < 0 and self._history_position > 0:
+            if self._history_position == len(history):
+                self._history_draft = buffer
+            self._history_position -= 1
+            self.input_buffer = history[self._history_position]
+        elif direction > 0 and self._history_position < len(history):
+            self._history_position += 1
+            self.input_buffer = (history[self._history_position] if self._history_position < len(history)
+                                 else self._history_draft)
+        else:
+            return
+        self.input_cursor = len(self.input_buffer)
+        self.suggestions = []
+
+    def _refresh_suggestions(self):
+        """Offer commands for a leading / and workspace files after @."""
+        self.suggestions = []
+        self.suggestion_index = 0
+        if self.suggestions_closed:
+            return
+        buffer = self.input_buffer
+        before = buffer[:self.input_cursor]
+        if buffer.startswith('/') and not any(char.isspace() for char in buffer):
+            query = buffer.lower()
+            exact = [item for item in COMMANDS if item[0] == query]
+            prefix = [item for item in COMMANDS if item[0].startswith(query) and item[0] != query]
+            inside = [item for item in COMMANDS if query[1:] and query[1:] in item[0][1:]]
+            self.suggestions = (exact + prefix) or inside
+        elif re.fullmatch(r'/\w+ \S*', buffer) and buffer.split(' ', 1)[0] in ARGUMENT_COMMANDS:
+            command, query = buffer.split(' ', 1)
+            options = self.subcommand_options(command)
+            self.suggestions = [(f'{command} {value}', note) for value, note in options
+                                if value.lower().startswith(query.lower())]
+        else:
+            mention = re.search(r'(?:^|\s)@(\S*)$', before)
+            if mention:
+                query = mention.group(1).lower()
+                files = self.completion_files
+                starts = [name for name in files if name.lower().startswith(query)]
+                inside = [name for name in files if query in name.lower() and not name.lower().startswith(query)]
+                self.suggestions = [('@' + name, '') for name in (starts + inside)[:200]]
+
+    def _accept_suggestion(self):
+        """Put the highlighted suggestion into the line without sending it."""
+        name = self.suggestions[self.suggestion_index][0]
+        if name.startswith('/'):
+            self.input_buffer = name + (' ' if name in ARGUMENT_COMMANDS else '')
+            self.input_cursor = len(self.input_buffer)
+            if name in ARGUMENT_COMMANDS:
+                self.suggestions_closed = False
+                self._refresh_suggestions()
+                return
+        else:
+            before = self.input_buffer[:self.input_cursor]
+            start = before.rfind('@')
+            self.input_buffer = before[:start] + name + ' ' + self.input_buffer[self.input_cursor:]
+            self.input_cursor = start + len(name) + 1
+        self.suggestions = []
+        self.suggestions_closed = True
+
+    def subcommand_options(self, command):
+        """Choices for a command's argument: fixed lists, or project proof commands."""
+        if command == '/proof':
+            repo = getattr(self, 'completion_repo', None)
+            try:
+                return [(value, note) for value, note in proof_candidates(repo)] if repo else []
+            except OSError:
+                return []
+        return list(SUBCOMMANDS.get(command, []))
+
+    def pick_subcommand(self, command, current='', custom=False):
+        """Open a picker for a command's argument; '' means type a custom value."""
+        options = []
+        for value, note in self.subcommand_options(command):
+            if value == current:
+                note = (note + ' · ' if note else '') + 'current'
+            options.append((value, value, note))
+        if custom:
+            options.append(('Type a custom command', '', ''))
+        if not options:
+            return ''
+        return self.select_choice(command.upper().lstrip('/'), options)
+
+    def _can_pick(self):
+        """Arrow-key pickers need the full-screen UI and a real keyboard."""
+        return self.enabled and sys.stdin.isatty()
 
     def select_choice(self, title, options, subtitle=''):
         """Show a picker and return the chosen option's value.
@@ -799,11 +1142,26 @@ class TeamUI:
             if data != b'\x1b':
                 return data.decode('utf-8', 'replace')
             if select.select([fd], [], [], 0.05)[0]:
+                # Read exactly one sequence so a key typed right after an
+                # arrow (Enter, usually) is left for the next read.
                 rest = os.read(fd, 2)
-                if rest == b'[A':
-                    return 'up'
-                if rest == b'[B':
-                    return 'down'
+                if rest == b'[<':
+                    # SGR mouse report: ESC [ < button ; x ; y (M|m). Only the
+                    # wheel matters; buttons 64/65 are wheel up/down.
+                    report = b''
+                    while len(report) < 32 and select.select([fd], [], [], 0.05)[0]:
+                        byte = os.read(fd, 1)
+                        if byte in (b'M', b'm'):
+                            break
+                        report += byte
+                    button = report.split(b';', 1)[0]
+                    return {b'64': 'wheelup', b'65': 'wheeldown'}.get(button, 'mouse')
+                if rest in (b'[5', b'[6') and select.select([fd], [], [], 0.05)[0]:
+                    rest += os.read(fd, 1)
+                return {b'[A': 'up', b'OA': 'up', b'[B': 'down', b'OB': 'down',
+                        b'[C': 'right', b'OC': 'right', b'[D': 'left', b'OD': 'left',
+                        b'[H': 'home', b'OH': 'home', b'[F': 'end', b'OF': 'end',
+                        b'[5~': 'pageup', b'[6~': 'pagedown'}.get(rest, 'escape')
             return 'escape'
         except OSError:
             return None
@@ -818,7 +1176,7 @@ class TeamUI:
         self.footer = 'Enter a task to start the team'
         self.enter()
         try:
-            return self.read_command()
+            return self.read_command(None)
         finally:
             self.exit()
 
@@ -839,6 +1197,7 @@ class TeamUI:
         self.run_dir = None
         self.started_at = None
         self.current_task = ''
+        self.transcript_top = None
         self.footer = 'Enter a task, /history, or /quit'
         for key, panel in self.panels.items():
             panel['status'] = 'not configured' if key == 'orchestrate' and not self.orchestrator else 'waiting'
@@ -847,15 +1206,99 @@ class TeamUI:
             panel['effort'] = ''
             panel['started_at'] = None
 
-    def show_text(self, title, body, allow_resume=False):
-        """Show a scrollable text view; no terminal control bytes from saved content."""
+    def show_text(self, title, body, allow_resume=False, actions=None, markdown=False):
+        """Show a scrollable text view with a picker of follow-up actions.
+
+        ``actions`` is a list of ``(label, value)`` pairs moved through with the
+        arrow keys and chosen with Enter; the chosen value is returned, ``None``
+        on Esc. Without ``actions`` the view offers Back, plus "Resume this
+        session" when ``allow_resume`` is set, and returns True only when
+        resume was chosen. Saved content never reaches the terminal as control
+        bytes.
+        """
         clean = re.sub(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]', ' ', str(body))
         width, height = shutil.get_terminal_size((100, 28))
         width, height = max(20, width), max(8, height)
-        lines = []
-        for line in clean.splitlines():
-            lines.extend(textwrap.wrap(line, width=max(1, width - 2),
-                                       break_long_words=True, break_on_hyphens=False) or [''])
+        if markdown:
+            lines = self.markdown_rows(clean, width - 2)
+        else:
+            lines = []
+            for line in clean.splitlines():
+                lines.extend(textwrap.wrap(line, width=max(1, width - 2),
+                                           break_long_words=True, break_on_hyphens=False) or [''])
+        if actions is None:
+            # Back stays first so Enter never resumes a session by accident.
+            choices = [('Back', False)] + ([('Resume this session', True)] if allow_resume else [])
+            cancelled = False
+        else:
+            choices = list(actions) or [('Back', None)]
+            cancelled = None
+        if not self.enabled or not sys.stdin.isatty():
+            return self._show_text_typed(title, lines, width, height, allow_resume, cancelled)
+        page_size = max(1, height - 4 - len(choices))
+        last_offset = max(0, len(lines) - page_size)
+        scrollable = len(lines) > page_size
+        offset = 0
+        index = 0
+        try:
+            fd = sys.stdin.fileno()
+            state = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except (OSError, ValueError, termios.error):
+            fd, state = None, None
+        # Mouse reports let the wheel scroll the text while the arrow keys keep
+        # choosing an action; without them the wheel arrives as arrow keys.
+        sys.stdout.write('\x1b[?1000h\x1b[?1006h')
+        try:
+            while True:
+                page = lines[offset:offset + page_size]
+                span = f'({min(offset + 1, len(lines))}-{min(offset + page_size, len(lines))}/{len(lines)})'
+                rows = [self._fit(self._paint(' ' + title, 'accentb') + '  ' + self._paint(span, 'muted'), width),
+                        self._fit(self._paint('─' * width, 'muted'), width)]
+                rows.extend(self._fit(line, width) for line in page)
+                rows.extend([''] * (page_size - len(page)))
+                rows.append(self._fit(self._paint('─' * width, 'muted'), width))
+                for position, (label, _value) in enumerate(choices):
+                    marker = '❯' if position == index else ' '
+                    row = self._fit(f' {marker} {label}', width)
+                    rows.append(self._paint(row, 'accentb') if position == index else row)
+                hints = []
+                if len(choices) > 1:
+                    hints.append('↑↓ choose')
+                if scrollable:
+                    hints.append('wheel ↑↓ PgUp PgDn scroll' if len(choices) == 1 else 'wheel PgUp PgDn scroll')
+                hints += ['Enter select', 'Esc back']
+                self._previous_rows = None
+                sys.stdout.write('\x1b[?25l\x1b[H\x1b[2J' + '\n'.join(rows))
+                sys.stdout.write(f'\x1b[{height};1H\x1b[2K' + self._paint(' · '.join(hints), 'accent'))
+                sys.stdout.flush()
+                key = self._read_choice_key(fd)
+                if key is None or key in ('escape', 'q'):
+                    return cancelled
+                if key in ('\r', '\n'):
+                    return choices[index][1]
+                if key in ('up', 'down') and len(choices) > 1:
+                    index = (index + (1 if key == 'down' else -1)) % len(choices)
+                elif key in ('up', 'down'):
+                    offset = min(last_offset, max(0, offset + (1 if key == 'down' else -1)))
+                elif key in ('wheelup', 'wheeldown'):
+                    offset = min(last_offset, max(0, offset + (3 if key == 'wheeldown' else -3)))
+                elif key in ('left', 'pageup'):
+                    offset = max(0, offset - page_size)
+                elif key in ('right', 'pagedown', ' '):
+                    offset = min(last_offset, offset + page_size)
+                elif key == 'home':
+                    offset = 0
+                elif key == 'end':
+                    offset = last_offset
+        finally:
+            sys.stdout.write('\x1b[?1006l\x1b[?1000l')
+            if fd is not None and state is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, state)
+            self._end_choice()
+
+    def _show_text_typed(self, title, lines, width, height, allow_resume, cancelled):
+        """Line-input pager for terminals without key-by-key input."""
         page_size = max(1, height - 4)
         offset = 0
         while True:
@@ -865,19 +1308,19 @@ class TeamUI:
             rule = self._fit(self._paint('─' * width, 'muted'), width)
             self._previous_rows = None
             sys.stdout.write('\x1b[H\x1b[2J' + header + '\n' + rule + '\n'
-                             + '\n'.join(line[:width] for line in page))
+                             + '\n'.join(self._fit(line, width) for line in page))
             hint = '[n] next  [p] previous  [Enter/q] back' + ('  [r] resume' if allow_resume else '') + ': '
             sys.stdout.write(f'\x1b[{height};1H\x1b[2K\x1b[?25h' + self._paint(hint, 'accent'))
             sys.stdout.flush()
             try:
                 command = input().strip().lower()
             except (EOFError, KeyboardInterrupt):
-                return
+                return cancelled
             finally:
                 sys.stdout.write('\x1b[?25l')
                 sys.stdout.flush()
             if command in ('', 'q', 'back'):
-                return False
+                return cancelled
             if allow_resume and command == 'r':
                 return True
             if command in ('n', 'next'):
@@ -913,32 +1356,48 @@ class TeamUI:
         entries = entries[:100]
         offset = 0
         while True:
-            width, height = shutil.get_terminal_size((100, 28))
-            width, height = max(20, width), max(8, height)
-            page_size = max(1, height - 6)
-            rows = [self._fit(self._paint(' CCX TEAM HISTORY', 'accentb'), width),
-                    self._fit(self._paint(' Select a number · n/p changes page · Enter returns', 'muted'), width),
-                    self._fit(self._paint('─' * width, 'muted'), width)]
-            for index, (_, item, result) in enumerate(entries[offset:offset + page_size], offset + 1):
-                task = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(item.get('task', '')))
-                state = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(result.get('status', 'unknown')))
-                style = 'okb' if state == 'completed' else 'errb' if state == 'failed' else 'muted'
-                rows.append(self._fit(self._paint(f'  {index}. ', 'muted')
-                                      + self._paint(f'[{state}]', style)
-                                      + self._paint(' ' + self._truncate(task, max(10, width - 20)), ''), width))
-            if not entries:
-                rows.append(self._fit(self._paint('  No recorded tasks for this team yet.', 'muted'), width))
-            self._previous_rows = None
-            sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(rows))
-            sys.stdout.write(f'\x1b[{height};1H\x1b[2K\x1b[?25h' + self._paint('History: ', 'accent'))
-            sys.stdout.flush()
-            try:
-                choice = input().strip()
-            except (EOFError, KeyboardInterrupt):
-                return
-            finally:
-                sys.stdout.write('\x1b[?25l')
+            if self._can_pick():
+                options = []
+                for number, (_, item, result) in enumerate(entries):
+                    task = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(item.get('task', '')))
+                    state = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(result.get('status', 'unknown')))
+                    started = str(item.get('started', ''))[:16].replace('T', ' ')
+                    options.append((f'[{state}] {self._truncate(task, 70)}', number, started))
+                if not options:
+                    self.show_text('CCX TEAM HISTORY', 'No recorded tasks for this team yet.')
+                    return
+                chosen = self.select_choice('CCX TEAM HISTORY', options,
+                                            subtitle='Choose a run to read its details or resume it.')
+                if chosen is None:
+                    return
+                choice = str(chosen + 1)
+            else:
+                width, height = shutil.get_terminal_size((100, 28))
+                width, height = max(20, width), max(8, height)
+                page_size = max(1, height - 6)
+                rows = [self._fit(self._paint(' CCX TEAM HISTORY', 'accentb'), width),
+                        self._fit(self._paint(' Select a number · n/p changes page · Enter returns', 'muted'), width),
+                        self._fit(self._paint('─' * width, 'muted'), width)]
+                for index, (_, item, result) in enumerate(entries[offset:offset + page_size], offset + 1):
+                    task = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(item.get('task', '')))
+                    state = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(result.get('status', 'unknown')))
+                    style = 'okb' if state == 'completed' else 'errb' if state == 'failed' else 'muted'
+                    rows.append(self._fit(self._paint(f'  {index}. ', 'muted')
+                                          + self._paint(f'[{state}]', style)
+                                          + self._paint(' ' + self._truncate(task, max(10, width - 20)), ''), width))
+                if not entries:
+                    rows.append(self._fit(self._paint('  No recorded tasks for this team yet.', 'muted'), width))
+                self._previous_rows = None
+                sys.stdout.write('\x1b[H\x1b[2J' + '\n'.join(rows))
+                sys.stdout.write(f'\x1b[{height};1H\x1b[2K\x1b[?25h' + self._paint('History: ', 'accent'))
                 sys.stdout.flush()
+                try:
+                    choice = input().strip()
+                except (EOFError, KeyboardInterrupt):
+                    return
+                finally:
+                    sys.stdout.write('\x1b[?25l')
+                    sys.stdout.flush()
             if not choice or choice.lower() in ('q', 'back'):
                 return
             if choice.lower() in ('n', 'next'):
@@ -990,7 +1449,7 @@ class TeamUI:
                     text += '\n\nSome saved details could not be read.'
                 text += f'\n\nArtifacts: {path}'
                 can_resume = result.get('status') == 'completed' and isinstance(item.get('checkpoint'), dict)
-                if self.show_text('RUN DETAIL', text, allow_resume=can_resume):
+                if self.show_text('RUN DETAIL', text, allow_resume=can_resume, markdown=True):
                     return path, item, result
 
     @staticmethod
@@ -1040,8 +1499,9 @@ class TeamUI:
             return
         width, height = shutil.get_terminal_size((100, 28))
         width, height = max(20, width), max(8, height)
-        result_rows = self._result_rows(width, max(1, height - 9))
-        body_height = max(1, height - 7 - len(result_rows) - (1 if result_rows else 0))
+        bottom = self._composer_rows(width, max(4, height // 3))
+        result_rows = self._result_rows(width, max(1, height - 8 - len(bottom)))
+        body_height = max(1, height - 4 - len(bottom) - len(result_rows) - (1 if result_rows else 0))
         rows = [self._header_row(width), self._rule(width)]
         rows.extend(self._body_rows(width, body_height))
         rows.append(self._rule(width))
@@ -1049,10 +1509,19 @@ class TeamUI:
         if result_rows:
             rows.append(self._rule(width))
         rows.append(self._status_row(width))
-        rows.append(self._footer_row(width))
-        rows = rows[:max(1, height - 2)]
+        rows = rows[:max(1, height - len(bottom))]
+        top = len(rows)
+        rows.extend(bottom)
+        rows = rows[:height]
+        if len(rows) == height:
+            # Leave the last cell empty so the terminal never scrolls the frame.
+            rows[-1] = self._fit(rows[-1], width - 1)
         self._paint_rows(rows)
-        self._write_composer(width, height)
+        if self.composing and self._composer_cursor:
+            row, column = self._composer_cursor
+            sys.stdout.write(f'\x1b[{min(height, top + row + 1)};{column + 1}H\x1b[?25h')
+        else:
+            sys.stdout.write('\x1b[?25l')
         if self.color:
             sys.stdout.write('\x1b[0m')
         sys.stdout.flush()
@@ -1138,6 +1607,11 @@ class TeamUI:
             wrapped = textwrap.wrap(body, width=text_width, break_long_words=True,
                                     break_on_hyphens=False) or ['']
             for index, chunk in enumerate(wrapped):
+                if tag == 'you':
+                    # Plain text inside one style, so the band spans the row.
+                    lead = '▌ ' + tag.ljust(tag_width) + ' ' if index == 0 else '▌' + ' ' * (tag_width + 2)
+                    lines.append(self._paint(self._fit(lead + chunk, width), 'userrow'))
+                    continue
                 if index == 0:
                     prefix = self._paint('▌ ' + tag.ljust(tag_width) + ' ', style)
                 else:
@@ -1146,14 +1620,49 @@ class TeamUI:
         if not lines and not self.visible:
             lines = [self._fit(self._paint('What would you like the team to do?', 'accentb'), width),
                      self._fit(self._paint('Type a task below · /history reviews previous runs', 'muted'), width)]
-        overflow = max(0, len(lines) - room)
-        if overflow:
-            keep = max(1, room - 1)
-            lines = lines[-keep:]
-            lines.insert(0, self._fit(self._paint(f'↑ {overflow} earlier lines · /timeline', 'muted'), width))
+        total = len(lines)
+        self._transcript_view = (total, room)
+        overflow = max(0, total - room)
+        keep = max(1, room - 2)
+        if overflow and self.transcript_top is not None and self.transcript_top < total - keep:
+            top = max(0, self.transcript_top)
+            self.transcript_top = top
+            below = total - top - keep
+            above = (f'↑ {top} earlier lines · PgUp/Home' if top else '· beginning of conversation')
+            lines = ([self._fit(self._paint(above, 'muted'), width)] + lines[top:top + keep]
+                     + [self._fit(self._paint(f'↓ {below} newer lines · PgDn/End to follow', 'accent'), width)])
+        elif overflow:
+            self.transcript_top = None
+            lines = lines[-max(1, room - 1):]
+            lines.insert(0, self._fit(self._paint(f'↑ {overflow} earlier lines · ↑/PgUp to scroll', 'muted'), width))
         else:
             lines = lines[:room] + [self._fit('', width)] * (room - len(lines))
         return [header] + [self._fit(line, width) for line in lines[:room]]
+
+    def scroll_transcript(self, step):
+        """Move the conversation view; a negative step goes back in time.
+
+        ``step`` is a line count, or 'page', '-page', 'home', 'end'. Reaching the
+        newest line switches back to following new output.
+        """
+        total, room = self._transcript_view
+        keep = max(1, room - 2)
+        if total <= room:
+            self.transcript_top = None
+            return False
+        bottom = total - keep
+        top = bottom if self.transcript_top is None else self.transcript_top
+        if step == 'home':
+            top = 0
+        elif step == 'end':
+            top = bottom
+        elif step in ('page', '-page'):
+            top += keep if step == 'page' else -keep
+        else:
+            top += step
+        previous = self.transcript_top
+        self.transcript_top = None if top >= bottom else max(0, top)
+        return self.transcript_top != previous
 
     def _agents_column(self, width, body_rows):
         """Right rail: one compact line per agent, details only when they fit."""
@@ -1203,17 +1712,180 @@ class TeamUI:
             details.append(self._paint(self._truncate('▸ ' + str(line), width), 'muted'))
         return summary, details
 
+    def _inline_segments(self, text, style=None):
+        """Split one line into (text, style) runs for bold and code spans."""
+        segments = []
+        for part in MD_INLINE.split(text):
+            if not part:
+                continue
+            if len(part) > 4 and part[:2] in ('**', '__') and part[-2:] == part[:2]:
+                segments.append((part[2:-2], style or 'bold'))
+            elif len(part) > 2 and part[0] == part[-1] == '`':
+                segments.append((part[1:-1], 'code'))
+            elif len(part) > 2 and part[0] == part[-1] == '*':
+                segments.append((part[1:-1], style or 'italic'))
+            else:
+                segments.append((part, style))
+        return segments
+
+    def _wrap_segments(self, segments, width, first='', rest=''):
+        """Word-wrap styled runs; ``first``/``rest`` prefix the first and later lines."""
+        words = []
+        space = False
+        for text, style in segments:
+            for piece in re.split(r'(\s+)', text):
+                if not piece:
+                    continue
+                if piece.isspace():
+                    space = True
+                    continue
+                words.append((piece, style, space))
+                space = False
+        rest_width = len(self._plain(rest))
+        lines = []
+        current, used, started = first, len(self._plain(first)), False
+        for piece, style, space in words:
+            while piece:
+                gap = 1 if space and started else 0
+                room = width - used - gap
+                if len(piece) <= room:
+                    current += ' ' * gap + self._paint(piece, style)
+                    used += gap + len(piece)
+                    started = True
+                    break
+                if started and len(piece) <= width - rest_width:
+                    lines.append(current)
+                    current, used, started = rest, rest_width, False
+                    continue
+                if room <= 0:
+                    lines.append(current)
+                    current, used, started = rest, rest_width, False
+                    continue
+                current += ' ' * gap + self._paint(piece[:room], style)
+                lines.append(current)
+                current, used, started = rest, rest_width, False
+                piece, space = piece[room:], False
+        lines.append(current)
+        return lines
+
+    def _table_rows(self, block, width):
+        """Render a Markdown table with aligned, wrapped columns."""
+        table = []
+        for line in block:
+            cells = [cell.strip() for cell in line.strip().strip('|').split('|')]
+            if any(cells) and all(re.fullmatch(r':?-+:?', cell) or not cell for cell in cells):
+                continue
+            table.append(cells)
+        if not table:
+            return []
+        count = max(len(row) for row in table)
+        table = [row + [''] * (count - len(row)) for row in table]
+        natural = [max(len(''.join(text for text, _ in self._inline_segments(row[column])))
+                       for row in table) for column in range(count)]
+        widths = [max(3, size) for size in natural]
+        available = width - 1 - 3 * (count - 1)
+        if available < 8 * count:
+            # Too many columns for the terminal: one bullet per row instead.
+            header, rows = table[0], table[1:] or table[:1]
+            out = []
+            for row in rows:
+                text = ' · '.join(f'{name}: {value}' if name and row is not header else value
+                                  for name, value in zip(header, row) if value)
+                out.extend(self._wrap_segments(self._inline_segments(text), width,
+                                               ' ' + self._paint('•', 'accent') + ' ', '   '))
+            return out
+        while sum(widths) > available:
+            widest = max(range(count), key=lambda column: widths[column])
+            widths[widest] -= 1
+        divider = self._paint(' │ ', 'muted')
+        out = []
+        for number, row in enumerate(table):
+            style = 'bold' if number == 0 else None
+            cells = [self._wrap_segments(self._inline_segments(row[column], style), widths[column])
+                     for column in range(count)]
+            for depth in range(max(len(cell) for cell in cells)):
+                out.append(' ' + divider.join(self._fit(cell[depth] if depth < len(cell) else '', widths[column])
+                                              for column, cell in enumerate(cells)).rstrip())
+            if number == 0 and len(table) > 1:
+                out.append(' ' + self._paint('─┼─'.join('─' * size for size in widths), 'muted'))
+        return out
+
+    def markdown_rows(self, text, width):
+        """Lay out Markdown for the terminal: headings, lists, tables, code."""
+        width = max(20, width)
+        text = str(text).replace('\r\n', '\n').replace('\t', '    ')
+        text = re.sub(r'[\x00-\x09\x0b-\x1f\x7f-\x9f]', ' ', text)
+        lines = text.split('\n')
+        out = []
+
+        def gap():
+            if out and out[-1] != '':
+                out.append('')
+
+        index, fenced = 0, False
+        while index < len(lines):
+            line = lines[index]
+            stripped = line.strip()
+            index += 1
+            if stripped.startswith('```'):
+                fenced = not fenced
+                continue
+            if fenced:
+                out.append(self._paint('  │ ', 'muted') + self._paint(self._truncate(line.rstrip(), width - 4), 'code'))
+                continue
+            if not stripped:
+                gap()
+                continue
+            heading = re.match(r'(#{1,6})\s+(.*)', stripped)
+            if heading:
+                gap()
+                title = heading.group(2).rstrip('#').strip()
+                marker = self._paint('▍', 'accent') + ' ' if len(heading.group(1)) <= 2 else ''
+                out.extend(self._wrap_segments(self._inline_segments(title, 'accentb'), width, marker, '  '))
+                continue
+            if re.fullmatch(r'(-\s*){3,}|(\*\s*){3,}|(_\s*){3,}', stripped):
+                out.append(self._paint('─' * width, 'muted'))
+                continue
+            if stripped.startswith('|'):
+                block = [line]
+                while index < len(lines) and lines[index].strip().startswith('|'):
+                    block.append(lines[index])
+                    index += 1
+                gap()
+                out.extend(self._table_rows(block, width))
+                gap()
+                continue
+            bullet = re.match(r'(\s*)[-*+]\s+(.*)', line)
+            if bullet:
+                indent = '  ' * min(3, len(bullet.group(1)) // 2)
+                mark = '•' if not indent else '◦'
+                out.extend(self._wrap_segments(self._inline_segments(bullet.group(2)), width,
+                                               indent + ' ' + self._paint(mark, 'accent') + ' ', indent + '   '))
+                continue
+            numbered = re.match(r'(\s*)(\d+)[.)]\s+(.*)', line)
+            if numbered:
+                indent = '  ' * min(3, len(numbered.group(1)) // 2)
+                label = numbered.group(2) + '.'
+                out.extend(self._wrap_segments(self._inline_segments(numbered.group(3)), width,
+                                               indent + ' ' + self._paint(label, 'accentb') + ' ',
+                                               indent + ' ' * (len(label) + 2)))
+                continue
+            if stripped.startswith('>'):
+                bar = self._paint('│', 'muted') + ' '
+                out.extend(self._wrap_segments(self._inline_segments(stripped[1:].strip()), width, bar, bar))
+                continue
+            out.extend(self._wrap_segments(self._inline_segments(stripped), width))
+        while out and out[-1] == '':
+            out.pop()
+        while out and out[0] == '':
+            out.pop(0)
+        return out or ['']
+
     def _result_rows(self, width, max_height):
         """Result preview: the conclusion stays readable in place, wrapped."""
         if not self.result:
             return []
-        body = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(self.result))
-        wrapped = []
-        for line in body.splitlines():
-            wrapped.extend(textwrap.wrap(line, width=max(20, width - 4), break_long_words=True,
-                                         break_on_hyphens=False) or [''])
-        if not wrapped:
-            wrapped = ['']
+        wrapped = self.markdown_rows(self.result, max(20, width - 4))
         room = max(1, max_height - 1)
         overflow = max(0, len(wrapped) - room)
         shown = wrapped[:room]
@@ -1241,7 +1913,10 @@ class TeamUI:
 
     def _footer_row(self, width):
         """Key hints on the left, artifact directory on the right."""
-        hints = 'ctrl+p commands · tab complete · @file · /history · /result · /quit'
+        if self.running:
+            hints = 'type to queue a task · ↑↓ scroll · esc interrupt'
+        else:
+            hints = 'enter send · / commands · @ files · ↑↓ history · alt+enter newline · ctrl+p palette'
         artifacts = str(self.run_dir) if self.run_dir else ''
         left = self._paint(' ' + hints, 'muted')
         if artifacts and len(hints) + len(artifacts) + 5 < width:
@@ -1249,12 +1924,70 @@ class TeamUI:
             return self._fit(left + ' ' * max(1, gap) + self._paint(artifacts, 'muted'), width)
         return self._fit(left, width)
 
-    def _write_composer(self, width, height):
-        """The composer is marked with a chevron rather than a heavy box."""
-        sys.stdout.write(f'\x1b[{height - 1};1H\x1b[2K' + self._paint('❯ ', 'accentb'))
-        if self.running:
-            sys.stdout.write(self._paint('Queue: ' + self.queue_input, 'muted'))
-        sys.stdout.write(f'\x1b[{height - 1};3H')
+    @staticmethod
+    def _layout_input(text, cursor, inner):
+        """Wrap the draft into box lines and find the cursor's (line, column)."""
+        lines = []
+        position = 0
+        spot = (0, 0)
+        for logical in text.split('\n'):
+            chunks = [logical[index:index + inner] for index in range(0, len(logical), inner)] or ['']
+            for number, chunk in enumerate(chunks):
+                start = position + number * inner
+                last = number == len(chunks) - 1
+                lines.append(chunk)
+                if start <= cursor < start + len(chunk) or (last and cursor == start + len(chunk)):
+                    spot = (len(lines) - 1, cursor - start)
+            position += len(logical) + 1
+        if spot[1] >= inner:
+            lines.insert(spot[0] + 1, '')
+            spot = (spot[0] + 1, 0)
+        return lines, spot
+
+    def _composer_rows(self, width, max_lines):
+        """Bordered input box plus the suggestion list or the key hints."""
+        inner = max(8, width - 6)
+        if self.composing:
+            label, text, cursor = self.compose_label, self.input_buffer, self.input_cursor
+            style = 'accent'
+        elif self.running:
+            label, text, cursor = 'Queue: ', self.queue_input, len(self.queue_input)
+            style = 'muted'
+        else:
+            label, text, cursor = '', '', 0
+            style = 'muted'
+        lines, (line, column) = self._layout_input(label + text, len(label) + cursor, inner)
+        visible = max(1, min(6, max_lines - 3))
+        first = min(max(0, line - visible + 1), max(0, len(lines) - visible))
+        rows = [self._paint('╭' + '─' * (width - 2) + '╮', style)]
+        for index in range(first, min(len(lines), first + visible)):
+            content = lines[index]
+            if index == 0 and label:
+                content = self._paint(content[:len(label)], 'muted') + content[len(label):]
+            if self.composing and not label and not text and index == 0:
+                content = self._paint(COMPOSER_PLACEHOLDER, 'muted')
+            mark = self._paint('❯', 'accentb') if index == 0 else ' '
+            rows.append(self._paint('│', style) + ' ' + mark + ' ' + self._fit(content, inner)
+                        + ' ' + self._paint('│', style))
+        rows.append(self._paint('╰' + '─' * (width - 2) + '╯', style))
+        self._composer_cursor = (1 + line - first, 4 + column)
+        if self.composing and self.suggestions:
+            shown = min(len(self.suggestions), 6)
+            top = min(max(0, self.suggestion_index - shown + 1), len(self.suggestions) - shown)
+            name_width = min(28, max(len(name) for name, _ in self.suggestions[top:top + shown]) + 2)
+            for index in range(top, top + shown):
+                name, description = self.suggestions[index]
+                chosen = index == self.suggestion_index
+                marker = '❯' if chosen else ' '
+                row = f'  {marker} ' + self._paint(self._truncate(name, name_width).ljust(name_width),
+                                                   'accentb' if chosen else 'user')
+                rows.append(self._fit(row + self._paint(description, 'muted' if not chosen else None), width))
+            if len(self.suggestions) > shown:
+                rows.append(self._fit(self._paint(f'    {len(self.suggestions)} matches · ↑↓ choose · tab complete',
+                                                  'muted'), width))
+        else:
+            rows.append(self._footer_row(width))
+        return rows
 
     def _paint_rows(self, rows):
         """Repaint only the rows that changed.
@@ -1287,7 +2020,7 @@ class TeamUI:
             meta.append(f'Elapsed: {self._elapsed()}')
         if self.run_dir:
             meta.append(f'Artifacts: {self.run_dir}')
-        return '\n'.join(meta) + '\n\n' + str(message)
+        return '> ' + ' · '.join(meta) + '\n\n' + str(message)
 
 
 team_ui = None
@@ -1364,6 +2097,14 @@ class Progress:
                     self.show(f"tool: {item.get('server', '')}/{item.get('tool', '')}")
 
 
+RUNNING_SCROLL_KEYS = {
+    '\x1b[A': -1, '\x1bOA': -1, '\x1b[B': 1, '\x1bOB': 1,
+    '\x1b[5~': '-page', '\x1b[6~': 'page',
+    '\x1b[H': 'home', '\x1bOH': 'home', '\x1b[1~': 'home',
+    '\x1b[F': 'end', '\x1bOF': 'end', '\x1b[4~': 'end',
+}
+
+
 def read_running_input(ui, fd, decoder):
     """Accept queued tasks during a running subprocess; Esc stops this process."""
     if not select.select([fd], [], [], 0)[0]:
@@ -1372,10 +2113,23 @@ def read_running_input(ui, fd, decoder):
     if data == b'\x1b':
         return True
     text = decoder.decode(data)
-    if '\x1b' in text:
-        return False  # Ignore terminal key sequences such as arrows.
     changed = False
-    for char in text:
+    # Arrow and page keys scroll the conversation; a mouse wheel in the
+    # alternate screen arrives as arrow keys too. Other sequences are ignored.
+    position = 0
+    plain = []
+    while position < len(text):
+        if text[position] != '\x1b':
+            plain.append(text[position])
+            position += 1
+            continue
+        match = re.match(r'\x1b(\[[0-9;]*[~A-Za-z]|O[A-Za-z])?', text[position:])
+        sequence = match.group(0)
+        position += max(1, len(sequence))
+        step = RUNNING_SCROLL_KEYS.get(sequence)
+        if step is not None and ui.scroll_transcript(step):
+            changed = True
+    for char in plain:
         if char in ('\r', '\n'):
             task = ui.queue_input.strip()
             if task:
@@ -2416,7 +3170,7 @@ def main():
                     if not ui:
                         raise WorkflowError('Task required: ccx <workflow> "your task"')
                     try:
-                        pending = ui.read_command('Task (/history, /result, /quit): ')
+                        pending = ui.read_command(None)
                     except (EOFError, KeyboardInterrupt):
                         break
                 task = pending.strip()
@@ -2427,6 +3181,11 @@ def main():
                     pending = ui.command_palette()
                     continue
                 if ui and task.lower() == '/theme':
+                    if ui._can_pick():
+                        chosen = ui.pick_subcommand('/theme', ui.theme)
+                        if chosen:
+                            pending = '/theme ' + chosen
+                        continue
                     ui.show_text('THEMES', f'Current: {ui.theme}\n\nAvailable: default, ocean, contrast\nUse /theme NAME to change and save.')
                     continue
                 if ui and task.lower().startswith('/theme '):
@@ -2437,7 +3196,15 @@ def main():
                     except (WorkflowError, OSError) as error:
                         ui.show_text('THEME ERROR', str(error))
                     continue
-                if ui and task.lower() == '/queue':
+                if ui and task.lower() == '/queue' and ui._can_pick():
+                    chosen = ui.pick_subcommand('/queue')
+                    if not chosen:
+                        continue
+                    if chosen != 'show':
+                        pending = '/queue ' + chosen
+                        continue
+                    task = '/queue show'
+                if ui and task.lower() in ('/queue', '/queue show'):
                     items = '\n'.join(f'{i}. {item}' for i, item in enumerate(ui.queued_tasks, 1))
                     ui.show_text('QUEUED TASKS', items or 'No queued tasks. Type /queue clear to discard the queue.')
                     continue
@@ -2523,6 +3290,11 @@ def main():
                     ui.show_text('HELP', 'Enter a task to start. Ctrl+P opens the command palette; Tab completes commands and @file paths.\nWhile an agent runs, type and press Enter to queue a task; Esc stops it.\n/queue: list queued tasks; /queue clear: discard them.\n/timeline: show conversation; /agents: pick an agent and read its log.\n/result: open the result preview with the run metadata.\n/files: list files; /diff: show changes; /editor: multiline input.\n/theme NAME: choose default, ocean, or contrast. NO_COLOR=1 disables colour.\n/undo and /redo: restore guarded checkpoints; both need a git checkout.\n/history: list previous runs and resume a matching session.\n/route auto|plan|direct|inspect: select the route for future tasks.\n/proof COMMAND: set the verification command for future tasks. When a task needs one and none was detected, the team asks for it in place.\n/quit: exit.\n\nThe previous successful task and outcome are used as context for the next task in this session.')
                     continue
                 if ui and task.lower() == '/route':
+                    if ui._can_pick():
+                        chosen = ui.pick_subcommand('/route', selected_route)
+                        if chosen:
+                            pending = '/route ' + chosen
+                        continue
                     ui.footer = f'Current route: {selected_route}; use /route auto|plan|direct|inspect'
                     continue
                 if ui and task.lower().startswith('/route '):
@@ -2534,6 +3306,18 @@ def main():
                         ui.footer = 'Invalid route; use auto, plan, direct, or inspect'
                     continue
                 if ui and task == '/proof':
+                    if ui._can_pick():
+                        chosen = ui.pick_subcommand('/proof', config.get('CCX_PROOF', ''), custom=True)
+                        if chosen is None:
+                            continue
+                        if not chosen:
+                            try:
+                                chosen = ui.read_command('Verification command: ').strip()
+                            except (EOFError, KeyboardInterrupt):
+                                chosen = ''
+                        if chosen:
+                            pending = '/proof ' + chosen
+                        continue
                     ui.footer = 'Verification: ' + (config.get('CCX_PROOF') or 'auto-detect')
                     continue
                 if ui and task.startswith('/proof '):
@@ -2577,7 +3361,7 @@ def main():
                     continue
                 if ui and task.lower() == '/result':
                     preview = last_result or 'No completed task yet.'
-                    ui.show_text('RESULT PREVIEW', ui.conclusion_text(preview))
+                    ui.show_text('RESULT PREVIEW', ui.conclusion_text(preview), markdown=True)
                     continue
                 if ui and task.startswith('/'):
                     ui.footer = 'Unknown command; use /help'
@@ -2704,9 +3488,19 @@ def main():
                             ui.footer = ('Completed · undo unavailable: ' + checkpoint['error'] if checkpoint['error'] else
                                          'Completed · /result for conclusion · /undo for file changes')
                         ui.render()
-                        ui.show_text('CONCLUSION', ui.conclusion_text(message))
                         if ui.queued_tasks:
-                            pending = ui.queued_tasks.popleft()
+                            first = ('Run next queued task: ' + ui._truncate(ui.queued_tasks[0], 60), '/queue next')
+                        else:
+                            first = ('New task', None)
+                        actions = [first]
+                        if tracked:
+                            actions.append(('Show changes', '/diff'))
+                        actions.append(('Conversation', '/timeline'))
+                        actions.append(('Agent logs', '/agents'))
+                        if undo_stack:
+                            actions.append(('Undo these changes', '/undo'))
+                        actions.append(('Quit', '/quit'))
+                        pending = ui.show_text('CONCLUSION', ui.conclusion_text(message), actions=actions, markdown=True)
                     else:
                         print(message)
                         return 0
@@ -2728,7 +3522,7 @@ def main():
                     else:
                         ui.footer = 'Failed · /result for details · /undo if changes were recorded'
                         ui.render()
-                        ui.show_text('FAILED', last_result)
+                        ui.show_text('FAILED', last_result, markdown=True)
                 finally:
                     # A verification command typed at the prompt becomes the
                     # session default, so the next task does not ask again.
