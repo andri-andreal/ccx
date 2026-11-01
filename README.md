@@ -43,6 +43,9 @@ behind each.*
   travel with the plan instead of becoming another guess.
 - **Verification command picker** - if no test/build command is detected, the team offers
   the detected command plus the ones that fit the checkout, instead of an empty text prompt.
+- **Interactive team TUI** - a composer with live `/command` and `@file` suggestions,
+  arrow-key pickers for every choice, a scrollable conversation, and results rendered
+  as Markdown with aligned tables.
 - **Codex in any checkout** - Codex refuses to start outside a trusted git repository, so
   ccx registers the project and skips that check; planning works in a plain folder too.
 - **Builder/checker consensus** - exchange fixes and evidence, rerun verification,
@@ -344,25 +347,56 @@ conversation on the left and a live agent rail on the right. The header carries 
 active route, the project path and the current Git branch. Each agent shows a status
 glyph plus its word (`● running`, `✓ done`, `✗ failed`, `○ waiting`), so state never
 depends on colour alone. The current task is pinned at the top of the conversation and
-the active agent's elapsed time runs in the status row. After a task, the conclusion
-appears in a **RESULT** preview block that stays readable in place, and CCX shows the
-full conclusion and stays open. Use `Ctrl+P` or `/commands` for the searchable command
-palette, and Tab to complete slash commands or `@path` file references. Explicit
-`@path` references attach UTF-8 files inside the project (up to 64 KiB each; paths
-with spaces are not yet supported). `/editor` opens `$VISUAL` or `$EDITOR` for a
+the active agent's elapsed time runs in the status row. Your own messages carry a
+full-width highlight, so they stand apart from agent output. While an agent runs, the
+conversation scrolls with ↑/↓, the mouse wheel, PgUp/PgDn and Home/End; it holds its
+place as new output arrives, and End (or scrolling to the bottom) follows again.
+
+After a task, the conclusion appears in a **RESULT** preview block and then in a full
+**CONCLUSION** view. Both render the agent's Markdown for the terminal: headings,
+aligned and wrapped tables, bullet and numbered lists, code blocks, bold, italic and
+`code` spans. The conclusion view ends with a menu of follow-up actions: **New task**
+(or **Run next queued task**), **Show changes**, **Conversation**, **Agent logs**,
+**Undo these changes** and **Quit**. ↑/↓ choose an action and Enter runs it; the mouse
+wheel, ←/→ and PgUp/PgDn scroll the text. While the view is open the terminal reports
+mouse events so the wheel can scroll, so select text with Shift+drag.
+
+Tasks are typed into a bordered composer:
+
+| Key | Action |
+|---|---|
+| `/` | Suggest slash commands with a short description, filtered as you type |
+| `@` | Suggest project files; Enter or Tab inserts the highlighted path |
+| ↑ / ↓ | Choose a suggestion; otherwise move between lines or recall earlier input |
+| Enter | Send, or run the highlighted command |
+| Tab | Complete without sending; commands with choices list them next |
+| Alt+Enter, or `\` then Enter | New line |
+| Esc | Close the suggestions, or clear the line |
+| ←/→, Home/End, Ctrl+A/E/U/K/W | Shell-style editing; pasted text keeps its newlines |
+| Ctrl+P | Command palette |
+
+Every choice is a picker: ↑/↓ move, Enter selects, Esc or `q` goes back and 1-9 jump.
+`/route`, `/theme`, `/queue` and `/proof` sent without an argument open their choices;
+`/proof` lists the commands found in the project and ends with **Type a custom
+command**, the only case that needs typing. `/route plan` style arguments still work.
+When stdin is not an interactive terminal, the team falls back to typed prompts.
+
+Explicit `@path` references attach UTF-8 files inside the project (up to 64 KiB each;
+paths with spaces are not yet supported). `/editor` opens `$VISUAL` or `$EDITOR` for a
 multiline task and submits it after the editor exits successfully.
 
 Colours come from a small semantic palette (cyan for you, green for success, magenta
 for the team, red for failure, dim grey for metadata) and can be turned off with
-`NO_COLOR=1`. `/theme default|ocean|contrast` switches palette.
+`NO_COLOR=1`. `/theme` picks `default`, `ocean` or `contrast` and saves it.
 
-- `/history`: browse prior runs; open one and press `r` to resume its context when
-  the current project matches its saved checkpoint. Earlier runs without a saved
+- `/history`: browse prior runs in a picker; open one and choose **Resume this
+  session** to resume its context when the current project matches its saved
+  checkpoint. **Back** is the default, so Enter never resumes by accident. Earlier runs without a saved
   checkpoint can be viewed but not resumed.
 - `/timeline`, `/agents`, and `/result`: inspect the conversation, the agent rail or
   the latest conclusion. `/agents` lists the running agents and drills into one agent's
-  full log; `/result` opens the result preview with its run metadata. Detail views use
-  `n`/`p` to change pages.
+  full log; `/result` opens the result preview with its run metadata. Detail views
+  scroll with the mouse wheel, ←/→ and PgUp/PgDn.
 - `/files` and `/diff`: list project files and inspect tracked changes; untracked
   paths are listed separately. `/diff` needs a Git checkout.
 - `/undo` and `/redo`: restore the latest recorded CCX file changes. Restoration
@@ -374,12 +408,13 @@ for the team, red for failure, dim grey for metadata) and can be turned off with
 - Outside a Git repository the team still runs. The header shows `· no git`, the
   footer reports that undo and diff are unavailable, and file snapshots are taken
   from disk instead of a commit base.
-- `/route auto|plan|direct|inspect` and `/proof COMMAND`: set the route or
-  verification for later tasks in the current session.
+- `/route` and `/proof`: pick the route (`auto`, `plan`, `direct`, `inspect`) or the
+  verification command for later tasks in the current session; `/route NAME` and
+  `/proof COMMAND` set them directly.
 - While an agent is running, type and press Enter to queue a task, or press Esc
   to stop the current process. The queued task begins after the conclusion is
-  dismissed; `/queue` and `/queue clear` manage queued tasks.
-- `/theme default|ocean|contrast` saves a terminal theme; `/help` lists commands;
+  dismissed (Enter on **Run next queued task**). `/queue` offers show, next and clear.
+- `/theme` saves a terminal theme; `/help` lists commands;
   `/quit` exits.
 
 Runs, normalized activity events, task text, outcomes and checkpoint copies are
@@ -460,10 +495,11 @@ targets (`test`, `check`, `build`), pytest configuration, or unittest tests.
 The default npm placeholder test is ignored. A saved `--proof` takes precedence
 over detection; a runtime `--proof` overrides both. If detection finds nothing, supply `--proof` or use `/proof COMMAND` in the
 interactive session. A plan or direct route requires verification. Review-only runs can proceed without verification.
-In the team TUI, a task that needs a verification command and finds none asks for it
-in place (`Verification command:`) — the answer becomes the session default, so the
-next task does not ask again. Leaving it empty reports that `/proof COMMAND` can
-supply one and the task can be sent again.
+In the team TUI, a task that needs a verification command and finds none offers a
+picker in place: the detected command first, then the ones that fit the checkout, and
+**Type another command** for anything else. The choice becomes the session default, so
+the next task does not ask again. Cancelling reports that `/proof` can supply one and
+the task can be sent again.
 Commands run with your normal local permissions at the target Git root.
 Approval binds the plan hash and inspection binds the change snapshot, including
 staged, untracked and deleted files. Concurrent workflows in the same checkout
