@@ -402,6 +402,23 @@ open a separate screen.
 `/result` opens the latest conclusion full screen with its run metadata. Full-screen
 views scroll with the mouse wheel, ←/→ and PgUp/PgDn.
 
+**Modes.** The footer shows the current mode (`⏵⏵ auto mode`); **Shift+Tab** cycles
+it, and `/mode` picks it from a list:
+
+| Mode | What a task does |
+|---|---|
+| auto | The orchestrator picks a route for each task (default) |
+| plan | Plans and reviews without touching files, then stops: **PLAN READY** offers **Build this plan**, **Revise with feedback** or **Not now** |
+| build | Builds straight away, then verifies and reviews (`direct` route) |
+| inspect | Read-only answers and reviews |
+
+**Build this plan** and `/build` build the approved plan without planning again; the
+build is refused if the project changed since the plan was approved. **Revise with
+feedback** plans again in plan mode with your note added to the task. `/route` still
+works and sets the matching mode (`direct` is build mode). `--route` and
+`--review-only` choose the starting mode. Outside the team TUI, `--route plan` keeps
+running plan, build and review in one go.
+
 Tasks are typed into a bordered composer:
 
 | Key | Action |

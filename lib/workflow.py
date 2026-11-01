@@ -307,6 +307,8 @@ COMMANDS = [
     ('/files', 'List workspace files'),
     ('/requests', 'Inspect HTTP requests the agents made, like Postman'),
     ('/queue', 'Show queued tasks'),
+    ('/mode', 'Pick the mode: auto, plan (stop for approval), build, inspect'),
+    ('/build', 'Build the plan you approved in plan mode'),
     ('/route', 'Show or set the route: auto, plan, direct, inspect'),
     ('/proof', 'Show or set the verification command'),
     ('/editor', 'Write a multiline task in $EDITOR'),
@@ -314,14 +316,23 @@ COMMANDS = [
     ('/help', 'Keys and commands'),
     ('/quit', 'Exit ccx'),
 ]
+# Composer modes (Shift+Tab cycles them) and the route each one runs.
+MODES = ('auto', 'plan', 'build', 'inspect')
+MODE_ROUTES = {'auto': 'auto', 'plan': 'plan', 'build': 'direct', 'inspect': 'inspect'}
+ROUTE_MODES = {'auto': 'auto', 'plan': 'plan', 'direct': 'build', 'inspect': 'inspect'}
+MODE_STYLES = {'auto': 'accent', 'plan': 'warn', 'build': 'ok', 'inspect': 'user'}
 # Commands that take an argument; completing them leaves room to type it.
-ARGUMENT_COMMANDS = {'/route', '/proof', '/theme', '/queue'}
+ARGUMENT_COMMANDS = {'/route', '/proof', '/theme', '/queue', '/mode'}
 # Fixed choices for commands that take one; /proof's are found per project.
 SUBCOMMANDS = {
     '/route': [('auto', 'the orchestrator picks the route per task'),
-               ('plan', 'plan, build, then review'),
+               ('plan', 'plan and review, then stop for your approval'),
                ('direct', 'build straight away, then review'),
                ('inspect', 'read-only review, no file changes')],
+    '/mode': [('auto', 'the orchestrator picks the route per task'),
+              ('plan', 'plan and review, then stop for your approval'),
+              ('build', 'build straight away, then review'),
+              ('inspect', 'read-only answers, no file changes')],
     '/theme': [('default', 'magenta accents'), ('ocean', 'cyan and blue'),
                ('contrast', 'bright, high contrast')],
     '/queue': [('show', 'list queued tasks'), ('next', 'run the next queued task now'),
@@ -663,6 +674,9 @@ class TeamUI:
         self.agent_names = {}
         # HTTP requests the agents made during this task, oldest first.
         self.requests = []
+        # Composer mode and the plan approved in plan mode, waiting for /build.
+        self.mode = 'auto'
+        self.approved = None
         self.flow_used = set()
         self._last_tick = 0.0
         # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
@@ -1219,6 +1233,9 @@ class TeamUI:
             if not buffer and key in ('\x1b[H', '\x1bOH', '\x1b[1~', '\x1b[F', '\x1bOF', '\x1b[4~'):
                 self.scroll_transcript('home' if key in ('\x1b[H', '\x1bOH', '\x1b[1~') else 'end')
                 continue
+            if key == '\x1b[Z':
+                self.mode = MODES[(MODES.index(self.mode) + 1) % len(MODES)]
+                continue
             if key == '\x12':
                 self.history_search = not self.history_search
                 self.suggestions_closed = False
@@ -1655,7 +1672,7 @@ class TeamUI:
         if review_only:
             roles = ['plan', 'review']
         self.visible = (['orchestrate'] if 'orchestrate' in self.visible else []) + roles
-        self.route = 'review-only' if review_only else route
+        self.route = ('plan · awaiting approval' if self.mode == 'plan' else 'review-only') if review_only else route
         self.render()
 
     def reset_task(self):
@@ -2883,9 +2900,11 @@ class TeamUI:
         if self.running:
             hints = 'type to queue a task · ↑↓ scroll · ctrl+o tools · esc interrupt'
         else:
-            hints = 'enter send · / commands · @ files · ↑↓ history · wheel/pgup scroll · ctrl+r search · ctrl+o tools'
+            hints = 'shift+tab mode · enter send · / commands · @ files · ↑↓ history · wheel/pgup scroll · ctrl+r search'
         artifacts = str(self.run_dir) if self.run_dir else ''
-        left = self._paint(' ' + hints, 'muted')
+        chip = f' ⏵⏵ {self.mode} mode '
+        left = self._paint(chip, MODE_STYLES.get(self.mode, 'accent') + 'b') + self._paint(' ' + hints, 'muted')
+        hints = chip + ' ' + hints
         if artifacts and len(hints) + len(artifacts) + 5 < width:
             gap = width - len(hints) - len(artifacts) - 2
             return self._fit(left + ' ' * max(1, gap) + self._paint(artifacts, 'muted'), width)
@@ -4802,8 +4821,9 @@ class Loop:
                 return False
             raise WorkflowError('Stopped: project agents were not accepted.')
 
-    def run(self, task, review_only, route_override='auto'):
+    def run(self, task, review_only, route_override='auto', approved=None):
         self.prepare_agents()
+        self.approved_from = Path(approved) if approved else None
         base = git(self.repo, 'rev-parse', 'HEAD').decode().strip() if self.tracked else ''
         original = project_snapshot(self.repo, base, self.tracked)
         route = 'plan'
@@ -4858,7 +4878,27 @@ class Loop:
             # The proof was asked for after the run folder was written, so the
             # saved configuration has to learn the command that was picked.
             save(self.run_dir / 'workflow.json', self.config)
-        if route == 'direct':
+        if self.approved_from:
+            # Build the plan the user approved in plan mode, without planning again.
+            previous = self.approved_from
+            plan = (previous / 'PLAN.md').read_text()
+            earlier = json.loads((previous / 'review-approval.json').read_text())
+            if sha(plan.encode()) != earlier.get('plan_sha256'):
+                raise WorkflowError('The approved plan file changed; plan again.')
+            if earlier.get('snapshot') != original:
+                raise WorkflowError('The project changed since the plan was approved; plan again.')
+            try:
+                self.api_checks = self.api_checks + validate_api_checks(json.loads((previous / 'plan-checks.json').read_text()))
+            except (OSError, ValueError):
+                pass
+            (self.run_dir / 'PLAN.md').write_text(plan)
+            approval = {'plan_sha256': sha(plan.encode()), 'snapshot': original}
+            save(self.run_dir / 'review-approval.json', {**approval, 'approved_in': previous.name,
+                                                          'review': earlier.get('review')})
+            save(self.run_dir / 'route.json', {'route': 'plan', 'reason': f'approved plan from {previous.name}',
+                                               'source': 'user'})
+            status(f'building the plan approved in {previous.name}')
+        elif route == 'direct':
             plan = 'User task (direct route):\n' + task
             (self.run_dir / 'PLAN.md').write_text(plan)
             approval = {'plan_sha256': sha(plan.encode()), 'snapshot': original}
@@ -4932,6 +4972,7 @@ class Loop:
                 previous = [f for f in review['findings'] if f['severity'] in ('high', 'medium')]
                 feedback = json.dumps(review)
             self.api_checks = self.api_checks + getattr(self, 'plan_checks', [])
+            save(self.run_dir / 'plan-checks.json', getattr(self, 'plan_checks', []))
             if review_only:
                 return ('Plan approved; review-only run finished.\n\nPlan:\n' + plan +
                         '\n\nReview:\n' + review['summary'])
@@ -5086,6 +5127,8 @@ def main():
         team_name = config_path.parent.name
         pending = args.task
         selected_route = args.route
+        if ui:
+            ui.mode = 'plan' if args.review_only else ROUTE_MODES.get(args.route, 'auto')
         last_result = ''
         last_success_result = ''
         last_task = ''
@@ -5113,6 +5156,7 @@ def main():
                         break
                 task = pending.strip()
                 pending = None
+                approved_from = None
                 if ui and task.lower() in ('/quit', '/exit', 'q'):
                     break
                 if ui and task.lower() in ('/', '/commands'):
@@ -5252,7 +5296,8 @@ def main():
                     value = task[7:].strip().lower()
                     if value in ('auto', 'plan', 'direct', 'inspect'):
                         selected_route = value
-                        ui.footer = f'Route set to {value} for this session'
+                        ui.mode = ROUTE_MODES[value]
+                        ui.footer = f'Route set to {value} for this session · {ui.mode} mode'
                     else:
                         ui.footer = 'Invalid route; use auto, plan, direct, or inspect'
                     continue
@@ -5314,6 +5359,28 @@ def main():
                     preview = last_result or 'No completed task yet.'
                     ui.show_text('RESULT PREVIEW', ui.conclusion_text(preview), markdown=True)
                     continue
+                if ui and task.lower() == '/mode':
+                    chosen = ui.pick_subcommand('/mode', ui.mode) if ui._can_pick() else None
+                    if chosen:
+                        pending = '/mode ' + chosen
+                    else:
+                        ui.footer = f'Mode: {ui.mode} · shift+tab cycles auto, plan, build, inspect'
+                    continue
+                if ui and task.lower().startswith('/mode '):
+                    value = task[6:].strip().lower()
+                    if value in MODES:
+                        ui.mode = value
+                        selected_route = MODE_ROUTES[value]
+                        ui.footer = f'Mode set to {value}'
+                    else:
+                        ui.footer = 'Invalid mode; use auto, plan, build, or inspect'
+                    continue
+                if ui and task.lower() == '/build':
+                    if not ui.approved:
+                        ui.footer = 'No approved plan yet · switch to plan mode (shift+tab) and send a task'
+                        continue
+                    task = ui.approved['task']
+                    approved_from = ui.approved['run_dir']
                 if ui and task.startswith('/'):
                     ui.footer = 'Unknown command; use /help'
                     continue
@@ -5321,6 +5388,12 @@ def main():
                     if ui:
                         continue
                     raise WorkflowError('Task required: ccx <workflow> "your task"')
+                run_route, run_review_only = selected_route, args.review_only
+                if ui:
+                    run_route = MODE_ROUTES.get(ui.mode, selected_route)
+                    run_review_only = args.review_only or ui.mode == 'plan'
+                if approved_from:
+                    run_route, run_review_only = 'plan', False
                 if ui:
                     ui.reset_task()
                     ui.footer = 'Preparing task'
@@ -5345,8 +5418,8 @@ def main():
                     # Only routes that change files need a proof command. An
                     # orchestrator may still choose 'inspect', so that case is
                     # settled inside the loop, once the route is known.
-                    if (not run_config['CCX_PROOF'] and not args.review_only
-                            and selected_route != 'inspect' and not run_config.get('CCX_ORCHESTRATOR')):
+                    if (not run_config['CCX_PROOF'] and not run_review_only
+                            and run_route != 'inspect' and not run_config.get('CCX_ORCHESTRATOR')):
                         require_proof(run_config, repo)
                     if root == repo or repo in root.parents:
                         raise WorkflowError('CCX runs directory must be outside the target repository.')
@@ -5414,7 +5487,8 @@ def main():
                         redo_stack.clear()
                         try:
                             message = Loop(args.ccx, run_config, repo, run_dir, profiles,
-                                           before_build=before_build, tracked=tracked).run(model_task, args.review_only, selected_route)
+                                           before_build=before_build, tracked=tracked).run(
+                                model_task, run_review_only, run_route, approved=approved_from)
                         except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                             finish_checkpoint()
                             raise
@@ -5443,10 +5517,31 @@ def main():
                             ui.footer = done + ' · /diff · /result · undo unavailable: ' + checkpoint['error']
                         else:
                             ui.footer = done + ' · /diff · /undo · /result'
+                        if approved_from:
+                            ui.approved = None
+                        if ui.mode == 'plan' and run_review_only and not args.review_only:
+                            ui.approved = {'run_dir': str(run_dir), 'task': task}
+                            ui.footer = done + ' · plan approved · /build to build it'
                         if ui.queued_tasks:
                             # The next queued task starts right away; Esc stops it.
                             pending = ui.queued_tasks.popleft()
                         ui.render()
+                        if ui.approved and not pending and not approved_from and ui._can_pick():
+                            choice = ui.select_choice('PLAN READY', [
+                                ('Build this plan', 'build', 'no new planning; the project must be unchanged'),
+                                ('Revise with feedback', 'revise', 'type what to change, then plan again'),
+                                ('Not now', None, 'build it later with /build')],
+                                subtitle='The plan was reviewed and approved. It is in the conversation above.')
+                            if choice == 'build':
+                                pending = '/build'
+                            elif choice == 'revise':
+                                try:
+                                    feedback = ui.read_command('Feedback: ').strip()
+                                except (EOFError, KeyboardInterrupt):
+                                    feedback = ''
+                                if feedback:
+                                    pending = (task.split('\n\nFeedback on the previous plan:')[0]
+                                               + '\n\nFeedback on the previous plan: ' + feedback)
                     else:
                         print(message)
                         try:

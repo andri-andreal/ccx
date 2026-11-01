@@ -815,6 +815,93 @@ class IntegrationTests(unittest.TestCase):
         ui.reset_task()
         self.assertEqual(ui.task_usage(), {})
 
+    def test_shift_tab_cycles_modes_and_the_footer_shows_it(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = False
+        self.assertEqual(ui.mode, 'auto')
+        seen = []
+        for _ in range(4):
+            ui._compose_keys('\x1b[Z')
+            seen.append(ui.mode)
+        self.assertEqual(seen, ['plan', 'build', 'inspect', 'auto'])
+        self.assertEqual(ui.input_buffer, '')
+        ui.mode = 'plan'
+        self.assertIn('⏵⏵ plan mode', ui._plain(ui._footer_row(140)))
+        self.assertIn('shift+tab mode', ui._plain(ui._footer_row(140)))
+
+    def tui_session(self, env=None):
+        master, slave = pty.openpty()
+        proc = KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo, env=env or {**self.env, 'TERM': 'xterm'},
+                                stdin=slave, stdout=slave, stderr=slave)
+        os.close(slave)
+        def read_until(token):
+            data = b''
+            deadline = time.monotonic() + 15
+            while token not in data:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                    proc.kill()
+                    self.fail(f'Missing {token!r}: {data[-1200:]!r}')
+                data += os.read(master, 65536)
+            return data
+        return master, proc, read_until
+
+    def test_plan_mode_stops_for_approval_then_builds_without_replanning(self):
+        self.workflow()
+        log = self.root / 'mode-prompts.jsonl'
+        master, proc, read_until = self.tui_session({**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(log)})
+        try:
+            with proc:
+                read_until(b'Describe a task')
+                os.write(master, b'\x1b[Z')
+                self.assertIn(b'plan mode', read_until(b'plan mode'))
+                os.write(master, b'Fixture task\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'PLAN READY', picker)
+                self.assertFalse((self.repo / 'implemented.py').exists())
+                os.write(master, b'\r')
+                done = read_until(b'Describe a task')
+                self.assertIn(b'Completed in', done)
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertTrue((self.repo / 'implemented.py').exists())
+            prompts = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(sum('Produce an implementation plan' in p for p in prompts), 1)
+            approvals = sorted((self.root / 'config' / 'runs').glob('team-*/review-approval.json'),
+                               key=lambda path: path.stat().st_mtime)
+            self.assertTrue(json.loads(approvals[-1].read_text()).get('approved_in'))
+        finally:
+            os.close(master)
+
+    def test_build_later_refuses_a_plan_for_a_changed_project(self):
+        self.workflow()
+        master, proc, read_until = self.tui_session()
+        try:
+            with proc:
+                read_until(b'Describe a task')
+                os.write(master, b'/mode plan\n')
+                self.assertIn(b'Mode set to plan', read_until(b'Describe a task'))
+                os.write(master, b'Fixture task\n')
+                read_until(b'q cancel')
+                os.write(master, b'3')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'/build to build it', read_until(b'Describe a task'))
+                (self.repo / 'other.txt').write_text('changed\n')
+                subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+                subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'x'],
+                               cwd=self.repo, check=True)
+                os.write(master, b'/build\n')
+                screen = read_until(b'Describe a task')
+                self.assertIn(b'project changed since the plan', screen)
+                self.assertIn(b'Failed', screen)
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertFalse((self.repo / 'implemented.py').exists())
+        finally:
+            os.close(master)
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')
