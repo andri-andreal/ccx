@@ -672,6 +672,8 @@ class TeamUI:
         self.flow_started = 0.0
         # Agent definition names per panel, shown when they differ from the role.
         self.agent_names = {}
+        # Per panel: agent definition name, its layer and the skills it brings.
+        self.agent_details = {}
         # HTTP requests the agents made during this task, oldest first.
         self.requests = []
         # Composer mode and the plan approved in plan mode, waiting for /build.
@@ -839,6 +841,8 @@ class TeamUI:
         elif kind == 'agents_loaded':
             names = event.get('agents')
             self.agent_names = dict(names) if isinstance(names, dict) else {}
+            details = event.get('details')
+            self.agent_details = dict(details) if isinstance(details, dict) else {}
         elif kind == 'route_selected':
             self.select_route(event['route'], event.get('review_only', False))
         elif kind == 'status':
@@ -1985,7 +1989,7 @@ class TeamUI:
         panel['effort'] = effort or 'default'
         panel['started_at'] = time.monotonic()
         panel['lines'].append(f'{name} started')
-        self.timeline.append((panel['title'], f'{name} started · {model or "CLI default"}', 'status'))
+        self.timeline.append((panel['title'], f'{name} started · {model or "CLI default"}' + self.agent_label(key), 'status'))
         if self.started_at is None:
             self.started_at = time.monotonic()
         self.render()
@@ -2505,6 +2509,14 @@ class TeamUI:
         rows = rows[:body_rows] + [''] * max(0, body_rows - len(rows)) + flow
         return [self._fit(row, width) for row in rows]
 
+    def agent_label(self, key):
+        """` · agent planner + testing, security` for a panel, or nothing."""
+        details = self.agent_details.get(key)
+        if not isinstance(details, dict) or not details.get('name'):
+            return ''
+        skills = details.get('skills') or []
+        return f" · agent {details['name']}" + (' + ' + ', '.join(skills) if skills else '')
+
     def custom_agent(self, key):
         """The agent name for a panel when it is not the plain role name."""
         name = self.agent_names.get(key, '')
@@ -2650,6 +2662,12 @@ class TeamUI:
             meta.append(f'effort {panel["effort"]}')
         if meta:
             details.append(self._paint(self._truncate('model: ' + ' · '.join(meta), width), 'muted'))
+        definition = self.agent_details.get(key)
+        if isinstance(definition, dict) and definition.get('name'):
+            skills = definition.get('skills') or []
+            text = f"agent: {definition['name']} ({definition.get('layer', '')})"
+            text += ' · skills: ' + (', '.join(skills) if skills else 'none')
+            details.append(self._paint(self._truncate(text, width), 'muted'))
         usage = self.panel_usage(panel)
         if usage:
             details.append(self._paint(self._truncate('tokens: ' + usage_text(usage), width), 'muted'))
@@ -3472,6 +3490,13 @@ class Progress:
                             inputs = {}
                         if isinstance(inputs.get('command'), str) and block.get('id'):
                             self.commands[block['id']] = inputs['command']
+                        if block.get('name') == 'Skill' and inputs.get('skill'):
+                            self.show(f"uses skill {inputs['skill']}", 'status')
+                            continue
+                        if block.get('name') in ('Task', 'Agent') and (inputs.get('subagent_type') or inputs.get('description')):
+                            self.show(f"delegates to agent {inputs.get('subagent_type') or 'general'}: "
+                                      f"{inputs.get('description', '')}".rstrip(': '), 'status')
+                            continue
                         detail = next((inputs[k] for k in ('file_path', 'path', 'pattern', 'command') if k in inputs), '')
                         self.show(f"{block.get('name', 'tool')} {detail}".strip(), 'tool')
                     elif block.get('type') == 'text':
@@ -4796,7 +4821,10 @@ class Loop:
                                             | {'skills': [{k: v for k, v in skill.items() if k != 'body'}
                                                           for skill in agent['skills']]}
                                             for role, agent in self.agents.items()})
-        emit_event('agents_loaded', agents={ROLE_PANELS[role]: agent['name'] for role, agent in self.agents.items()})
+        emit_event('agents_loaded', agents={ROLE_PANELS[role]: agent['name'] for role, agent in self.agents.items()},
+                   details={ROLE_PANELS[role]: {'name': agent['name'], 'layer': agent['layer'],
+                                                'skills': [skill['name'] for skill in agent['skills']]}
+                            for role, agent in self.agents.items()})
 
     def ask_project_trust(self, files):
         """Show the project's agent files and let the user decide whether to use them."""

@@ -902,6 +902,31 @@ class IntegrationTests(unittest.TestCase):
         finally:
             os.close(master)
 
+    def test_rail_and_start_lines_show_agent_and_skills(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = False
+        ui.on_event({'type': 'agents_loaded', 'agents': {'review': 'reviewer'},
+                     'details': {'review': {'name': 'reviewer', 'layer': 'builtin', 'skills': ['testing', 'security']},
+                                 'plan': {'name': 'go-architect', 'layer': 'project', 'skills': []}}})
+        ui.begin('review', 'minimax-native', '', 'medium')
+        rows = '\n'.join(ui._agent_block(ui.panels['review'], 70)[1])
+        self.assertIn('agent: reviewer (builtin) · skills: testing, security', rows)
+        self.assertIn(('REVIEW', 'minimax-native started · CLI default · agent reviewer + testing, security', 'status'),
+                      list(ui.timeline))
+        ui.begin('plan', 'codex', 'gpt', 'medium')
+        self.assertIn('agent: go-architect (project) · skills: none', '\n'.join(ui._agent_block(ui.panels['plan'], 70)[1]))
+        # A CLI's own skill or subagent shows as a line of its own.
+        events = []
+        with mock.patch.object(workflow_module, 'emit_event', lambda kind, **payload: events.append(payload)), \
+             mock.patch.object(workflow_module, 'team_ui', None), mock.patch('builtins.print'):
+            progress = workflow_module.Progress('build', 'claude')
+            progress.line(json.dumps({'type': 'assistant', 'message': {'content': [
+                {'type': 'tool_use', 'id': 't1', 'name': 'Skill', 'input': {'skill': 'pdf'}},
+                {'type': 'tool_use', 'id': 't2', 'name': 'Task', 'input': {'subagent_type': 'Explore', 'description': 'find handlers'}}]}}))
+        self.assertEqual([(e['message'], e['category']) for e in events],
+                         [('uses skill pdf', 'status'), ('delegates to agent Explore: find handlers', 'status')])
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')

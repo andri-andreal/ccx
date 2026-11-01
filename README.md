@@ -562,8 +562,13 @@ unless `CCX_TRUST_PROJECT_AGENTS=1` is set.
 - `/roles` in the team TUI lists the roles, opens a definition, and **Edit** opens a
   project copy in `$VISUAL`/`$EDITOR`.
 
-A custom agent name appears in the agent rail (`PLAN (go-architect)`) and on its box in
-the FLOW panel. A profile named `agents` is shadowed by this command.
+While a task runs, every agent in the rail shows the definition and skills it was given
+(`agent: reviewer (builtin) · skills: testing, security`), and its start line in the
+conversation repeats them (`minimax-native started · agent reviewer + testing, security`).
+When a CLI uses its own skills or subagents, such as Claude's Skill and Task tools, the
+conversation shows `uses skill pdf` or `delegates to agent Explore: …` as separate lines
+instead of folding them into the tool-call summary. A custom agent name also appears in
+the rail title (`PLAN (go-architect)`) and on its box in the FLOW panel. A profile named `agents` is shadowed by this command.
 
 Run `ccx new` in a terminal and choose **Plan/build/review loop**. Select
 existing CLI profiles for orchestrator, planner, builder and checker. The builder defaults to
