@@ -468,7 +468,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn('Choosing route', terminal.getvalue())
             self.assertIn('CLI: kimi', terminal.getvalue())
 
-    def test_result_preview_is_rendered_in_place(self):
+    def test_answer_lands_in_the_conversation_from_its_first_line(self):
         class Terminal(io.StringIO):
             def isatty(self): return True
         config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
@@ -477,14 +477,23 @@ class IntegrationTests(unittest.TestCase):
              mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((100, 28))):
             ui = workflow_module.TeamUI(config, '/tmp/run')
             ui.visible = ['review']
-            ui.result = 'Plan approved and the build verified.'
-            ui.result_status = 'completed'
+            ui.timeline.extend(('review', f'tool: read', 'tool') for _ in range(5))
+            answer = 'Answer starts here.\n\n' + '\n'.join(f'- point {n}' for n in range(60))
+            ui.on_event({'type': 'task_finished', 'status': 'completed', 'summary': answer})
+            ui.result = answer
+            ui._previous_rows = None
             ui.render()
             frame = terminal.getvalue()
-            self.assertIn('RESULT', frame)
-            self.assertIn('Plan approved and the build verified.', frame)
-            self.assertIn('completed', frame)
-            self.assertIn('\x1b[', frame)
+            # The answer is read from its first line; no separate RESULT panel.
+            self.assertIn('Answer starts here.', frame)
+            self.assertNotIn('point 59', frame)
+            self.assertIn('newer lines', frame)
+            self.assertNotIn('── RESULT', frame)
+            terminal.seek(0); terminal.truncate()
+            ui.on_event({'type': 'task_finished', 'status': 'failed', 'error': 'checker rejected the build'})
+            ui._previous_rows = None
+            ui.render()
+            self.assertIn('Failed: checker rejected the build', terminal.getvalue())
 
     def test_colour_can_be_disabled_and_status_stays_readable(self):
         class Terminal(io.StringIO):
@@ -791,13 +800,13 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\r')
                 self.assertIn(b'Route set to auto', read_until(b'Describe a task'))
                 os.write(master, b'Fixture task\n')
-                completed = read_until(b'Enter select')
+                # The run ends back at the composer: no screen to dismiss.
+                completed = read_until(b'Describe a task')
                 self.assertIn(b'PLAN', completed)
                 self.assertIn(b'REVIEW', completed)
                 self.assertNotIn(b'EXECUTE', completed)
-                self.assertIn(b'CONCLUSION', completed)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
+                self.assertIn(b'Completed in', completed)
+                self.assertNotIn(b'CONCLUSION', completed)
                 os.write(master, b'/result\n')
                 detail = read_until(b'Enter select')
                 self.assertIn(b'Plan approved', detail)
@@ -815,14 +824,10 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'q')
                 read_until(b'Describe a task')
                 os.write(master, b'Follow-up task\n')
-                second = read_until(b'Enter select')
-                self.assertIn(b'CONCLUSION', second)
-                for label in (b'New task', b'Show changes', b'Agent logs', b'Quit'):
-                    self.assertIn(label, second)
-                # Up from the first action wraps to Quit; no letters typed.
-                os.write(master, b'\x1b[A')
-                time.sleep(0.2)
-                os.write(master, b'\r')
+                second = read_until(b'Describe a task')
+                self.assertIn(b'Completed in', second)
+                self.assertIn(b'/undo', second)
+                os.write(master, b'/quit\n')
                 proc.wait(timeout=10)
                 self.assertEqual(proc.returncode, 0)
             runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
@@ -859,14 +864,12 @@ class IntegrationTests(unittest.TestCase):
                 initial = read_until(b'Describe a task')
                 self.assertNotIn(b'ORCHESTRATOR |', initial)
                 os.write(master, b'Inspect the project\n')
-                output = read_until(b'Enter select')
+                output = read_until(b'Describe a task')
                 self.assertIn(b'ORCHESTRATOR', output)
                 self.assertIn(b'REVIEW', output)
                 self.assertNotIn(b'PLAN |', output)
                 self.assertNotIn(b'EXECUTE |', output)
                 self.assertIn(b'Read-only inspection completed', output)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             saved = (self.root / 'config' / 'profiles' / 'team' / 'workflow.env').read_text()
@@ -909,11 +912,9 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\r')
                 read_until(b'Command: ')
                 os.write(master, b'true\n')
-                output = read_until(b'Enter select')
-                self.assertIn(b'CONCLUSION', output)
+                output = read_until(b'Describe a task')
+                self.assertIn(b'Completed in', output)
                 self.assertIn(b'Verification: true', output)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -948,11 +949,10 @@ class IntegrationTests(unittest.TestCase):
                 read_until(b'Verification command')
                 # Cancelling the picker is the same as leaving the answer empty.
                 os.write(master, b'q')
-                output = read_until(b'Enter select')
+                output = read_until(b'Describe a task')
                 self.assertIn(b'/proof', output)
                 self.assertIn(b'No verification command', output)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
+                self.assertIn(b'Failed', output)
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -1033,12 +1033,9 @@ class IntegrationTests(unittest.TestCase):
             os.write(master, b'First task\n')
             read_until(master, proc, b'Queue: ')
             os.write(master, b'Follow-up queued\n')
-            read_until(master, proc, b'Enter select')
-            os.write(master, b'\n')
-            second = read_until(master, proc, b'Enter select')
-            self.assertIn(b'CONCLUSION', second)
-            os.write(master, b'\n')
-            read_until(master, proc, b'Describe a task')
+            # The queued task starts as soon as the first one completes.
+            second = read_until(master, proc, b'Describe a task')
+            self.assertIn(b'Completed in', second)
             os.write(master, b'/quit\n')
             self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -1055,10 +1052,8 @@ class IntegrationTests(unittest.TestCase):
             read_until(master, proc, b'Queue: ')
             time.sleep(0.2)
             os.write(master, b'\x1b')
-            output = read_until(master, proc, b'Enter select')
+            output = read_until(master, proc, b'Describe a task')
             self.assertIn(b'stopped by user', output)
-            os.write(master, b'\n')
-            read_until(master, proc, b'Describe a task')
             os.write(master, b'/quit\n')
             self.assertEqual(proc.wait(timeout=10), 0)
         finally:
@@ -1088,10 +1083,8 @@ class IntegrationTests(unittest.TestCase):
                     return data
                 read_until(b'Describe a task')
                 os.write(master, b'Attempt task\n')
-                self.assertIn(b'FAILED', read_until(b'Enter select'))
+                self.assertIn(b'Failed', read_until(b'Describe a task'))
                 self.assertTrue((self.repo / 'implemented.py').exists())
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
                 os.write(master, b'/undo\n')
                 self.assertIn(b'Undo complete', read_until(b'Describe a task'))
                 self.assertFalse((self.repo / 'implemented.py').exists())
@@ -1127,14 +1120,10 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'/proof test -f implemented.py\n')
                 self.assertIn(b'Verification command updated', read_until(b'Describe a task'))
                 os.write(master, b'First task\n')
-                read_until(b'Enter select')
-                os.write(master, b'\n')
                 read_until(b'Describe a task')
                 os.write(master, b'Second task\n')
-                second = read_until(b'Enter select')
-                self.assertIn(b'CONCLUSION', second)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
+                second = read_until(b'Describe a task')
+                self.assertIn(b'Completed in', second)
                 os.write(master, b'/undo\n')
                 self.assertIn(b'Undo complete', read_until(b'Describe a task'))
                 self.assertFalse((self.repo / 'implemented.py').exists())
@@ -1149,10 +1138,8 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\n')
                 read_until(b'Describe a task')
                 os.write(master, b'Third task\n')
-                failure = read_until(b'Enter select')
+                failure = read_until(b'Describe a task')
                 self.assertIn(b'clean Git checkout', failure)
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             runs = list((self.root / 'config' / 'runs').glob('team-*/session.json'))
@@ -1233,9 +1220,7 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\r')
                 self.assertIn(b'Session restored', read_until(b'Describe a task'))
                 os.write(master, b'Follow-up\n')
-                read_until(b'Enter select')
-                os.write(master, b'\n')
-                read_until(b'Describe a task')
+                self.assertIn(b'Completed in', read_until(b'Describe a task'))
                 os.write(master, b'/quit\n')
                 self.assertEqual(proc.wait(timeout=10), 0)
             prompts = [json.loads(line) for line in prompt_log.read_text().splitlines()]
@@ -1967,8 +1952,6 @@ class IntegrationTests(unittest.TestCase):
             self.assertIn(b'Which framework?', picker)
             self.assertIn(b'gin', picker)
             os.write(master, b'\r')
-            read_until(b'Enter select')
-            os.write(master, b'\n')
             read_until(b'Describe a task')
         finally:
             if proc.poll() is None:

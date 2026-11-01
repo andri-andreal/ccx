@@ -404,6 +404,8 @@ class TeamUI:
         self._transcript_view = (0, 1)
         # Ctrl+O shows every tool call instead of one summary per run of calls.
         self.expand_tools = False
+        self._focus_last = False
+        self._entry_starts = []
         self._resized = False
         self._previous_winch = None
         self._entry_cache = {}
@@ -546,7 +548,12 @@ class TeamUI:
             self.current_task = event.get('task', '')
             self.timeline.append(('YOU', event.get('task', '')))
         elif kind == 'task_finished':
-            self.timeline.append(('CCX', event.get('summary', event.get('error', ''))))
+            if event.get('status') == 'failed':
+                self.timeline.append(('CCX', 'Failed: ' + str(event.get('error', '')), 'error'))
+            else:
+                self.timeline.append(('CCX', event.get('summary', ''), 'text'))
+            # Show the answer from its first line, not its last.
+            self._focus_last = True
 
     def _on_resize(self, signum=None, frame=None):
         """SIGWINCH: flag a full repaint; the input loops redraw at their next tick."""
@@ -1644,7 +1651,8 @@ class TeamUI:
         width, height = shutil.get_terminal_size((100, 28))
         width, height = max(20, width), max(8, height)
         bottom = self._composer_rows(width, max(4, height // 3))
-        result_rows = self._result_rows(width, max(1, height - 8 - len(bottom)))
+        # The answer lives in the conversation; /result opens it full screen.
+        result_rows = []
         body_height = max(1, height - 4 - len(bottom) - len(result_rows) - (1 if result_rows else 0))
         rows = [self._header_row(width), self._rule(width)]
         rows.extend(self._body_rows(width, body_height))
@@ -1744,7 +1752,11 @@ class TeamUI:
             lines.append(self._fit(self._paint('▌ TASK ', 'accentb') + wrapped[0], width))
             for extra in wrapped[1:]:
                 lines.append(self._fit('       ' + extra, width))
+        lead = len(lines)
         lines.extend(self._timeline_rows(width, text_width, tag_width))
+        if self._focus_last and self._entry_starts:
+            self._focus_last = False
+            self.transcript_top = lead + self._entry_starts[-1]
         if not lines and not self.visible:
             lines = [self._fit(self._paint('What would you like the team to do?', 'accentb'), width),
                      self._fit(self._paint('Type a task below · /history reviews previous runs', 'muted'), width)]
@@ -1773,9 +1785,11 @@ class TeamUI:
                    for entry in self.timeline]
         indent = ' ' * (tag_width + 3)
         rows = []
+        starts = []
         index = 0
         while index < len(entries):
             role, message, kind = entries[index]
+            starts.append(len(rows))
             tag = ROLE_TAGS.get(role, str(role)[:tag_width].lower())
             style = ROLE_STYLES.get(tag, 'accentb')
             head = self._paint('▌ ' + tag.ljust(tag_width) + ' ', style)
@@ -1824,6 +1838,11 @@ class TeamUI:
                         cached.append(self._paint(self._fit(lead + chunk, width), 'userrow'))
                 elif kind == 'status':
                     cached = [self._fit(head + self._paint(' '.join(message.split()), 'muted'), width)]
+                elif kind == 'error':
+                    lead = self._paint('▌ ' + tag.ljust(tag_width) + ' ', 'errb')
+                    body = self.markdown_rows(message, text_width)
+                    cached = [self._fit((lead if number == 0 else indent) + self._paint(self._plain(row), 'err'), width)
+                              for number, row in enumerate(body)]
                 else:
                     body = self.markdown_rows(message, text_width)
                     cached = [self._fit((head if number == 0 else indent) + row, width)
@@ -1832,6 +1851,7 @@ class TeamUI:
                     self._entry_cache.clear()
                 self._entry_cache[key] = cached
             rows.extend(cached)
+        self._entry_starts = starts
         return rows
 
     def scroll_transcript(self, step):
@@ -3777,25 +3797,17 @@ def main():
                         ui.result = message
                         ui.result_status = 'completed'
                         ui.enable_completion(repo)
+                        done = f'✓ Completed in {ui._elapsed()}'
                         if not tracked:
-                            ui.footer = 'Completed · no git repository, undo unavailable'
+                            ui.footer = done + ' · /result · no git repository, undo unavailable'
+                        elif checkpoint['error']:
+                            ui.footer = done + ' · /diff · /result · undo unavailable: ' + checkpoint['error']
                         else:
-                            ui.footer = ('Completed · undo unavailable: ' + checkpoint['error'] if checkpoint['error'] else
-                                         'Completed · /result for conclusion · /undo for file changes')
-                        ui.render()
+                            ui.footer = done + ' · /diff · /undo · /result'
                         if ui.queued_tasks:
-                            first = ('Run next queued task: ' + ui._truncate(ui.queued_tasks[0], 60), '/queue next')
-                        else:
-                            first = ('New task', None)
-                        actions = [first]
-                        if tracked:
-                            actions.append(('Show changes', '/diff'))
-                        actions.append(('Conversation', '/timeline'))
-                        actions.append(('Agent logs', '/agents'))
-                        if undo_stack:
-                            actions.append(('Undo these changes', '/undo'))
-                        actions.append(('Quit', '/quit'))
-                        pending = ui.show_text('CONCLUSION', ui.conclusion_text(message), actions=actions, markdown=True)
+                            # The next queued task starts right away; Esc stops it.
+                            pending = ui.queued_tasks.popleft()
+                        ui.render()
                     else:
                         print(message)
                         return 0
@@ -3815,9 +3827,12 @@ def main():
                         ui.render()
                         ui.show_text('NOT A GIT REPOSITORY', str(error))
                     else:
-                        ui.footer = 'Failed · /result for details · /undo if changes were recorded'
+                        ui.footer = '✗ Failed · /result for details · /undo if changes were recorded'
+                        if not run_dir:
+                            # Nothing reached the conversation; say it there.
+                            ui.timeline.append(('CCX', last_result, 'error'))
+                            ui._focus_last = True
                         ui.render()
-                        ui.show_text('FAILED', last_result, markdown=True)
                 finally:
                     # A verification command typed at the prompt becomes the
                     # session default, so the next task does not ask again.

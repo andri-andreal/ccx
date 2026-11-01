@@ -356,14 +356,17 @@ the conversation. While an agent runs, the conversation scrolls with ↑/↓, th
 wheel, PgUp/PgDn and Home/End; it holds its place as new output arrives, and End (or
 scrolling to the bottom) follows again. The layout redraws when the terminal is resized.
 
-After a task, the conclusion appears in a **RESULT** preview block and then in a full
-**CONCLUSION** view. Both render the agent's Markdown for the terminal: headings,
-aligned and wrapped tables, bullet and numbered lists, code blocks, bold, italic and
-`code` spans. The conclusion view ends with a menu of follow-up actions: **New task**
-(or **Run next queued task**), **Show changes**, **Conversation**, **Agent logs**,
-**Undo these changes** and **Quit**. ↑/↓ choose an action and Enter runs it; the mouse
-wheel, ←/→ and PgUp/PgDn scroll the text. While the view is open the terminal reports
-mouse events so the wheel can scroll, so select text with Shift+drag.
+When a task finishes, the team goes straight back to the composer, like a chat. The
+answer stays in the conversation, laid out as Markdown, and the view jumps to its first
+line so a long answer reads from the top; scroll for the rest. The status row reports
+`✓ Completed in 71.4s · /diff · /undo · /result`, and a queued task starts right away
+(Esc stops it). A failed run is shown in red in the conversation with
+`✗ Failed · /result for details`; only setup errors, such as a missing Git repository,
+open a separate screen.
+
+`/result` opens the latest conclusion full screen with its run metadata. Full-screen
+views scroll with the mouse wheel, ←/→ and PgUp/PgDn; while one is open the terminal
+reports mouse events, so select text there with Shift+drag.
 
 Tasks are typed into a bordered composer:
 
@@ -421,8 +424,8 @@ for the team, red for failure, dim grey for metadata) and can be turned off with
   verification command for later tasks in the current session; `/route NAME` and
   `/proof COMMAND` set them directly.
 - While an agent is running, type and press Enter to queue a task, or press Esc
-  to stop the current process. The queued task begins after the conclusion is
-  dismissed (Enter on **Run next queued task**). `/queue` offers show, next and clear.
+  to stop the current process. The queued task begins as soon as the current one
+  finishes. `/queue` offers show, next and clear.
 - `/theme` saves a terminal theme; `/help` lists commands;
   `/quit` exits.
 
