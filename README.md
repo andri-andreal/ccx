@@ -39,6 +39,7 @@ ccx team            # open the team TUI in your project
 | **Know what it costs** | Input and output tokens per agent and per task, cache hits shown separately, cost for native Claude. |
 | **Watch the hand-offs** | The FLOW panel draws the four agents and animates each hand-off; the rail shows every agent's CLI, model, definition and skills. |
 | **Shape the agents** | Each role has an editable Markdown definition and skills (built-in, yours, or committed with the project), reviewed before use. |
+| **Big goals, milestone by milestone** | `/roadmap <goal>` turns a large goal (say, a new service from scratch) into reviewed milestones with the architecture decisions to keep, then runs them one by one; every milestone carries the goal, the decisions and what earlier milestones built. |
 | **Change course in place** | `/config` swaps a role's CLI, model or effort, the budgets and verification without leaving the window; `/undo` restores the files of the last task. |
 | **Contained** | kimi and MiniMax agents run in a `bwrap` sandbox that hides the rest of your home directory. |
 
@@ -566,6 +567,32 @@ resume; this does not resume the underlying CLI's native conversation. A new
 session starts with a clean-checkout requirement unless a matching run is resumed.
 Follow-up tasks may use unchanged work from the same session; unrelated external
 edits require inspection. Redirected output remains a plain one-task log.
+
+### Roadmap for large goals
+
+One task is one plan, build, verify and review cycle, which suits a change but not a
+system built from scratch. `/roadmap <goal>` plans the larger goal first:
+
+1. The planner reads the project and returns 3 to 10 milestones, each small enough for
+   one task and each leaving the project working and tested, plus the architecture
+   decisions later milestones must keep. The first milestone sets up the skeleton, a
+   verification command and `docs/ARCHITECTURE.md`. The reviewer checks the roadmap with
+   the same rules as a plan (follow-up rounds, a budget picker when rounds run out).
+2. The **ROADMAP** screen lists the milestones with their status and offers **Run next
+   milestone**, **Run all remaining milestones**, **Run a specific milestone**, **Revise
+   the roadmap with feedback** and **Close**.
+3. Each milestone runs as a full plan route. Its task carries the project goal, the
+   decisions, a short outcome of every finished milestone and the names of later ones,
+   so consistency does not depend on the conversation's limited carry-over. In plan
+   mode a milestone still stops at **PLAN READY** for your approval.
+4. A finished milestone is marked done with its outcome and run; **Run all** continues
+   with the next one (Esc stops it) and pauses when a milestone fails, marking it failed.
+   The header shows progress such as `roadmap 2/6`.
+
+The roadmap is stored per project in `~/.config/ccx/roadmaps/` (mode 600), outside the
+checkout, so `/roadmap` resumes it in a later session; a revision keeps milestones that
+are already done. Commit between milestones so each one starts from a clean base and
+`/undo` stays meaningful. `/roadmap <new goal>` asks before replacing an existing roadmap.
 
 ### API checks
 
