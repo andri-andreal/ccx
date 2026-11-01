@@ -544,6 +544,15 @@ trust as `.ccx/agents/`. Checks only reach a local base URL (`localhost`, `127.0
 `::1`); new files the server writes into the project during the checks are removed, and
 a change to an existing file fails the round.
 
+### Default profile
+
+`ccx default test2` makes `ccx` with no arguments open that profile, usually a team
+workflow, so the team TUI is the front door. Single-CLI profiles keep opening their own
+CLI (`ccx claude` starts Claude Code, `ccx codex` starts Codex), which stays the quicker
+choice for one-agent work. `ccx default` prints the current default, `ccx list` marks it
+with `*`, and `ccx default --clear` brings back the help screen. A default whose profile
+was removed is ignored. The choice is stored in `~/.config/ccx/default` (mode 600).
+
 ### Agents and skills per role
 
 Each role (orchestrator, planner, builder, reviewer) has an editable definition: a
@@ -760,6 +769,7 @@ built-in command names (`new`, `list`, `show`, `edit`, `rm`, `help`, `version`).
 | Command | Behavior |
 | --- | --- |
 | `ccx new` | Interactive creation; ↑/↓ selects Single or Loop |
+| `ccx default [name\|--clear]` | Show, set or clear the profile that `ccx` alone opens |
 | `ccx <model-profile> [args...]` | Forward arguments to that profile's CLI |
 | `ccx <workflow> "task"` | Run plan review, implementation, proof and consensus |
 | `ccx <workflow> --review-only "task"` | Create/review a plan without building |

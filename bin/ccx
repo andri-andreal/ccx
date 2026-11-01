@@ -1479,6 +1479,39 @@ router_teardown() {
   return 0
 }
 
+default_file() { printf '%s/default' "$CCX_HOME"; }
+
+default_profile() { # the saved default, only while that profile still exists
+  local name
+  [ -f "$(default_file)" ] || return 1
+  name="$(head -n 1 "$(default_file)" 2>/dev/null)"
+  valid_profile_name "$name" || return 1
+  [ -f "$(profile_dir "$name")/workflow.env" ] || [ -f "$(profile_env "$name")" ] || return 1
+  printf '%s\n' "$name"
+}
+
+cmd_default() {
+  local name="${1:-}"
+  case "$name" in
+    '')
+      if name="$(default_profile)"; then
+        printf '%s\n' "$name"
+      else
+        printf 'No default profile. Set one with: ccx default <workflow-or-profile>\n'
+      fi ;;
+    --clear|-c)
+      rm -f "$(default_file)"
+      printf 'Default profile cleared; ccx alone shows help.\n' ;;
+    *)
+      valid_profile_name "$name" || die "invalid profile name: $name"
+      [ -f "$(profile_dir "$name")/workflow.env" ] || [ -f "$(profile_env "$name")" ] \
+        || die "unknown profile: $name (see ccx list)"
+      mkdir -p "$CCX_HOME"
+      (umask 077; printf '%s\n' "$name" > "$(default_file)")
+      printf 'Default profile: %s · run ccx to open it\n' "$name" ;;
+  esac
+}
+
 cmd_help() {
   cat <<'EOF'
 Usage: ccx <profile> [claude args...]   launch claude with a profile
@@ -1488,6 +1521,7 @@ Usage: ccx <profile> [claude args...]   launch claude with a profile
        ccx new --type loop               save a plan/build/review workflow
        ccx <workflow> "task"              run a saved workflow
        ccx list                         list profiles
+       ccx default [name|--clear]       show, set or clear the profile `ccx` alone opens
        ccx doctor [profile]             diagnose setup/profile (--json)
        ccx certify <profile>            run opt-in capability probes
        ccx logs <profile> [--follow]    show redacted router events
@@ -1500,12 +1534,13 @@ EOF
 
 cmd_list() {
   local pd; pd="$(profiles_dir)"
-  local found=0 d name penv prov url model router
+  local found=0 d name penv prov url model router default_name
+  default_name="$(default_profile 2>/dev/null || true)"
   if [ -d "$pd" ]; then
     for d in "$pd"/*/; do
       [ -d "$d" ] || continue
       if [ -f "$d/workflow.env" ]; then
-        printf '%-16s loop       planner=%s builder=%s reviewer=%s' "$(basename "$d")" \
+        printf '%-16s loop       planner=%s builder=%s reviewer=%s' "$(basename "$d")$([ "$(basename "$d")" != "$default_name" ] || printf '*')" \
           "$(kv_get "$d/workflow.env" CCX_PLANNER)" "$(kv_get "$d/workflow.env" CCX_BUILDER)" "$(kv_get "$d/workflow.env" CCX_REVIEWER)"
         local orchestrator_name; orchestrator_name="$(kv_get "$d/workflow.env" CCX_ORCHESTRATOR)"
         [ -z "$orchestrator_name" ] || printf ' orchestrator=%s' "$orchestrator_name"
@@ -1527,10 +1562,12 @@ cmd_list() {
       fi
       [ "$prov" != codex ] || url='(Codex login)'
       case "$prov" in kimi-cli|mcode) url="(native CLI login)" ;; esac
+      [ "$name" != "$default_name" ] || name="$name*"
       printf '%-16s %-10s %-34s %s\n' "$name" "${prov:-?}" "${url:-(anthropic login)}" "${model:-}"
     done
   fi
   [ "$found" -eq 1 ] || printf 'No profiles yet. Create one: ccx new\n'
+  [ -z "$default_name" ] || printf '\n* default: ccx alone opens %s\n' "$default_name"
 }
 
 cmd_new() {
@@ -2323,11 +2360,17 @@ cmd_version() {
 }
 
 main() {
+  local default_name
+  # `ccx` alone opens the saved default (usually a team workflow); otherwise help.
+  if [ "$#" -eq 0 ] && default_name="$(default_profile)"; then
+    cmd_run "$default_name"
+  fi
   local cmd="${1:-help}"
   case "$cmd" in
     help | -h | --help) cmd_help ;;
     version | --version | -V) cmd_version ;;
     list | ls) cmd_list ;;
+    default) shift; cmd_default "$@" ;;
     new) shift; cmd_new "$@" ;;
     agents)
       shift

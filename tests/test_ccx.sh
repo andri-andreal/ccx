@@ -713,4 +713,32 @@ assert_not_contains "$out" "registered $non_git" "a trusted project is not regis
 out="$(cd "$non_git" && CODEX_HOME="$codex_home" CCX_CODEX_TRUST=off CCX_DRY_RUN=1 "$CCX" codexfix exec --input - 2>&1)"
 assert_not_contains "$out" "would register" "CCX_CODEX_TRUST=off skips the trust registration"
 
+# --- default profile: `ccx` alone opens it ---
+out="$("$CCX" default 2>&1)"; rc=$?
+assert_exit "$rc" 0 "default without one exits 0"
+assert_contains "$out" "No default profile" "default reports none yet"
+out="$("$CCX" default nosuch 2>&1)"; rc=$?
+assert_eq "$rc" 1 "default refuses an unknown profile"
+out="$("$CCX" default ../x 2>&1)"; rc=$?
+assert_eq "$rc" 1 "default refuses an unsafe name"
+out="$("$CCX" default myclaude 2>&1)"; rc=$?
+assert_exit "$rc" 0 "default myclaude exits 0"
+assert_contains "$out" "Default profile: myclaude" "default confirms the choice"
+assert_mode "$CCX_HOME/default" 600 "default file is 600"
+assert_eq "$("$CCX" default)" "myclaude" "default prints the saved profile"
+assert_contains "$("$CCX" list)" "myclaude*" "list marks the default"
+assert_contains "$("$CCX" list)" "* default: ccx alone opens myclaude" "list explains the mark"
+out="$("$CCX" 2>&1)"; rc=$?
+assert_exit "$rc" 0 "ccx alone runs the default profile"
+assert_not_contains "$out" "Usage: ccx" "ccx alone no longer shows help when a default exists"
+assert_contains "$("$CCX" help)" "Usage: ccx" "ccx help still shows help"
+out="$("$CCX" default --clear 2>&1)"
+assert_contains "$out" "cleared" "default --clear confirms"
+assert_contains "$("$CCX" 2>&1)" "Usage: ccx" "ccx alone shows help again after clearing"
+"$CCX" default myclaude >/dev/null
+rm -rf "$CCX_HOME/profiles/myclaude.bak"; mv "$CCX_HOME/profiles/myclaude" "$CCX_HOME/profiles/myclaude.bak"
+assert_contains "$("$CCX" 2>&1)" "Usage: ccx" "a removed default falls back to help"
+mv "$CCX_HOME/profiles/myclaude.bak" "$CCX_HOME/profiles/myclaude"
+"$CCX" default --clear >/dev/null
+
 finish
