@@ -530,6 +530,18 @@ produces a nonzero exit, never an automatic approval. `consensus-rounds.json`
 preserves the dialogue and proof results; `consensus.json` records both parties'
 agreement and the plan/code fingerprints only on success.
 
+Planning converges instead of circling. The planner fills a missing detail that has
+a conventional default (field names, error format, module path, dependency versions)
+and lists it under Assumptions; a decision with no safe default comes back as up to
+three questions with options, asked once in the team TUI before planning again (this
+does not use a round). From the second round the reviewer rechecks its earlier
+findings by id; a new finding can keep the plan from approval only when it is high,
+and a new medium one is kept as low with a note. When the plan rounds still run out,
+the TUI offers **Build with this plan** (open findings go to the builder and the
+approval records `accepted_by_user`), **One more round**, **Add guidance and revise**,
+**Show the plan and findings** or **Stop**. Without a terminal the run stops as before,
+naming the open findings and the saved `PLAN.md`.
+
 Progress is shown automatically: round numbers, profile/model/effort, public
 Claude tool activity or Codex command/file events, elapsed time every 10 seconds,
 review/builder summaries and findings, and verification stdout/stderr. Long

@@ -73,6 +73,8 @@ if schema and 'route' in schema['properties']:
         value['questions'] = json.loads(os.environ['FAKE_QUESTIONS'])
 elif schema and 'plan' in schema['properties']:
     value = {'plan':'Create implemented.py; verify with the configured command.'}
+    if case == 'planner_questions' and 'add up to three questions' in prompt:
+        value['questions'] = [{'question':'Which status values?','options':['active/inactive','active/suspended/left']}]
 elif schema and 'status' in schema['properties']:
     pathlib.Path('implemented.py').write_text('print(42)\n')
     feedback = json.loads(prompt.split('PREVIOUS ROUND / FIX REQUEST:\n',1)[1].split('\nReturn only a JSON object',1)[0])
@@ -91,6 +93,13 @@ elif schema and 'status' in schema['properties']:
 elif schema:
     value = {'verdict':'APPROVED','summary':'Reviewed fixture.', 'findings':[],
              'coverage':['implemented.py'], 'limitations':[]}
+    if case == 'revise_new_medium' and 'CHANGE MANIFEST' not in prompt:
+        if 'PREVIOUS FINDINGS' in prompt:
+            value.update(verdict='REVISE',findings=[{'id':'N1','severity':'medium','path':'plan',
+                'evidence':'A brand-new nit','fix':'Optional polish'}])
+        else:
+            value.update(verdict='REVISE',findings=[{'id':'R1','severity':'high','path':'plan',
+                'evidence':'Missing case','fix':'Add it'}])
     if case == 'revise' and 'CHANGE MANIFEST' not in prompt:
         value.update(verdict='REVISE',findings=[{'id':'R1','severity':'high','path':'plan',
             'evidence':'Missing case','fix':'Add it'}])
@@ -467,6 +476,115 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(ui.panels['orchestrate']['status'], 'done')
             self.assertIn('Choosing route', terminal.getvalue())
             self.assertIn('CLI: kimi', terminal.getvalue())
+
+    def test_follow_up_review_does_not_block_on_new_medium_findings(self):
+        self.workflow()
+        run = self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CASE': 'revise_new_medium'})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        runs = sorted((self.root / 'config' / 'runs').glob('team-*/review-approval.json'))
+        review = json.loads(runs[-1].read_text())['review']
+        self.assertEqual(review['verdict'], 'APPROVED')
+        self.assertEqual(review['findings'][0]['severity'], 'low')
+        self.assertIn('follow-up round', review['findings'][0]['evidence'])
+
+    def test_settle_follow_up_keeps_unresolved_and_new_high_findings(self):
+        previous = [{'id': 'R1', 'severity': 'high', 'path': 'plan', 'evidence': 'x', 'fix': 'y'}]
+        base = {'verdict': 'REVISE', 'summary': 's', 'coverage': [], 'limitations': []}
+        still = workflow_module.settle_follow_up({**base, 'findings': [dict(previous[0], severity='medium')]}, previous)
+        self.assertEqual(still['verdict'], 'REVISE')
+        new_high = workflow_module.settle_follow_up(
+            {**base, 'findings': [{'id': 'N9', 'severity': 'high', 'path': 'p', 'evidence': 'e', 'fix': 'f'}]}, previous)
+        self.assertEqual(new_high['verdict'], 'REVISE')
+        nit = workflow_module.settle_follow_up(
+            {**base, 'findings': [{'id': 'N2', 'severity': 'medium', 'path': 'p', 'evidence': 'e', 'fix': 'f'}]}, previous)
+        self.assertEqual(nit['verdict'], 'APPROVED')
+        self.assertEqual(nit['findings'][0]['severity'], 'low')
+
+    def test_exhausted_plan_budget_without_a_terminal_keeps_the_plan(self):
+        self.workflow()
+        run = self.ccx('team', 'Implement fixture', ok=False, env={**self.env, 'FAKE_CASE': 'revise'})
+        self.assertIn('round budget exhausted (1 high open)', run.stderr)
+        self.assertIn('PLAN.md', run.stderr)
+
+    def test_exhausted_plan_budget_offers_to_build_in_the_tui(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        try:
+            with subprocess.Popen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'revise'},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Describe a task')
+                os.write(master, b'/proof test -f implemented.py\n')
+                read_until(b'Describe a task')
+                os.write(master, b'Implement fixture\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'PLAN REVIEW BUDGET USED UP', picker)
+                self.assertIn(b'Build with this plan (1 high open)', picker)
+                os.write(master, b'\r')
+                done = read_until(b'Describe a task')
+                self.assertIn(b'Completed in', done)
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            self.assertTrue((self.repo / 'implemented.py').exists())
+            approval = sorted((self.root / 'config' / 'runs').glob('team-*/review-approval.json'))[-1]
+            self.assertTrue(json.loads(approval.read_text())['accepted_by_user'])
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+
+    def test_planner_questions_are_asked_once_without_using_a_round(self):
+        self.workflow()
+        master, slave = pty.openpty()
+        prompt_log = self.root / 'planner-prompts.jsonl'
+        try:
+            with subprocess.Popen([str(CCX), 'team', '--review-only'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'planner_questions',
+                                       'FAKE_PROMPT_LOG': str(prompt_log)},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Describe a task')
+                os.write(master, b'Build employees\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'Which status values?', picker)
+                os.write(master, b'2')
+                read_until(b'q cancel')
+                os.write(master, b'\r')
+                self.assertIn(b'Completed in', read_until(b'Describe a task'))
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+            prompts = [json.loads(line) for line in prompt_log.read_text().splitlines()]
+            planner = [p for p in prompts if 'Produce an implementation plan' in p]
+            self.assertEqual(len(planner), 2)
+            self.assertIn('active/suspended/left', planner[1])
+            self.assertIn('Record those as unresolved questions', planner[1])
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
 
     def test_answer_lands_in_the_conversation_from_its_first_line(self):
         class Terminal(io.StringIO):
