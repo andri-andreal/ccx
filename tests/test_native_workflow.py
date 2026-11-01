@@ -6,6 +6,7 @@ import os
 import pty
 import re
 import select
+import stat
 from pathlib import Path
 import subprocess
 import tempfile
@@ -573,6 +574,76 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(ui.input_buffer, 'hello Xworld')
         keys('\x05\x17')
         self.assertEqual(ui.input_buffer, 'hello ')
+
+    def test_transcript_groups_tool_calls_and_lays_out_agent_markdown(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = False
+        ui.on_event({'type': 'agent_started', 'phase': 'review', 'profile': 'minimax', 'model': ''})
+        for message in ('tool: read', 'tool: read', 'still running (10s elapsed)', 'tool: grep', 'tool: bash'):
+            ui.on_event({'type': 'activity', 'phase': 'review', 'message': message})
+        ui.on_event({'type': 'activity', 'phase': 'review', 'category': 'text',
+                     'message': '## Findings\n\n- **CI** missing\n- `lockfile` duplicated'})
+        rows = [ui._plain(row).rstrip() for row in ui._timeline_rows(80, 71, 6)]
+        self.assertIn('▌ review ⏺ 4 tool calls · read 2 · grep 1 · bash 1', rows)
+        self.assertTrue(any('└ bash' in row and 'ctrl+o expand' in row for row in rows))
+        self.assertFalse(any('still running' in row for row in rows))
+        self.assertIn('▌ review ▍ Findings', rows)
+        self.assertTrue(any(row.endswith('• CI missing') for row in rows))
+        self.assertTrue(any(row.endswith('• lockfile duplicated') for row in rows))
+        ui.expand_tools = True
+        rows = [ui._plain(row).rstrip() for row in ui._timeline_rows(80, 71, 6)]
+        self.assertEqual(sum('⏺ read' in row for row in rows), 2)
+        self.assertFalse(any('still running' in row for row in rows))
+        # The rail stays one line per entry even for multi-line agent text.
+        self.assertTrue(all('\n' not in line for line in ui.panels['review']['lines']))
+
+    def test_diff_view_colours_changes_and_summarises_files(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = True
+        diff = ('diff --git a/app.py b/app.py\nindex 1..2 100644\n--- a/app.py\n+++ b/app.py\n'
+                '@@ -1,2 +1,2 @@\n-old = 1\n+new = 2\n context\n')
+        rows = ui.diff_rows(diff, 60)
+        plain = [ui._plain(row) for row in rows]
+        self.assertEqual(plain[0], '1 file changed  +1 -1')
+        self.assertIn('▍ app.py', plain)
+        self.assertIn(ui._paint('+new = 2', 'ok'), rows)
+        self.assertIn(ui._paint('-old = 1', 'err'), rows)
+        self.assertIn(ui._paint('@@ -1,2 +1,2 @@', 'accent'), rows)
+
+    def test_composer_history_persists_and_ctrl_r_searches_it(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {'CCX_HOME': home}):
+            ui = workflow_module.TeamUI(config, '/tmp/run')
+            self.assertEqual(ui.input_history, [])
+            for task in ('fix the login bug', 'add tests for sync', 'fix the logout bug'):
+                ui._compose_keys(task)
+                sent = ui._compose_keys('\r')
+                ui._save_history(sent)
+            history = Path(home) / 'tui-history.jsonl'
+            self.assertEqual(stat.S_IMODE(history.stat().st_mode), 0o600)
+            again = workflow_module.TeamUI(config, '/tmp/run')
+            self.assertEqual(again.input_history[-1], 'fix the logout bug')
+            # Ctrl+R lists matching entries, newest first; Enter puts one back to edit.
+            again._compose_keys('\x12fix')
+            self.assertEqual([item[2] for item in again.suggestions], ['fix the logout bug', 'fix the login bug'])
+            again._compose_keys('\x1b[B\r')
+            self.assertFalse(again.history_search)
+            self.assertEqual(again.input_buffer, 'fix the login bug')
+            # Fuzzy @file matching finds letters in order.
+            again.completion_files = ['lib/workflow.py', 'README.md', 'bin/ccx']
+            again._compose_keys('\x1b')
+            again._compose_keys('see @wfpy')
+            self.assertEqual(again.suggestions[0][0], '@lib/workflow.py')
+
+    def test_resize_flags_a_full_repaint(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui._previous_rows = ['old frame']
+        ui._on_resize()
+        self.assertTrue(ui._resized)
+        self.assertIsNone(ui._previous_rows)
 
     def test_result_markdown_is_laid_out_for_the_terminal(self):
         config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
@@ -1300,7 +1371,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(process.returncode,0,seen+out+err)
             self.assertNotIn('PRIVATE_REASONING_DO_NOT_DISPLAY',seen+out)
             self.assertIn('APPROVED:',out)
-            self.assertIn('item.started: rg security',out)
+            self.assertIn('review: bash rg security',out)
         raw = next((self.root / 'config/runs').glob('team-*/01-plan/stdout.txt')).read_text()
         self.assertIn('PRIVATE_REASONING_DO_NOT_DISPLAY',raw)
 

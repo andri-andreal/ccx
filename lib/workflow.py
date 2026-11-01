@@ -95,6 +95,7 @@ SUBCOMMANDS = {
     '/queue': [('show', 'list queued tasks'), ('next', 'run the next queued task now'),
                ('clear', 'discard every queued task')],
 }
+HISTORY_LIMIT = 500
 COMPOSER_PLACEHOLDER = 'Describe a task · / for commands · @ to attach a file'
 # One key or terminal sequence per match; group 1 is bracketed-paste text.
 KEY_TOKEN = re.compile(r'\x1b\[200~(.*?)\x1b\[201~|\x1b\[[0-9;?]*[~A-Za-z]|\x1bO[A-Za-z]'
@@ -364,7 +365,10 @@ def load_conversation(root, selected, team, repo):
                         continue
                     if event.get('type') == 'activity':
                         label = str(event.get('phase', 'agent')).upper()
-                        lines.append((label, str(event.get('message', ''))))
+                        message = str(event.get('message', ''))
+                        kind = event.get('category') or activity_kind(message)
+                        if kind != 'heartbeat':
+                            lines.append((label, message, kind))
                     elif event.get('type') == 'task_finished':
                         lines.append(('CCX', str(event.get('summary', event.get('error', '')))))
             except OSError:
@@ -398,6 +402,11 @@ class TeamUI:
         # First transcript line shown while scrolled back; None follows the newest.
         self.transcript_top = None
         self._transcript_view = (0, 1)
+        # Ctrl+O shows every tool call instead of one summary per run of calls.
+        self.expand_tools = False
+        self._resized = False
+        self._previous_winch = None
+        self._entry_cache = {}
         self.running = False
         self.spinner_frame = 0
         self.entered = False
@@ -409,6 +418,7 @@ class TeamUI:
         self.input_buffer = ''
         self.input_cursor = 0
         self.input_history = []
+        self.history_search = False
         self._history_position = 0
         self._history_draft = ''
         self.suggestions = []
@@ -421,6 +431,9 @@ class TeamUI:
         self._previous_rows = None
         self.theme = 'default'
         self.theme_path = Path(os.environ.get('CCX_HOME', str(Path.home() / '.config' / 'ccx'))) / 'tui.json'
+        self.history_path = self.theme_path.parent / 'tui-history.jsonl'
+        self.input_history = self._load_history()
+        self._history_position = len(self.input_history)
         try:
             settings = json.loads(self.theme_path.read_text())
             if isinstance(settings, dict) and settings.get('theme') in ('default', 'ocean', 'contrast'):
@@ -524,7 +537,7 @@ class TeamUI:
         elif kind == 'agent_finished':
             self.done(phase, event.get('ok', True))
         elif kind == 'activity':
-            self.update(phase, event.get('message', ''))
+            self.update(phase, event.get('message', ''), event.get('category'))
         elif kind == 'route_selected':
             self.select_route(event['route'], event.get('review_only', False))
         elif kind == 'status':
@@ -535,16 +548,31 @@ class TeamUI:
         elif kind == 'task_finished':
             self.timeline.append(('CCX', event.get('summary', event.get('error', ''))))
 
+    def _on_resize(self, signum=None, frame=None):
+        """SIGWINCH: flag a full repaint; the input loops redraw at their next tick."""
+        self._resized = True
+        self._previous_rows = None
+
     def enter(self):
         if self.enabled:
             if not self.entered:
                 sys.stdout.write('\x1b[?1049h\x1b[?25l')
                 self.entered = True
+                try:
+                    self._previous_winch = signal.signal(signal.SIGWINCH, self._on_resize)
+                except (ValueError, OSError, AttributeError):
+                    self._previous_winch = None
             self._previous_rows = None
             self.render()
 
     def exit(self):
         if self.enabled and self.entered:
+            if self._previous_winch is not None:
+                try:
+                    signal.signal(signal.SIGWINCH, self._previous_winch)
+                except (ValueError, OSError):
+                    pass
+                self._previous_winch = None
             sys.stdout.write('\x1b[?25h\x1b[?1049l')
             sys.stdout.flush()
             self.entered = False
@@ -688,8 +716,9 @@ class TeamUI:
             query = selection
 
     def show_timeline(self):
-        content = '\n\n'.join(f'{role}: {message}' for role, message in self.timeline)
-        self.show_text('CONVERSATION', content or 'No messages yet.')
+        content = '\n\n'.join(f'**{entry[0]}** · {entry[1]}' if (entry[2:] or ('text',))[0] == 'text'
+                                else f'`{entry[0]}` {entry[1]}' for entry in self.timeline)
+        self.show_text('CONVERSATION', content or 'No messages yet.', markdown=True)
 
     def show_agents(self):
         """Pick an agent, then page through its full activity log."""
@@ -796,12 +825,19 @@ class TeamUI:
         self.suggestions_closed = False
         self._history_position = len(self.input_history)
         self._history_draft = ''
+        self.history_search = False
         self._previous_rows = None
         sys.stdout.write('\x1b[?2004h')
         try:
             self.render()
             pending = b''
             while True:
+                if not select.select([fd], [], [], 0.25)[0]:
+                    if self._resized:
+                        self._resized = False
+                        self._previous_rows = None
+                        self.render()
+                    continue
                 data = os.read(fd, 4096)
                 if not data:
                     raise EOFError
@@ -815,6 +851,8 @@ class TeamUI:
                 pending = b''
                 submitted = self._compose_keys(text)
                 if submitted is not None:
+                    if getattr(self, '_recorded', None) == submitted:
+                        self._save_history(submitted)
                     return submitted
                 self.render()
         finally:
@@ -835,6 +873,17 @@ class TeamUI:
                 self._insert(re.sub(r'[\x00-\x09\x0b-\x1f\x7f]', '', pasted))
                 continue
             buffer, cursor = self.input_buffer, self.input_cursor
+            if self.history_search and key in ('\r', '\n', '\t', '\x1b'):
+                if self.suggestions and key != '\x1b':
+                    self._accept_suggestion()
+                self.history_search = False
+                self.suggestions = []
+                continue
+            if key == '\x12':
+                self.history_search = not self.history_search
+                self.suggestions_closed = False
+                self._refresh_suggestions()
+                continue
             if key in ('\r', '\n'):
                 if self.suggestions:
                     name = self.suggestions[self.suggestion_index][0]
@@ -894,6 +943,8 @@ class TeamUI:
                 self._changed()
             elif key == '\x0c':
                 self._previous_rows = None
+            elif key == '\x0f':
+                self.expand_tools = not self.expand_tools
             elif key in ('\x1b[A', '\x1bOA', '\x1b[B', '\x1bOB', '\x10', '\x0e'):
                 self._vertical(-1 if key in ('\x1b[A', '\x1bOA') else 1)
             elif key == '\x1b':
@@ -919,8 +970,10 @@ class TeamUI:
         self._refresh_suggestions()
 
     def _submit(self, text, remember=True):
+        self._recorded = None
         if remember and text.strip() and (not self.input_history or self.input_history[-1] != text):
             self.input_history.append(text)
+            self._recorded = text
         self._history_position = len(self.input_history)
         self._history_draft = ''
         self.input_buffer, self.input_cursor = '', 0
@@ -968,6 +1021,17 @@ class TeamUI:
             return
         buffer = self.input_buffer
         before = buffer[:self.input_cursor]
+        if self.history_search:
+            query = buffer.lower()
+            seen = set()
+            for entry in reversed(self.input_history):
+                if entry in seen or query not in entry.lower():
+                    continue
+                seen.add(entry)
+                self.suggestions.append((' '.join(entry.split()), '', entry))
+                if len(self.suggestions) >= 100:
+                    break
+            return
         if buffer.startswith('/') and not any(char.isspace() for char in buffer):
             query = buffer.lower()
             exact = [item for item in COMMANDS if item[0] == query]
@@ -986,11 +1050,31 @@ class TeamUI:
                 files = self.completion_files
                 starts = [name for name in files if name.lower().startswith(query)]
                 inside = [name for name in files if query in name.lower() and not name.lower().startswith(query)]
-                self.suggestions = [('@' + name, '') for name in (starts + inside)[:200]]
+                ranked = starts + inside
+                if len(ranked) < 200 and query:
+                    # Fuzzy: the query's letters in order, e.g. "wfpy" -> lib/workflow.py.
+                    chosen = set(ranked)
+                    scored = []
+                    for name in files:
+                        if name in chosen:
+                            continue
+                        score = fuzzy_score(query, name.lower())
+                        if score is not None:
+                            scored.append((score, name))
+                    ranked += [name for _, name in sorted(scored)]
+                self.suggestions = [('@' + name, '') for name in ranked[:200]]
 
     def _accept_suggestion(self):
         """Put the highlighted suggestion into the line without sending it."""
-        name = self.suggestions[self.suggestion_index][0]
+        suggestion = self.suggestions[self.suggestion_index]
+        if self.history_search:
+            self.input_buffer = suggestion[2]
+            self.input_cursor = len(self.input_buffer)
+            self.history_search = False
+            self.suggestions = []
+            self.suggestions_closed = True
+            return
+        name = suggestion[0]
         if name.startswith('/'):
             self.input_buffer = name + (' ' if name in ARGUMENT_COMMANDS else '')
             self.input_cursor = len(self.input_buffer)
@@ -1005,6 +1089,41 @@ class TeamUI:
             self.input_cursor = start + len(name) + 1
         self.suggestions = []
         self.suggestions_closed = True
+
+    def _load_history(self):
+        """Earlier composer input, oldest first; a damaged file is ignored."""
+        try:
+            with self.history_path.open('rb') as stream:
+                stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, stream.tell() - 524288))
+                raw = stream.read().decode('utf-8', errors='replace')
+        except OSError:
+            return []
+        entries = []
+        for line in raw.splitlines():
+            try:
+                value = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(value, str) and value.strip():
+                entries.append(value)
+        return entries[-HISTORY_LIMIT:]
+
+    def _save_history(self, text):
+        """Append one sent line; the file is private and trimmed when it grows."""
+        try:
+            self.history_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(self.history_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, 'a', encoding='utf-8') as stream:
+                stream.write(json.dumps(text) + '\n')
+            if self.history_path.stat().st_size > 1048576:
+                kept = self.input_history[-HISTORY_LIMIT:]
+                temporary = self.history_path.with_suffix('.tmp')
+                temporary.write_text(''.join(json.dumps(item) + '\n' for item in kept), encoding='utf-8')
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, self.history_path)
+        except OSError:
+            pass
 
     def subcommand_options(self, command):
         """Choices for a command's argument: fixed lists, or project proof commands."""
@@ -1063,6 +1182,12 @@ class TeamUI:
                 fd = None
         try:
             while True:
+                width, height = shutil.get_terminal_size((100, 28))
+                width, height = max(20, width), max(8, height)
+                visible = max(3, height - 7)
+                if index >= top + visible:
+                    top = index - visible + 1
+                self._resized = False
                 rows = self._choice_rows(title, options, index, top, visible, subtitle, width)
                 hint = '↑↓ move · ⏎ select · q cancel · 1-9 jump'
                 if len(options) > visible:
@@ -1138,6 +1263,9 @@ class TeamUI:
             except (OSError, ValueError):
                 return None
         try:
+            while not select.select([fd], [], [], 0.25)[0]:
+                if self._resized:
+                    return 'resize'
             data = os.read(fd, 1)
             if data != b'\x1b':
                 return data.decode('utf-8', 'replace')
@@ -1206,7 +1334,7 @@ class TeamUI:
             panel['effort'] = ''
             panel['started_at'] = None
 
-    def show_text(self, title, body, allow_resume=False, actions=None, markdown=False):
+    def show_text(self, title, body, allow_resume=False, actions=None, markdown=False, diff=False):
         """Show a scrollable text view with a picker of follow-up actions.
 
         ``actions`` is a list of ``(label, value)`` pairs moved through with the
@@ -1217,15 +1345,21 @@ class TeamUI:
         bytes.
         """
         clean = re.sub(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]', ' ', str(body))
-        width, height = shutil.get_terminal_size((100, 28))
-        width, height = max(20, width), max(8, height)
-        if markdown:
-            lines = self.markdown_rows(clean, width - 2)
-        else:
+
+        def layout():
+            width, height = shutil.get_terminal_size((100, 28))
+            width, height = max(20, width), max(8, height)
+            if diff:
+                return width, height, self.diff_rows(clean, width - 1)
+            if markdown:
+                return width, height, self.markdown_rows(clean, width - 2)
             lines = []
             for line in clean.splitlines():
                 lines.extend(textwrap.wrap(line, width=max(1, width - 2),
                                            break_long_words=True, break_on_hyphens=False) or [''])
+            return width, height, lines
+
+        width, height, lines = layout()
         if actions is None:
             # Back stays first so Enter never resumes a session by accident.
             choices = [('Back', False)] + ([('Resume this session', True)] if allow_resume else [])
@@ -1251,6 +1385,13 @@ class TeamUI:
         sys.stdout.write('\x1b[?1000h\x1b[?1006h')
         try:
             while True:
+                if self._resized:
+                    self._resized = False
+                    width, height, lines = layout()
+                    page_size = max(1, height - 4 - len(choices))
+                    last_offset = max(0, len(lines) - page_size)
+                    scrollable = len(lines) > page_size
+                    offset = min(offset, last_offset)
                 page = lines[offset:offset + page_size]
                 span = f'({min(offset + 1, len(lines))}-{min(offset + page_size, len(lines))}/{len(lines)})'
                 rows = [self._fit(self._paint(' ' + title, 'accentb') + '  ' + self._paint(span, 'muted'), width),
@@ -1470,7 +1611,7 @@ class TeamUI:
         panel['effort'] = effort or 'default'
         panel['started_at'] = time.monotonic()
         panel['lines'].append(f'{name} started')
-        self.timeline.append((panel['title'], f'{name} started · {model or "CLI default"}'))
+        self.timeline.append((panel['title'], f'{name} started · {model or "CLI default"}', 'status'))
         if self.started_at is None:
             self.started_at = time.monotonic()
         self.render()
@@ -1485,13 +1626,16 @@ class TeamUI:
                 panel['lines'].append(f'finished in {time.monotonic() - started:.1f}s')
         self.render()
 
-    def update(self, label, message):
+    def update(self, label, message, kind=None):
         key = self.panel_for(label)
+        kind = kind or activity_kind(str(message))
         if key:
-            self.panels[key]['lines'].append(message)
-            self.timeline.append((self.panels[key]['title'], message))
+            if kind != 'heartbeat':
+                # The rail is one line per entry; the transcript keeps the text.
+                self.panels[key]['lines'].append(' '.join(str(message).split())[:400])
+                self.timeline.append((self.panels[key]['title'], message, kind))
         else:
-            self.footer = message
+            self.footer = ' '.join(str(message).split())
         self.render()
 
     def render(self):
@@ -1600,23 +1744,7 @@ class TeamUI:
             lines.append(self._fit(self._paint('▌ TASK ', 'accentb') + wrapped[0], width))
             for extra in wrapped[1:]:
                 lines.append(self._fit('       ' + extra, width))
-        for role, message in self.timeline:
-            tag = ROLE_TAGS.get(role, str(role)[:tag_width].lower())
-            style = ROLE_STYLES.get(tag, 'accentb')
-            body = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(message))
-            wrapped = textwrap.wrap(body, width=text_width, break_long_words=True,
-                                    break_on_hyphens=False) or ['']
-            for index, chunk in enumerate(wrapped):
-                if tag == 'you':
-                    # Plain text inside one style, so the band spans the row.
-                    lead = '▌ ' + tag.ljust(tag_width) + ' ' if index == 0 else '▌' + ' ' * (tag_width + 2)
-                    lines.append(self._paint(self._fit(lead + chunk, width), 'userrow'))
-                    continue
-                if index == 0:
-                    prefix = self._paint('▌ ' + tag.ljust(tag_width) + ' ', style)
-                else:
-                    prefix = ' ' * (gutter + 1 + tag_width + 1)
-                lines.append(self._fit(prefix + chunk, width))
+        lines.extend(self._timeline_rows(width, text_width, tag_width))
         if not lines and not self.visible:
             lines = [self._fit(self._paint('What would you like the team to do?', 'accentb'), width),
                      self._fit(self._paint('Type a task below · /history reviews previous runs', 'muted'), width)]
@@ -1638,6 +1766,73 @@ class TeamUI:
         else:
             lines = lines[:room] + [self._fit('', width)] * (room - len(lines))
         return [header] + [self._fit(line, width) for line in lines[:room]]
+
+    def _timeline_rows(self, width, text_width, tag_width):
+        """Transcript rows: Markdown for agent text, one summary per run of tool calls."""
+        entries = [(entry[0], str(entry[1]), entry[2] if len(entry) > 2 else activity_kind(str(entry[1])))
+                   for entry in self.timeline]
+        indent = ' ' * (tag_width + 3)
+        rows = []
+        index = 0
+        while index < len(entries):
+            role, message, kind = entries[index]
+            tag = ROLE_TAGS.get(role, str(role)[:tag_width].lower())
+            style = ROLE_STYLES.get(tag, 'accentb')
+            head = self._paint('▌ ' + tag.ljust(tag_width) + ' ', style)
+            if kind == 'heartbeat':
+                index += 1
+                continue
+            if kind == 'tool':
+                calls = []
+                while (index < len(entries) and entries[index][0] == role
+                       and entries[index][2] in ('tool', 'heartbeat')):
+                    if entries[index][2] == 'tool':
+                        calls.append(tool_parts(entries[index][1]))
+                    index += 1
+                if self.expand_tools:
+                    for number, (name, detail) in enumerate(calls):
+                        lead = head if number == 0 else indent
+                        rows.append(self._fit(lead + self._paint('⏺ ', 'accent') + self._paint(name, 'bold')
+                                              + ' ' + self._paint(detail, 'muted'), width))
+                    continue
+                counts = {}
+                for name, _ in calls:
+                    counts[name] = counts.get(name, 0) + 1
+                ranked = sorted(counts.items(), key=lambda item: -item[1])
+                summary = ' · '.join(f'{name} {count}' for name, count in ranked[:5])
+                if len(ranked) > 5:
+                    summary += ' · …'
+                noun = 'tool call' if len(calls) == 1 else 'tool calls'
+                rows.append(self._fit(head + self._paint('⏺ ', 'accent') + self._paint(f'{len(calls)} {noun}', 'bold')
+                                      + self._paint(' · ' + summary, 'muted'), width))
+                name, detail = calls[-1]
+                rows.append(self._fit(indent + self._paint(f'└ {name} {detail}'.rstrip(), 'muted')
+                                      + self._paint('  ctrl+o expand', 'muted'), width))
+                continue
+            index += 1
+            key = (role, message, kind, width, self.theme, self.color)
+            cached = self._entry_cache.get(key)
+            if cached is None:
+                if tag == 'you':
+                    body = ' '.join(message.split())
+                    chunks = textwrap.wrap(body, width=text_width, break_long_words=True,
+                                           break_on_hyphens=False) or ['']
+                    cached = []
+                    for number, chunk in enumerate(chunks):
+                        # Plain text inside one style, so the band spans the row.
+                        lead = '▌ ' + tag.ljust(tag_width) + ' ' if number == 0 else '▌' + ' ' * (tag_width + 2)
+                        cached.append(self._paint(self._fit(lead + chunk, width), 'userrow'))
+                elif kind == 'status':
+                    cached = [self._fit(head + self._paint(' '.join(message.split()), 'muted'), width)]
+                else:
+                    body = self.markdown_rows(message, text_width)
+                    cached = [self._fit((head if number == 0 else indent) + row, width)
+                              for number, row in enumerate(body)]
+                if len(self._entry_cache) > 4000:
+                    self._entry_cache.clear()
+                self._entry_cache[key] = cached
+            rows.extend(cached)
+        return rows
 
     def scroll_transcript(self, step):
         """Move the conversation view; a negative step goes back in time.
@@ -1810,6 +2005,44 @@ class TeamUI:
                 out.append(' ' + self._paint('─┼─'.join('─' * size for size in widths), 'muted'))
         return out
 
+    def diff_rows(self, text, width):
+        """Colour a unified diff: a file summary, then +/- lines and hunk headers."""
+        files, added, removed = [], 0, 0
+        for line in text.splitlines():
+            if line.startswith('diff --git '):
+                files.append(line.split(' b/', 1)[-1])
+            elif line.startswith('+') and not line.startswith('+++'):
+                added += 1
+            elif line.startswith('-') and not line.startswith('---'):
+                removed += 1
+        rows = []
+        if files:
+            rows.append(self._paint(f'{len(files)} file{"s" if len(files) != 1 else ""} changed', 'bold')
+                        + '  ' + self._paint(f'+{added}', 'okb') + ' ' + self._paint(f'-{removed}', 'errb'))
+            rows.append('')
+        for line in text.splitlines():
+            line = line.replace('\t', '    ')
+            if line.startswith('diff --git '):
+                if rows and rows[-1] != '':
+                    rows.append('')
+                rows.append(self._paint('▍ ' + self._truncate(line.split(' b/', 1)[-1], width - 2), 'accentb'))
+                continue
+            if line.startswith(('index ', '--- ', '+++ ', 'new file mode', 'deleted file mode',
+                                'similarity index', 'rename from', 'rename to', 'old mode', 'new mode')):
+                rows.append(self._paint(self._truncate(line, width), 'muted'))
+            elif line.startswith('@@'):
+                rows.append(self._paint(self._truncate(line, width), 'accent'))
+            elif line.startswith('+'):
+                rows.append(self._paint(self._truncate(line, width), 'ok'))
+            elif line.startswith('-'):
+                rows.append(self._paint(self._truncate(line, width), 'err'))
+            elif line.startswith('Untracked files:'):
+                rows.append('')
+                rows.append(self._paint(line, 'bold'))
+            else:
+                rows.append(self._truncate(line, width))
+        return rows or ['']
+
     def markdown_rows(self, text, width):
         """Lay out Markdown for the terminal: headings, lists, tables, code."""
         width = max(20, width)
@@ -1914,9 +2147,9 @@ class TeamUI:
     def _footer_row(self, width):
         """Key hints on the left, artifact directory on the right."""
         if self.running:
-            hints = 'type to queue a task · ↑↓ scroll · esc interrupt'
+            hints = 'type to queue a task · ↑↓ scroll · ctrl+o tools · esc interrupt'
         else:
-            hints = 'enter send · / commands · @ files · ↑↓ history · alt+enter newline · ctrl+p palette'
+            hints = 'enter send · / commands · @ files · ↑↓ history · ctrl+r search · ctrl+o tools'
         artifacts = str(self.run_dir) if self.run_dir else ''
         left = self._paint(' ' + hints, 'muted')
         if artifacts and len(hints) + len(artifacts) + 5 < width:
@@ -1949,6 +2182,8 @@ class TeamUI:
         inner = max(8, width - 6)
         if self.composing:
             label, text, cursor = self.compose_label, self.input_buffer, self.input_cursor
+            if self.history_search:
+                label = 'history search: '
             style = 'accent'
         elif self.running:
             label, text, cursor = 'Queue: ', self.queue_input, len(self.queue_input)
@@ -1971,12 +2206,16 @@ class TeamUI:
                         + ' ' + self._paint('│', style))
         rows.append(self._paint('╰' + '─' * (width - 2) + '╯', style))
         self._composer_cursor = (1 + line - first, 4 + column)
-        if self.composing and self.suggestions:
+        if self.composing and self.history_search and not self.suggestions:
+            rows.append(self._fit(self._paint('    no earlier input matches · esc leaves search', 'muted'), width))
+        elif self.composing and self.suggestions:
             shown = min(len(self.suggestions), 6)
             top = min(max(0, self.suggestion_index - shown + 1), len(self.suggestions) - shown)
-            name_width = min(28, max(len(name) for name, _ in self.suggestions[top:top + shown]) + 2)
+            name_width = min(28, max(len(item[0]) for item in self.suggestions[top:top + shown]) + 2)
+            if self.history_search:
+                name_width = max(8, width - 6)
             for index in range(top, top + shown):
-                name, description = self.suggestions[index]
+                name, description = self.suggestions[index][:2]
                 chosen = index == self.suggestion_index
                 marker = '❯' if chosen else ' '
                 row = f'  {marker} ' + self._paint(self._truncate(name, name_width).ljust(name_width),
@@ -2033,17 +2272,63 @@ def status(message):
         print(f'ccx: {message}', flush=True)
 
 
+def fuzzy_score(query, text):
+    """Lower is better: the span the query's letters cover in order, or None."""
+    position, first = 0, None
+    for char in query:
+        position = text.find(char, position)
+        if position < 0:
+            return None
+        if first is None:
+            first = position
+        position += 1
+    return position - first
+
+
+TOOL_LINE = re.compile(r'^(?:tool: |item\.(?:started|completed): |file changes: )')
+
+
+def activity_kind(message):
+    """Guess the kind of an untyped activity line from plain CLIs or old logs."""
+    if TOOL_LINE.match(message):
+        return 'tool'
+    if re.match(r'^still running \(\d+s elapsed\)$', message):
+        return 'heartbeat'
+    return 'text'
+
+
+def tool_parts(message):
+    """Split a tool line into a short name and its detail."""
+    text = TOOL_LINE.sub('', message).strip()
+    if message.startswith(('item.started: ', 'item.completed: ')):
+        return 'bash', text
+    if message.startswith('file changes: '):
+        return 'edit', text
+    name, _, detail = text.partition(' ')
+    return (name or 'tool').lower(), detail.strip()
+
+
 class Progress:
     """Render public CLI activity while preserving the complete raw event logs."""
     def __init__(self, label, kind):
         self.label, self.kind = label, kind
 
-    def show(self, message):
-        message = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(message))
+    def show(self, message, kind=None):
+        """Publish one activity line; ``kind`` is text, tool, heartbeat or status.
+
+        Agent text keeps its newlines so the transcript can lay out Markdown;
+        everything else is a single line.
+        """
+        kind = kind or activity_kind(str(message))
+        if kind == 'text':
+            message = re.sub(r'[\x00-\x09\x0b-\x1f\x7f-\x9f]', ' ', str(message)).strip('\n')[:8000]
+        else:
+            message = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', str(message))[:400]
         if message.strip():
-            emit_event('activity', phase=self.label, message=message[:400])
+            emit_event('activity', phase=self.label, message=message, category=kind)
             if not (team_ui and team_ui.enabled):
-                print(f'ccx: {self.label}: {message[:400]}', flush=True)
+                flat = ' '.join(message.split())
+                print(f'ccx: {self.label}: {flat[:400]}', flush=True)
 
     def line(self, line, stderr=False):
         if stderr or self.kind == 'text':
@@ -2068,33 +2353,35 @@ class Progress:
                         if not isinstance(inputs, dict):
                             inputs = {}
                         detail = next((inputs[k] for k in ('file_path', 'path', 'pattern', 'command') if k in inputs), '')
-                        self.show(f"{block.get('name', 'tool')} {detail}")
+                        self.show(f"{block.get('name', 'tool')} {detail}".strip(), 'tool')
                     elif block.get('type') == 'text':
-                        self.show(block.get('text', ''))
+                        self.show(block.get('text', ''), 'text')
         elif self.kind == 'kimi-cli':
             if event.get('role') == 'assistant':
-                self.show(event.get('content', ''))
+                self.show(event.get('content', ''), 'text')
                 for tool in event.get('tool_calls', []):
                     if isinstance(tool, dict):
-                        self.show('tool: ' + str(tool.get('function', {}).get('name', '')))
+                        self.show(str(tool.get('function', {}).get('name', '')) or 'tool', 'tool')
         elif self.kind == 'mcode':
             item = event.get('item', {})
             if event.get('type') == 'item.completed' and isinstance(item, dict):
-                if item.get('type') == 'agent_message': self.show(item.get('content', ''))
-                if item.get('type') == 'tool_call': self.show('tool: ' + str(item.get('toolCall', {}).get('name', '')))
+                if item.get('type') == 'agent_message': self.show(item.get('content', ''), 'text')
+                if item.get('type') == 'tool_call': self.show(str(item.get('toolCall', {}).get('name', '')) or 'tool', 'tool')
         elif self.kind == 'codex':
             item = event.get('item', {})
             if event.get('type') in ('item.started', 'item.completed') and isinstance(item, dict):
                 if item.get('type') == 'command_execution':
-                    self.show(f"{event['type']}: {item.get('command', '')}")
+                    # Started and completed both arrive; one line per command.
+                    if event['type'] == 'item.started':
+                        self.show(f"bash {item.get('command', '')}", 'tool')
                 elif item.get('type') == 'file_change':
                     changes = item.get('changes', [])
                     if isinstance(changes, list):
-                        self.show('file changes: ' + ', '.join(str(c.get('path', '')) for c in changes if isinstance(c, dict)))
+                        self.show('edit ' + ', '.join(str(c.get('path', '')) for c in changes if isinstance(c, dict)), 'tool')
                 elif item.get('type') == 'agent_message':
-                    self.show(item.get('text', ''))
+                    self.show(item.get('text', ''), 'text')
                 elif item.get('type') == 'mcp_tool_call':
-                    self.show(f"tool: {item.get('server', '')}/{item.get('tool', '')}")
+                    self.show(f"{item.get('server', '')}/{item.get('tool', '')}", 'tool')
 
 
 RUNNING_SCROLL_KEYS = {
@@ -2107,6 +2394,10 @@ RUNNING_SCROLL_KEYS = {
 
 def read_running_input(ui, fd, decoder):
     """Accept queued tasks during a running subprocess; Esc stops this process."""
+    if ui._resized:
+        ui._resized = False
+        ui._previous_rows = None
+        ui.render()
     if not select.select([fd], [], [], 0)[0]:
         return False
     data = os.read(fd, 4096)
@@ -2130,6 +2421,10 @@ def read_running_input(ui, fd, decoder):
         if step is not None and ui.scroll_transcript(step):
             changed = True
     for char in plain:
+        if char == '\x0f':
+            ui.expand_tools = not ui.expand_tools
+            changed = True
+            continue
         if char in ('\r', '\n'):
             task = ui.queue_input.strip()
             if task:
@@ -2212,7 +2507,7 @@ def _execute_child(command, cwd, prompt, timeout, output, error, progress, start
                             drain(final=True)
                             raise WorkflowError('Current process stopped by user; inspect run diagnostics.')
                         if time.monotonic() >= next_heartbeat:
-                            progress.show(f'still running ({int(time.monotonic() - started)}s elapsed)')
+                            progress.show(f'still running ({int(time.monotonic() - started)}s elapsed)', 'heartbeat')
                             next_heartbeat = time.monotonic() + 10
             except (subprocess.TimeoutExpired, KeyboardInterrupt):
                 os.killpg(process.pid, signal.SIGKILL)
@@ -3276,7 +3571,7 @@ def main():
                             diff = git(command_repo, 'diff', '--no-ext-diff', '--no-textconv', 'HEAD', '--').decode(errors='replace')
                             untracked = git(command_repo, 'ls-files', '--others', '--exclude-standard').decode(errors='replace')
                             content = (diff or 'No tracked file changes.') + ('\n\nUntracked files:\n' + untracked if untracked else '')
-                            ui.show_text('WORKSPACE DIFF', content)
+                            ui.show_text('WORKSPACE DIFF', content, diff=True)
                     except (WorkflowError, OSError) as error:
                         ui.show_text('ERROR', str(error))
                     continue
@@ -3287,7 +3582,7 @@ def main():
                         ui.show_text('ERROR', str(error))
                     continue
                 if ui and task.lower() == '/help':
-                    ui.show_text('HELP', 'Enter a task to start. Ctrl+P opens the command palette; Tab completes commands and @file paths.\nWhile an agent runs, type and press Enter to queue a task; Esc stops it.\n/queue: list queued tasks; /queue clear: discard them.\n/timeline: show conversation; /agents: pick an agent and read its log.\n/result: open the result preview with the run metadata.\n/files: list files; /diff: show changes; /editor: multiline input.\n/theme NAME: choose default, ocean, or contrast. NO_COLOR=1 disables colour.\n/undo and /redo: restore guarded checkpoints; both need a git checkout.\n/history: list previous runs and resume a matching session.\n/route auto|plan|direct|inspect: select the route for future tasks.\n/proof COMMAND: set the verification command for future tasks. When a task needs one and none was detected, the team asks for it in place.\n/quit: exit.\n\nThe previous successful task and outcome are used as context for the next task in this session.')
+                    ui.show_text('HELP', 'Enter a task to start. Type / for commands and @ for files; ↑↓ choose, Tab completes, Enter sends. Alt+Enter adds a line, Ctrl+R searches earlier input, Ctrl+O expands tool calls, Ctrl+P opens the command palette.\nWhile an agent runs, type and press Enter to queue a task; ↑↓, PgUp/PgDn and the mouse wheel scroll the conversation; Esc stops it.\n/queue: list queued tasks; /queue clear: discard them.\n/timeline: show conversation; /agents: pick an agent and read its log.\n/result: open the result preview with the run metadata.\n/files: list files; /diff: show changes; /editor: multiline input.\n/theme: choose default, ocean, or contrast. NO_COLOR=1 disables colour.\n/undo and /redo: restore guarded checkpoints; both need a git checkout.\n/history: list previous runs and resume a matching session.\n/route: pick auto, plan, direct, or inspect for future tasks.\n/proof: pick or type the verification command for future tasks. When a task needs one and none was detected, the team asks for it in place.\n/quit: exit.\n\nThe previous successful task and outcome are used as context for the next task in this session.')
                     continue
                 if ui and task.lower() == '/route':
                     if ui._can_pick():

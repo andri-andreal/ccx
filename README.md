@@ -348,9 +348,13 @@ active route, the project path and the current Git branch. Each agent shows a st
 glyph plus its word (`● running`, `✓ done`, `✗ failed`, `○ waiting`), so state never
 depends on colour alone. The current task is pinned at the top of the conversation and
 the active agent's elapsed time runs in the status row. Your own messages carry a
-full-width highlight, so they stand apart from agent output. While an agent runs, the
-conversation scrolls with ↑/↓, the mouse wheel, PgUp/PgDn and Home/End; it holds its
-place as new output arrives, and End (or scrolling to the bottom) follows again.
+full-width highlight, so they stand apart from agent output. Agent replies are laid out
+as Markdown in the conversation, and each run of tool calls folds into one summary
+(`⏺ 6 tool calls · read 3 · grep 2 · bash 1`) with the latest call beneath it; Ctrl+O
+expands every call and folds them again. Heartbeats stay in the status row instead of
+the conversation. While an agent runs, the conversation scrolls with ↑/↓, the mouse
+wheel, PgUp/PgDn and Home/End; it holds its place as new output arrives, and End (or
+scrolling to the bottom) follows again. The layout redraws when the terminal is resized.
 
 After a task, the conclusion appears in a **RESULT** preview block and then in a full
 **CONCLUSION** view. Both render the agent's Markdown for the terminal: headings,
@@ -366,8 +370,10 @@ Tasks are typed into a bordered composer:
 | Key | Action |
 |---|---|
 | `/` | Suggest slash commands with a short description, filtered as you type |
-| `@` | Suggest project files; Enter or Tab inserts the highlighted path |
+| `@` | Suggest project files by prefix, substring or fuzzy letters (`@wfpy` finds `lib/workflow.py`); Enter or Tab inserts the path |
 | ↑ / ↓ | Choose a suggestion; otherwise move between lines or recall earlier input |
+| Ctrl+R | Search earlier input, newest first; Enter puts the entry back to edit |
+| Ctrl+O | Expand or fold tool calls in the conversation |
 | Enter | Send, or run the highlighted command |
 | Tab | Complete without sending; commands with choices list them next |
 | Alt+Enter, or `\` then Enter | New line |
@@ -380,6 +386,8 @@ Every choice is a picker: ↑/↓ move, Enter selects, Esc or `q` goes back and 
 `/proof` lists the commands found in the project and ends with **Type a custom
 command**, the only case that needs typing. `/route plan` style arguments still work.
 When stdin is not an interactive terminal, the team falls back to typed prompts.
+Sent input is kept in `~/.config/ccx/tui-history.jsonl` (mode `600`, the last 500
+entries), so ↑ and Ctrl+R reach earlier sessions too.
 
 Explicit `@path` references attach UTF-8 files inside the project (up to 64 KiB each;
 paths with spaces are not yet supported). `/editor` opens `$VISUAL` or `$EDITOR` for a
@@ -397,7 +405,8 @@ for the team, red for failure, dim grey for metadata) and can be turned off with
   the latest conclusion. `/agents` lists the running agents and drills into one agent's
   full log; `/result` opens the result preview with its run metadata. Detail views
   scroll with the mouse wheel, ←/→ and PgUp/PgDn.
-- `/files` and `/diff`: list project files and inspect tracked changes; untracked
+- `/files` and `/diff`: list project files and inspect tracked changes. `/diff` opens
+  with a file and line summary and colours added, removed and hunk lines; untracked
   paths are listed separately. `/diff` needs a Git checkout.
 - `/undo` and `/redo`: restore the latest recorded CCX file changes. Restoration
   refuses staged changes, a changed checkout, a different commit, or conflicts
