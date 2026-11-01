@@ -110,6 +110,10 @@ elif schema and 'status' in schema['properties']:
         for response in value['responses']: response['disposition'] = 'DISPUTED'
     if case == 'repair_proof' and feedback:
         pathlib.Path('repaired.py').write_text('fixed')
+elif schema and case == 'bad_review_json' and 'YOUR PREVIOUS REPLY WAS NOT VALID JSON' not in prompt and mcode:
+    print(json.dumps({'type':'turn.failed','error':{'code':'STRUCTURED_OUTPUT_INVALID','retryable':True}}))
+    print(json.dumps({'type':'exec.completed','result':{'status':'failed','error':{'code':'STRUCTURED_OUTPUT_INVALID'}}}))
+    sys.exit(4)
 elif schema:
     value = {'verdict':'APPROVED','summary':'Reviewed fixture.', 'findings':[],
              'coverage':['implemented.py'], 'limitations':[]}
@@ -141,7 +145,7 @@ elif schema:
     if case == 'mutate_inspection' and 'CHANGE MANIFEST' in prompt:
         pathlib.Path('implemented.py').write_text('modified during inspection')
 else:
-    if prompt.startswith('Inspect the repository'):
+    if 'Inspect the repository' in prompt:
         value = 'Read-only inspection completed.'
     else:
         pathlib.Path('implemented.py').write_text('print(42)\n')
@@ -430,6 +434,19 @@ class IntegrationTests(unittest.TestCase):
         self.workflow(planner='mcode', builder='mcode', reviewer='mcode')
         self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CHECK_TMP': '1'})
         self.assertTrue(self.mcode_data.is_dir())
+
+    def test_invalid_reviewer_json_is_asked_once_more(self):
+        self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
+        self.workflow(reviewer='mcode')
+        log = self.mcode_data / 'retry-prompts.jsonl'
+        run = self.ccx('team', 'Implement fixture',
+                       env={**self.env, 'FAKE_CASE': 'bad_review_json', 'FAKE_PROMPT_LOG': str(log)})
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        self.assertIn('asking once more', run.stdout)
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('YOUR PREVIOUS REPLY WAS NOT VALID JSON' in p for p in prompts))
+        # Every agent is told which directory is the project.
+        self.assertTrue(all(p.startswith('PROJECT DIRECTORY: ') for p in prompts), prompts[0][:200])
 
     def test_team_tui_layout_adapts_to_terminal_width(self):
         class Terminal(io.StringIO):

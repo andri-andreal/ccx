@@ -542,6 +542,12 @@ approval records `accepted_by_user`), **One more round**, **Add guidance and rev
 **Show the plan and findings** or **Stop**. Without a terminal the run stops as before,
 naming the open findings and the saved `PLAN.md`.
 
+Every agent prompt names the project directory and says that files elsewhere on the
+machine are not part of the project, so a reviewer of an empty folder does not borrow
+conventions from neighbouring repositories. A read-only agent (orchestrator, planner,
+reviewer) whose JSON reply is malformed, such as an unescaped quote inside a string,
+is asked once more with a note to escape quotes and keep findings short.
+
 Progress is shown automatically: round numbers, profile/model/effort, public
 Claude tool activity or Codex command/file events, elapsed time every 10 seconds,
 review/builder summaries and findings, and verification stdout/stderr. Long
