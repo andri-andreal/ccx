@@ -67,6 +67,26 @@ elif '--json-schema' in args:
     schema = json.loads(args[args.index('--json-schema')+1])
 elif kimi and 'Return only a JSON object matching this schema' in prompt:
     schema = json.loads(prompt.rsplit('Return only a JSON object matching this schema, without Markdown:\n', 1)[1])
+def strict_problem(node):
+    # OpenAI strict structured outputs: every object lists all of its properties as required.
+    if isinstance(node, dict):
+        if node.get('type') == 'object' and 'properties' in node:
+            missing = set(node['properties']) - set(node.get('required', []))
+            if missing:
+                return 'Missing ' + ', '.join(sorted(missing))
+        for child in node.values():
+            problem = strict_problem(child)
+            if problem:
+                return problem
+    elif isinstance(node, list):
+        for child in node:
+            problem = strict_problem(child)
+            if problem:
+                return problem
+    return None
+if schema and codex and strict_problem(schema):
+    print(json.dumps({'type':'turn.failed','error':{'message':'invalid_json_schema: ' + strict_problem(schema)}}))
+    sys.exit(1)
 if schema and 'route' in schema['properties']:
     value = {'route':os.environ.get('FAKE_ROUTE', 'plan'), 'reason':'Fixture routing.'}
     if os.environ.get('FAKE_QUESTIONS'):
@@ -486,6 +506,20 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(review['verdict'], 'APPROVED')
         self.assertEqual(review['findings'][0]['severity'], 'low')
         self.assertIn('follow-up round', review['findings'][0]['evidence'])
+
+    def test_every_output_schema_is_valid_for_codex_strict_mode(self):
+        def check(node, where):
+            if isinstance(node, dict):
+                if node.get('type') == 'object' and 'properties' in node:
+                    self.assertEqual(set(node['properties']), set(node.get('required', [])), where)
+                    self.assertIs(node.get('additionalProperties'), False, where)
+                for key, child in node.items():
+                    check(child, f'{where}.{key}')
+            elif isinstance(node, list):
+                for child in node:
+                    check(child, where)
+        for name in ('PLAN_SCHEMA', 'ROUTE_SCHEMA', 'REVIEW_SCHEMA', 'BUILD_SCHEMA'):
+            check(getattr(workflow_module, name), name)
 
     def test_settle_follow_up_keeps_unresolved_and_new_high_findings(self):
         previous = [{'id': 'R1', 'severity': 'high', 'path': 'plan', 'evidence': 'x', 'fix': 'y'}]

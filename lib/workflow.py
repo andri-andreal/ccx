@@ -235,6 +235,10 @@ def save(path, value):
     Path(path).write_text(json.dumps(value, indent=2, ensure_ascii=False) + '\n')
 
 
+# Required by strict schemas, but a model may omit them when they are empty.
+OMITTABLE_LISTS = {'questions'}
+
+
 def extract_json_response(text, expected):
     """Extract a complete response object, allowing model prose or Markdown around it."""
     decoder = json.JSONDecoder()
@@ -244,8 +248,10 @@ def extract_json_response(text, expected):
             value, _ = decoder.raw_decode(text[match.start():])
         except ValueError:
             continue
-        if isinstance(value, dict) and set(value) == set(expected.get('required', [])):
-            matches.append(value)
+        required = set(expected.get('required', []))
+        # A model may leave out an empty question list; treat it as empty.
+        if isinstance(value, dict) and required - OMITTABLE_LISTS <= set(value) <= required:
+            matches.append({**{key: [] for key in required & OMITTABLE_LISTS}, **value})
     if len(matches) != 1:
         raise WorkflowError('Kimi did not return exactly one complete response object.')
     return matches[0]
@@ -2873,7 +2879,9 @@ QUESTIONS_PROPERTY = {'type': 'array', 'items': {
 PLAN_SCHEMA = {
     'type': 'object', 'additionalProperties': False,
     'properties': {'plan': {'type': 'string'}, 'questions': QUESTIONS_PROPERTY},
-    'required': ['plan'],
+    # Codex (strict structured outputs) needs every property listed as required;
+    # an empty list means no questions.
+    'required': ['plan', 'questions'],
 }
 
 ROUTE_SCHEMA = {
@@ -2890,7 +2898,7 @@ ROUTE_SCHEMA = {
             'required': ['question', 'options'],
         }},
     },
-    'required': ['route', 'reason'],
+    'required': ['route', 'reason', 'questions'],
 }
 
 
@@ -3378,7 +3386,8 @@ class Loop:
                 'Never infer permission to change files from a request to inspect. '
                 'When the request is ambiguous in a way that changes what gets built, ask up to three '
                 'clarifying questions and give each one two to five concrete options. '
-                'Return route, a short reason, and optionally questions (a question with its options).\nTASK:\n' + task,
+                'Return route, a short reason, and questions (each a question with its options; '
+                'an empty list when nothing needs asking).\nTASK:\n' + task,
                 ROUTE_SCHEMA)
             if (not isinstance(decision, dict) or not {'route', 'reason'} <= set(decision)
                     or set(decision) - {'route', 'reason', 'questions'}
@@ -3452,7 +3461,8 @@ class Loop:
                        'answers them before the next plan. ' if interactive else
                        'Record those as unresolved questions in the plan. ') +
                     'Treat the USER ANSWERS section as decisions already made by the user. '
-                    'Return JSON with field plan (markdown string) and optionally questions.\nTASK:\n' + task + answer_block +
+                    'Return JSON with field plan (markdown string) and questions (an empty list when there '
+                    'are none).\nTASK:\n' + task + answer_block +
                     '\nVERIFICATION COMMAND:\n' + self.config['CCX_PROOF'] + '\nPREVIOUS PLAN:\n' + plan +
                     '\nREVIEW FEEDBACK:\n' + feedback, PLAN_SCHEMA)
                 if (not isinstance(value, dict) or 'plan' not in value or set(value) - {'plan', 'questions'}
