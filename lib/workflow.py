@@ -303,6 +303,7 @@ COMMANDS = [
     ('/roles', 'Show and edit the agent definition for each role'),
     ('/timeline', 'Show the whole conversation'),
     ('/files', 'List workspace files'),
+    ('/requests', 'Inspect HTTP requests the agents made, like Postman'),
     ('/queue', 'Show queued tasks'),
     ('/route', 'Show or set the route: auto, plan, direct, inspect'),
     ('/proof', 'Show or set the verification command'),
@@ -500,6 +501,10 @@ class EventJournal:
                  'type': kind, **payload}
         with self.path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + '\n')
+        if kind == 'http_exchange':
+            with (self.path.parent / 'requests.jsonl').open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps({'phase': payload.get('phase'), **payload.get('exchange', {})},
+                                        ensure_ascii=False) + '\n')
         if self.observer:
             self.observer(event)
 
@@ -644,6 +649,8 @@ class TeamUI:
         self.flow_started = 0.0
         # Agent definition names per panel, shown when they differ from the role.
         self.agent_names = {}
+        # HTTP requests the agents made during this task, oldest first.
+        self.requests = []
         self.flow_used = set()
         self._last_tick = 0.0
         # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
@@ -785,6 +792,14 @@ class TeamUI:
             self.done(phase, event.get('ok', True))
         elif kind == 'activity':
             self.update(phase, event.get('message', ''), event.get('category'))
+        elif kind == 'http_exchange':
+            exchange = event.get('exchange')
+            key = self.panel_for(phase)
+            if isinstance(exchange, dict):
+                exchange = {**exchange, 'phase': phase}
+                self.requests.append(exchange)
+                self.timeline.append((self.panels[key]['title'] if key else 'CCX', json.dumps(exchange), 'http'))
+                self.render()
         elif kind == 'agents_loaded':
             names = event.get('agents')
             self.agent_names = dict(names) if isinstance(names, dict) else {}
@@ -1632,6 +1647,7 @@ class TeamUI:
         self.transcript_top = None
         self.flow_edge = None
         self.flow_used = set()
+        self.requests = []
         self.footer = 'Enter a task, /history, or /quit'
         for key, panel in self.panels.items():
             panel['status'] = 'not configured' if key == 'orchestrate' and not self.orchestrator else 'waiting'
@@ -2150,6 +2166,8 @@ class TeamUI:
                         cached.append(self._paint(self._fit(lead + chunk, width), 'userrow'))
                 elif kind == 'status':
                     cached = [self._fit(head + self._paint(' '.join(message.split()), 'muted'), width)]
+                elif kind == 'http':
+                    cached = self.http_card(head, indent, message, width, text_width)
                 elif kind == 'error':
                     lead = self._paint('▌ ' + tag.ljust(tag_width) + ' ', 'errb')
                     body = self.markdown_rows(message, text_width)
@@ -2165,6 +2183,200 @@ class TeamUI:
             rows.extend(cached)
         self._entry_starts = starts
         return rows
+
+    def status_style(self, status):
+        if not isinstance(status, int):
+            return 'muted'
+        return 'ok' if status < 300 else 'accent' if status < 400 else 'warn' if status < 500 else 'err'
+
+    def method_style(self, method):
+        return {'GET': 'user', 'POST': 'ok', 'PUT': 'warn', 'PATCH': 'warn', 'DELETE': 'err'}.get(method, 'accent')
+
+    @staticmethod
+    def http_path(url):
+        """Path and query of a URL, or the URL itself when it has none."""
+        match = re.match(r'^(?:[a-z]+://)?[^/]+(/.*)?$', url)
+        return (match.group(1) or '/') if match else url
+
+    @staticmethod
+    def http_size(size):
+        if not isinstance(size, int):
+            return ''
+        return f'{size} B' if size < 1024 else f'{size / 1024:.1f} KB'
+
+    def http_status_text(self, exchange):
+        status = exchange.get('status')
+        text = f"{status} {exchange.get('reason') or HTTP_REASONS.get(status, '')}".strip() if status else 'no status'
+        extra = [part for part in (f"{exchange['duration_ms']} ms" if isinstance(exchange.get('duration_ms'), int) else '',
+                                   self.http_size(exchange.get('response_size'))) if part]
+        return text, extra
+
+    def http_card(self, head, indent, message, width, text_width):
+        """Two transcript rows for a request: method, path and status, then the body."""
+        try:
+            exchange = json.loads(message)
+        except ValueError:
+            return [self._fit(head + message, width)]
+        status_text, extra = self.http_status_text(exchange)
+        right = status_text + (' · ' + ' · '.join(extra) if extra else '')
+        method = exchange.get('method', 'GET')
+        path_room = max(8, text_width - len(method) - len(right) - 6)
+        line = (head + self._paint('⇄ ', 'accent') + self._paint(method, self.method_style(method) + 'b') + ' '
+                + self._truncate(self.http_path(exchange.get('url', '')), path_room))
+        gap = max(1, width - len(self._plain(line)) - len(right))
+        rows = [self._fit(line + ' ' * gap + self._paint(status_text, self.status_style(exchange.get('status')) + 'b')
+                          + (self._paint(' · ' + ' · '.join(extra), 'muted') if extra else ''), width)]
+        body = exchange.get('response_body') or exchange.get('request_body') or ''
+        if body:
+            preview = ' '.join(body.split())
+            rows.append(self._fit(indent + self._paint('└ ' + self._truncate(preview, text_width - 2), 'muted'), width))
+        return rows
+
+    def json_rows(self, text, width):
+        """Pretty, coloured JSON lines; anything else is wrapped plain text."""
+        try:
+            pretty = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
+        except ValueError:
+            return [row for line in text.splitlines() for row in (textwrap.wrap(line, width) or [''])] or ['']
+        rows = []
+        for line in pretty.splitlines():
+            match = re.match(r'^(\s*)("(?:[^"\\]|\\.)*")(\s*:\s*)?(.*)$', line)
+            if match and match.group(3):
+                lead, key, colon, value = match.groups()
+                styled = lead + self._paint(key, 'accent') + colon + self._json_value(value)
+            else:
+                stripped = line.lstrip()
+                styled = line[:len(line) - len(stripped)] + self._json_value(stripped)
+            rows.append(styled)
+        return rows
+
+    def _json_value(self, value):
+        core = value.rstrip(',')
+        tail = value[len(core):]
+        if core.startswith('"'):
+            return self._paint(core, 'ok') + tail
+        if re.fullmatch(r'-?\d+(\.\d+)?([eE][+-]?\d+)?|true|false|null', core):
+            return self._paint(core, 'warn') + tail
+        return value
+
+    def http_detail_rows(self, exchange, width):
+        """Request then response, like an API client's detail pane."""
+        method = exchange.get('method', 'GET')
+        rows = [self._paint(method, self.method_style(method) + 'b') + ' ' + self._paint(exchange.get('url', ''), 'bold')]
+        meta = [f"by {FLOW_LABELS.get(self.panel_for(exchange.get('phase', '')) or '', exchange.get('phase', 'agent'))}",
+                exchange.get('client', '')]
+        if exchange.get('exit_code') is not None:
+            meta.append(f"exit {exchange['exit_code']}")
+        rows.append(self._paint(' · '.join(part for part in meta if part), 'muted'))
+        rows.append('')
+
+        def section(title, style):
+            rows.append(self._paint('── ' + title + ' ' + '─' * max(0, width - len(title) - 4), style))
+
+        def headers(items):
+            for key, value in items:
+                rows.extend(self._paint(key + ':', 'accent') + ' ' + chunk if index == 0 else '  ' + chunk
+                            for index, chunk in enumerate(textwrap.wrap(value, max(8, width - len(key) - 2)) or ['']))
+
+        section('Request', 'accentb')
+        headers(exchange.get('request_headers', []))
+        if exchange.get('request_body'):
+            if exchange.get('request_headers'):
+                rows.append('')
+            rows.extend(self.json_rows(exchange['request_body'], width))
+        elif not exchange.get('request_headers'):
+            rows.append(self._paint('no headers or body', 'muted'))
+        rows.append('')
+        status_text, extra = self.http_status_text(exchange)
+        section('Response · ' + ' · '.join([status_text] + extra), self.status_style(exchange.get('status')) + 'b')
+        headers(exchange.get('response_headers', []))
+        if exchange.get('response_body'):
+            if exchange.get('response_headers'):
+                rows.append('')
+            rows.extend(self.json_rows(exchange['response_body'], width))
+            if exchange.get('truncated'):
+                rows.append(self._paint(f'… body cut at {HTTP_BODY_LIMIT // 1024} KB', 'muted'))
+        elif exchange.get('status') is None:
+            rows.append(self._paint('The command output did not show a response. Agents get status and headers '
+                                    'with curl -i or -w "%{http_code}".', 'muted'))
+        return [self._truncate(row, width) if not ANSI_PATTERN.search(row) else row for row in rows]
+
+    def show_requests(self):
+        """Postman-style view: request list on the left, the selected exchange on the right."""
+        if not self.requests:
+            self.show_text('REQUESTS', 'No HTTP requests yet. When an agent runs curl, HTTPie or xh, '
+                                       'each request appears here with its payload and response.')
+            return
+        if not self._can_pick():
+            body = '\n\n'.join(self._plain('\n'.join(self.http_detail_rows(item, 96))) for item in self.requests)
+            self.show_text('REQUESTS', body)
+            return
+        index, offset = len(self.requests) - 1, 0
+        try:
+            fd = sys.stdin.fileno()
+            state = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except (OSError, ValueError, termios.error):
+            fd, state = None, None
+        sys.stdout.write('\x1b[?1000h\x1b[?1006h')
+        try:
+            while True:
+                width, height = shutil.get_terminal_size((100, 28))
+                width, height = max(40, width), max(10, height)
+                split = width >= 90
+                list_width = min(44, width // 3) if split else width
+                detail_width = width - list_width - 3 if split else width - 2
+                body_height = height - 4
+                items = []
+                for position, exchange in enumerate(self.requests):
+                    status = exchange.get('status')
+                    method = exchange.get('method', 'GET')
+                    status_text = str(status) if status else '—'
+                    path = self._truncate(self.http_path(exchange.get('url', '')), max(4, list_width - 15))
+                    marker = '❯' if position == index else ' '
+                    row = (f'{marker} ' + self._paint(method.ljust(6), self.method_style(method) + 'b') + ' '
+                           + path.ljust(max(4, list_width - 15)) + ' ' + self._paint(status_text.rjust(3), self.status_style(status)))
+                    items.append(self._fit(row, list_width))
+                top = max(0, min(index - body_height + 1, len(items) - body_height)) if len(items) > body_height else 0
+                detail = self.http_detail_rows(self.requests[index], detail_width)
+                offset = max(0, min(offset, len(detail) - body_height))
+                rows = [self._fit(self._paint(f' REQUESTS ({len(self.requests)})', 'accentb')
+                                  + self._paint(f'  {index + 1}/{len(self.requests)}', 'muted'), width),
+                        self._fit(self._paint('─' * width, 'muted'), width)]
+                for line in range(body_height):
+                    left = items[top + line] if top + line < len(items) else ' ' * list_width
+                    right = detail[offset + line] if offset + line < len(detail) else ''
+                    if split:
+                        rows.append(self._fit(left + self._paint(' │ ', 'muted') + self._fit(right, detail_width), width))
+                    else:
+                        rows.append(self._fit(left if line < len(items) else ' ' + right, width))
+                hint = '↑↓ choose request · wheel PgUp PgDn scroll · Esc back'
+                self._previous_rows = None
+                sys.stdout.write('\x1b[?25l\x1b[H\x1b[2J' + '\n'.join(rows))
+                sys.stdout.write(f'\x1b[{height};1H\x1b[2K' + self._paint(hint, 'accent'))
+                sys.stdout.flush()
+                key = self._read_choice_key(fd)
+                if key is None or key in ('escape', 'q', '\r', '\n'):
+                    return
+                if key in ('up', 'down'):
+                    index = (index + (1 if key == 'down' else -1)) % len(self.requests)
+                    offset = 0
+                elif key in ('wheelup', 'wheeldown'):
+                    offset = max(0, offset + (3 if key == 'wheeldown' else -3))
+                elif key in ('pageup', 'left'):
+                    offset = max(0, offset - body_height)
+                elif key in ('pagedown', 'right', ' '):
+                    offset += body_height
+                elif key == 'home':
+                    offset = 0
+                elif key == 'resize':
+                    self._resized = False
+        finally:
+            if not (self.mouse and self.entered):
+                sys.stdout.write('\x1b[?1006l\x1b[?1000l')
+            if fd is not None and state is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, state)
+            self._end_choice()
 
     def scroll_transcript(self, step):
         """Move the conversation view; a negative step goes back in time.
@@ -2751,7 +2963,247 @@ def fuzzy_score(query, text):
     return position - first
 
 
+# HTTP requests agents make with curl, HTTPie or xh, captured from their tool calls.
+HTTP_CLIENTS = ('curl', 'http', 'https', 'xh', 'xhs')
+HTTP_REASONS = {200: 'OK', 201: 'Created', 202: 'Accepted', 204: 'No Content', 301: 'Moved Permanently',
+                302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden',
+                404: 'Not Found', 405: 'Method Not Allowed', 409: 'Conflict', 422: 'Unprocessable Entity',
+                429: 'Too Many Requests', 500: 'Internal Server Error', 502: 'Bad Gateway',
+                503: 'Service Unavailable', 504: 'Gateway Timeout'}
+HTTP_METHODS = ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')
+SECRET_HEADERS = {'authorization', 'proxy-authorization', 'cookie', 'set-cookie', 'x-api-key',
+                  'x-auth-token', 'api-key'}
+SECRET_FIELD = re.compile(r'pass(word)?|secret|token|api[_-]?key|authorization|credential', re.I)
+MASK = '••••••'
+HTTP_BODY_LIMIT = 65536
+CURL_ARG_LONG = {'request', 'header', 'data', 'data-raw', 'data-binary', 'data-ascii', 'data-urlencode',
+                 'json', 'user', 'write-out', 'output', 'url', 'form', 'cookie', 'max-time',
+                 'connect-timeout', 'user-agent', 'referer', 'cacert', 'cert', 'key', 'proxy', 'retry'}
+CURL_ARG_SHORT = set('XHduwoFbmAeEKrxTUz')
+
+
+def unwrap_shell(command):
+    """`bash -lc 'curl …'` -> `curl …`; other commands are returned as they are."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return command
+    if (len(tokens) >= 3 and os.path.basename(tokens[0]) in ('bash', 'sh', 'zsh', 'dash')
+            and tokens[1].startswith('-') and 'c' in tokens[1]):
+        return tokens[2]
+    return command
+
+
+def command_segments(command):
+    """Token lists of a shell line split at pipes, `&&`, `||` and `;`."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    segments, current = [], []
+    for token in tokens:
+        if token in ('|', '||', '&&', ';', '&', '|&'):
+            segments.append(current)
+            current = []
+        else:
+            current.append(token)
+    segments.append(current)
+    return [segment for segment in segments if segment]
+
+
+def parse_curl(tokens):
+    request = {'client': 'curl', 'method': '', 'url': '', 'headers': [], 'body': '', 'include': False,
+               'write_out': '', 'user': ''}
+    data_seen = get = False
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        name, value = None, None
+        if token.startswith('--') and len(token) > 2:
+            name, _, inline = token[2:].partition('=')
+            if name in CURL_ARG_LONG:
+                if inline:
+                    value = inline
+                else:
+                    index += 1
+                    value = tokens[index] if index < len(tokens) else ''
+        elif token.startswith('-') and len(token) > 1:
+            flags = token[1:]
+            for position, char in enumerate(flags):
+                if char in CURL_ARG_SHORT:
+                    name = char
+                    value = flags[position + 1:]
+                    if not value:
+                        index += 1
+                        value = tokens[index] if index < len(tokens) else ''
+                    break
+                if char == 'i':
+                    request['include'] = True
+                elif char == 'I':
+                    request['include'] = True
+                    request['method'] = request['method'] or 'HEAD'
+                elif char == 'G':
+                    get = True
+        else:
+            request['url'] = request['url'] or token
+        if name in ('X', 'request'):
+            request['method'] = value.upper()
+        elif name in ('H', 'header'):
+            key, _, header_value = value.partition(':')
+            request['headers'].append([key.strip(), header_value.strip()])
+        elif name in ('d', 'data', 'data-raw', 'data-binary', 'data-ascii', 'data-urlencode', 'json', 'F', 'form'):
+            request['body'] = (request['body'] + '&' if request['body'] else '') + value
+            data_seen = True
+            if name == 'json':
+                request['headers'].append(['Content-Type', 'application/json'])
+        elif name in ('u', 'user'):
+            request['user'] = value
+        elif name in ('w', 'write-out'):
+            request['write_out'] = value
+        elif name == 'url':
+            request['url'] = value
+        elif name in ('include',):
+            request['include'] = True
+        if token in ('--include', '-i'):
+            request['include'] = True
+        if token == '--head':
+            request['include'] = True
+            request['method'] = request['method'] or 'HEAD'
+        index += 1
+    request['method'] = request['method'] or ('GET' if get or not data_seen else 'POST')
+    return request
+
+
+def parse_httpie(tokens):
+    request = {'client': os.path.basename(tokens[0]), 'method': '', 'url': '', 'headers': [], 'body': '',
+               'include': True, 'write_out': '', 'user': ''}
+    fields = {}
+    for token in tokens[1:]:
+        if token.startswith('-'):
+            continue
+        if not request['url'] and not request['method'] and token.upper() in HTTP_METHODS:
+            request['method'] = token.upper()
+        elif not request['url']:
+            url = token
+            if url.startswith(':'):
+                url = 'http://localhost' + url
+            elif not re.match(r'https?://', url):
+                url = ('https://' if request['client'] in ('https', 'xhs') else 'http://') + url
+            request['url'] = url
+        elif ':=' in token:
+            key, _, raw = token.partition(':=')
+            try:
+                fields[key] = json.loads(raw)
+            except ValueError:
+                fields[key] = raw
+        elif '==' in token:
+            continue
+        elif '=' in token:
+            key, _, value = token.partition('=')
+            fields[key] = value
+        elif ':' in token:
+            key, _, value = token.partition(':')
+            request['headers'].append([key.strip(), value.strip()])
+    if fields:
+        request['body'] = json.dumps(fields)
+    request['method'] = request['method'] or ('POST' if fields else 'GET')
+    return request
+
+
+def parse_http_output(output, request):
+    """Split captured output into status, reason, headers and body when it allows."""
+    text = output.replace('\r\n', '\n')
+    status, reason, headers, body = None, '', [], text
+    blocks = list(re.finditer(r'^HTTP/[\d.]+ (\d{3})[^\n]*$', text, re.M))
+    if blocks:
+        last = blocks[-1]
+        status = int(last.group(1))
+        reason = last.group(0).split(' ', 2)[2].strip() if last.group(0).count(' ') >= 2 else ''
+        rest = text[last.end():].lstrip('\n')
+        head, _, body = rest.partition('\n\n')
+        for line in head.splitlines():
+            key, _, value = line.partition(':')
+            if key and value:
+                headers.append([key.strip(), value.strip()])
+    elif request.get('write_out') and 'http_code' in request['write_out']:
+        lines = text.rstrip('\n').split('\n')
+        match = re.search(r'(\d{3})\s*$', lines[-1]) if lines else None
+        if match:
+            status = int(match.group(1))
+            prefix = lines[-1][:match.start()].rstrip()
+            body = '\n'.join(lines[:-1] + ([prefix] if prefix and not re.search(r'(status|code)\W*$', prefix, re.I) else []))
+    return status, reason, headers, body.strip('\n')
+
+
+def mask_json(value):
+    if isinstance(value, dict):
+        return {key: (MASK if SECRET_FIELD.search(str(key)) and not isinstance(item, (dict, list)) else mask_json(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [mask_json(item) for item in value]
+    return value
+
+
+def mask_body(body):
+    try:
+        return json.dumps(mask_json(json.loads(body)), ensure_ascii=False)
+    except ValueError:
+        return re.sub(r'((?:pass(?:word)?|secret|token|api[_-]?key)=)[^&\s]+', r'\1' + MASK, body, flags=re.I)
+
+
+def mask_headers(headers):
+    return [[key, MASK if key.lower() in SECRET_HEADERS else value] for key, value in headers]
+
+
+def http_exchanges(command, output=None, duration_ms=None, exit_code=None):
+    """Requests in one shell command, with the response when the output shows it.
+
+    Secrets are masked here, before anything is stored or drawn: auth headers,
+    cookies, `-u` passwords, URL tokens and secret-looking JSON fields.
+    """
+    calls = []
+    for segment in command_segments(unwrap_shell(command)):
+        name = os.path.basename(segment[0])
+        if name == 'curl':
+            calls.append(parse_curl(segment))
+        elif name in HTTP_CLIENTS:
+            calls.append(parse_httpie(segment))
+    exchanges = []
+    for request in calls:
+        if not request['url']:
+            continue
+        exchange = {'client': request['client'], 'method': request['method'],
+                    'url': re.sub(r'((?:token|key|secret|password)=)[^&#\s]+', r'\1' + MASK, request['url'], flags=re.I),
+                    'request_headers': mask_headers(request['headers']),
+                    'request_body': mask_body(request['body'])[:HTTP_BODY_LIMIT],
+                    'status': None, 'reason': '', 'response_headers': [], 'response_body': '',
+                    'response_size': None, 'truncated': False, 'duration_ms': duration_ms, 'exit_code': exit_code}
+        if request['user']:
+            user = request['user'].split(':', 1)[0]
+            exchange['request_headers'].append(['Authorization', f'Basic {user}:{MASK}'])
+        if output is not None and len(calls) == 1:
+            status, reason, headers, body = parse_http_output(output, request)
+            size = len(body.encode())
+            exchange.update(status=status, reason=reason, response_headers=mask_headers(headers),
+                            response_body=mask_body(body)[:HTTP_BODY_LIMIT], response_size=size,
+                            truncated=size > HTTP_BODY_LIMIT)
+        exchanges.append(exchange)
+    return exchanges
+
+
 TOOL_LINE = re.compile(r'^(?:tool: |item\.(?:started|completed): |file changes: )')
+
+
+def text_content(value):
+    """Text of a tool result given as a string or a list of text blocks."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return '\n'.join(block.get('text', '') for block in value if isinstance(block, dict)
+                         and isinstance(block.get('text'), str))
+    return None
 
 
 def activity_kind(message):
@@ -2778,6 +3230,19 @@ class Progress:
     """Render public CLI activity while preserving the complete raw event logs."""
     def __init__(self, label, kind):
         self.label, self.kind = label, kind
+        self.commands = {}
+        self.started = {}
+
+    def http(self, command, output, duration_ms=None, exit_code=None):
+        """Publish every HTTP request found in a finished shell command."""
+        if not isinstance(command, str) or not re.search(r'\b(curl|https?|xhs?)\b', command):
+            return
+        for exchange in http_exchanges(command, output if isinstance(output, str) else None,
+                                       duration_ms, exit_code):
+            emit_event('http_exchange', phase=self.label, exchange=exchange)
+            if not (team_ui and team_ui.enabled):
+                print(f"ccx: {self.label}: ⇄ {exchange['method']} {exchange['url']} "
+                      f"{exchange['status'] or '—'}", flush=True)
 
     def show(self, message, kind=None):
         """Publish one activity line; ``kind`` is text, tool, heartbeat or status.
@@ -2818,21 +3283,51 @@ class Progress:
                         inputs = block.get('input', {})
                         if not isinstance(inputs, dict):
                             inputs = {}
+                        if isinstance(inputs.get('command'), str) and block.get('id'):
+                            self.commands[block['id']] = inputs['command']
                         detail = next((inputs[k] for k in ('file_path', 'path', 'pattern', 'command') if k in inputs), '')
                         self.show(f"{block.get('name', 'tool')} {detail}".strip(), 'tool')
                     elif block.get('type') == 'text':
                         self.show(block.get('text', ''), 'text')
+            elif event.get('type') == 'user':
+                message = event.get('message', {})
+                content = message.get('content') if isinstance(message, dict) else None
+                for block in content if isinstance(content, list) else []:
+                    if isinstance(block, dict) and block.get('type') == 'tool_result':
+                        command = self.commands.pop(block.get('tool_use_id'), None)
+                        if command:
+                            self.http(command, text_content(block.get('content')))
         elif self.kind == 'kimi-cli':
             if event.get('role') == 'assistant':
                 self.show(event.get('content', ''), 'text')
                 for tool in event.get('tool_calls', []):
                     if isinstance(tool, dict):
                         self.show(str(tool.get('function', {}).get('name', '')) or 'tool', 'tool')
+                        try:
+                            arguments = json.loads(tool.get('function', {}).get('arguments') or '{}')
+                        except (ValueError, TypeError):
+                            arguments = {}
+                        if isinstance(arguments, dict) and isinstance(arguments.get('command'), str):
+                            self.commands[tool.get('id')] = arguments['command']
+            elif event.get('role') == 'tool':
+                command = self.commands.pop(event.get('tool_call_id'), None)
+                if command:
+                    self.http(command, text_content(event.get('content')))
         elif self.kind == 'mcode':
             item = event.get('item', {})
+            if event.get('type') == 'item.started' and isinstance(item, dict):
+                self.started[item.get('id')] = event.get('timestampMs')
             if event.get('type') == 'item.completed' and isinstance(item, dict):
                 if item.get('type') == 'agent_message': self.show(item.get('content', ''), 'text')
-                if item.get('type') == 'tool_call': self.show(str(item.get('toolCall', {}).get('name', '')) or 'tool', 'tool')
+                if item.get('type') == 'tool_call':
+                    call = item.get('toolCall', {}) if isinstance(item.get('toolCall'), dict) else {}
+                    self.show(str(call.get('name', '')) or 'tool', 'tool')
+                    inputs = call.get('input') if isinstance(call.get('input'), dict) else {}
+                    begun, ended = self.started.pop(item.get('id'), None), event.get('timestampMs')
+                    duration = ended - begun if isinstance(begun, int) and isinstance(ended, int) else None
+                    output = call.get('output', {})
+                    self.http(inputs.get('command'), text_content(output.get('content') if isinstance(output, dict) else output),
+                              duration)
         elif self.kind == 'codex':
             item = event.get('item', {})
             if event.get('type') in ('item.started', 'item.completed') and isinstance(item, dict):
@@ -2840,6 +3335,8 @@ class Progress:
                     # Started and completed both arrive; one line per command.
                     if event['type'] == 'item.started':
                         self.show(f"bash {item.get('command', '')}", 'tool')
+                    else:
+                        self.http(item.get('command'), item.get('aggregated_output'), None, item.get('exit_code'))
                 elif item.get('type') == 'file_change':
                     changes = item.get('changes', [])
                     if isinstance(changes, list):
@@ -4245,6 +4742,9 @@ def main():
                         ui.show_roles(roles_repo)
                     except (WorkflowError, OSError) as error:
                         ui.show_text('ERROR', str(error))
+                    continue
+                if ui and task.lower() == '/requests':
+                    ui.show_requests()
                     continue
                 if ui and task.lower() == '/timeline':
                     ui.show_timeline()

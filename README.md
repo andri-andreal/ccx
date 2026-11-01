@@ -362,6 +362,24 @@ again. The team asks the terminal for mouse reports so the wheel scrolls instead
 recalling input; select text with Shift+drag, or set `CCX_MOUSE=0` to leave the mouse
 to the terminal (the wheel then acts as ↑/↓). The layout redraws when the terminal is resized.
 
+HTTP requests the agents make with `curl`, HTTPie or `xh` are picked up from their tool
+calls (Claude, Codex, kimi and minimax) and shown as cards in the conversation:
+
+```
+▌ exec   ⇄ POST /employees                        201 Created · 14 ms · 57 B
+         └ {"id": 42, "name": "Ana", "status": "active"}
+```
+
+`/requests` opens a Postman-style view: the requests of the current task on the left
+(method, path, status), and the selected one on the right with its URL, request headers
+and body, then the response status, time, size, headers and body. JSON is indented and
+coloured. ↑/↓ choose a request; the wheel and PgUp/PgDn scroll the detail. The response
+is known when the command output shows it: `curl -i` gives status and headers, and
+`-w '%{http_code}'` gives the status; the built-in builder guidance asks for that.
+Secrets are masked before anything is stored or drawn: `Authorization`, cookies, API-key
+headers, `-u` passwords, token-like URL parameters and JSON fields such as `password`
+or `token`. Bodies are cut at 64 KB. Each run keeps the exchanges in `requests.jsonl`.
+
 When a task finishes, the team goes straight back to the composer, like a chat. The
 answer stays in the conversation, laid out as Markdown, and the view jumps to its first
 line so a long answer reads from the top; scroll for the rest. The status row reports

@@ -158,6 +158,11 @@ elif mcode:
 elif codex:
     pathlib.Path(args[args.index('-o')+1]).write_text(json.dumps(value) if schema else value)
     print(json.dumps({'type':'thread.started','thread_id':session}))
+    if case == 'curl_build' and schema and 'status' in schema['properties']:
+        command = "bash -lc 'curl -s -w \"\\n%{http_code}\" http://localhost:8080/health'"
+        print(json.dumps({'type':'item.started','item':{'type':'command_execution','command':command}}))
+        print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':command,
+                                                           'aggregated_output':'{"ok":true}\n200','exit_code':0}}))
     print(json.dumps({'type':'turn.failed' if case == 'failed_turn' else 'turn.completed'}))
 else:
     print(json.dumps({'type':'result','subtype':'success','session_id':session,
@@ -573,6 +578,104 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('┌ go-archit', rows[0])
         self.assertIn('┌──────', rows[6])
 
+    def test_http_exchanges_parse_curl_httpie_and_mask_secrets(self):
+        command = ("bash -lc 'curl -si -X POST http://localhost:8080/employees?token=abc "
+                   "-H \"Content-Type: application/json\" -H \"Authorization: Bearer abc\" "
+                   "-d \"{\\\"name\\\":\\\"Ana\\\",\\\"password\\\":\\\"hunter2\\\"}\"'")
+        output = ('HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 201 Created\r\nContent-Type: application/json\r\n'
+                  'Set-Cookie: session=xyz\r\n\r\n{"id":42,"name":"Ana"}')
+        [exchange] = workflow_module.http_exchanges(command, output, 14, 0)
+        self.assertEqual((exchange['method'], exchange['status'], exchange['reason']), ('POST', 201, 'Created'))
+        self.assertEqual(exchange['url'], 'http://localhost:8080/employees?token=••••••')
+        self.assertIn(['Authorization', '••••••'], exchange['request_headers'])
+        self.assertIn(['Set-Cookie', '••••••'], exchange['response_headers'])
+        self.assertEqual(json.loads(exchange['request_body']), {'name': 'Ana', 'password': '••••••'})
+        self.assertEqual(json.loads(exchange['response_body']), {'id': 42, 'name': 'Ana'})
+        self.assertNotIn('hunter2', json.dumps(exchange))
+        # -w "%{http_code}" puts the status on the last line.
+        [written] = workflow_module.http_exchanges("curl -s -w '\\n%{http_code}' localhost:8080/e/9",
+                                                   '{"error":"not found"}\n404')
+        self.assertEqual((written['method'], written['status'], written['response_body']),
+                         ('GET', 404, '{"error": "not found"}'))
+        # -u passwords, HTTPie items and pipelines.
+        [basic] = workflow_module.http_exchanges('curl -u ana:secret -d x=1 http://h/x | jq .', None)
+        self.assertEqual(basic['method'], 'POST')
+        self.assertIn(['Authorization', 'Basic ana:••••••'], basic['request_headers'])
+        [httpie] = workflow_module.http_exchanges('http PUT :8080/e/1 name=Ana age:=30 X-Api-Key:k', None)
+        self.assertEqual((httpie['method'], httpie['url']), ('PUT', 'http://localhost:8080/e/1'))
+        self.assertEqual(json.loads(httpie['request_body']), {'name': 'Ana', 'age': 30})
+        self.assertIn(['X-Api-Key', '••••••'], httpie['request_headers'])
+        self.assertEqual(workflow_module.http_exchanges('go test ./... && echo http is fine', 'ok'), [])
+
+    def test_request_cards_and_detail_pane(self):
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        ui = workflow_module.TeamUI(config, '/tmp/run')
+        ui.color = False
+        [exchange] = workflow_module.http_exchanges(
+            "curl -si -X POST http://localhost:8080/employees -d '{\"name\":\"Ana\"}'",
+            'HTTP/1.1 201 Created\r\nContent-Type: application/json\r\n\r\n{"id":42}', 14)
+        ui.on_event({'type': 'http_exchange', 'phase': 'build', 'exchange': exchange})
+        self.assertEqual(len(ui.requests), 1)
+        rows = [ui._plain(row) for row in ui._timeline_rows(90, 81, 6)]
+        self.assertTrue(rows[0].startswith('▌ exec   ⇄ POST /employees'))
+        self.assertTrue(rows[0].rstrip().endswith('201 Created · 14 ms · 9 B'), rows[0])
+        self.assertIn('└ {"id": 42}', rows[1])
+        detail = [ui._plain(row) for row in ui.http_detail_rows(ui.requests[0], 60)]
+        self.assertEqual(detail[0], 'POST http://localhost:8080/employees')
+        self.assertTrue(any(row.startswith('── Request') for row in detail))
+        self.assertTrue(any(row.startswith('── Response · 201 Created · 14 ms · 9 B') for row in detail))
+        self.assertIn('  "id": 42', detail)
+        ui.reset_task()
+        self.assertEqual(ui.requests, [])
+
+    def test_requests_view_shows_list_and_selected_exchange(self):
+        class Terminal(io.StringIO):
+            def isatty(self): return True
+        config = {'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c', 'CCX_REVIEWER': 'd'}
+        master, slave = pty.openpty()
+        stdin = os.fdopen(slave, 'r')
+        try:
+            with mock.patch.object(workflow_module.sys, 'stdout', new_callable=Terminal) as terminal, \
+                 mock.patch.object(workflow_module.sys, 'stdin', stdin), \
+                 mock.patch.dict(os.environ, {'TERM': 'xterm'}), \
+                 mock.patch.object(workflow_module.shutil, 'get_terminal_size', return_value=os.terminal_size((120, 30))):
+                ui = workflow_module.TeamUI(config, '/tmp/run')
+                ui.color = False
+                for command, output in (("curl -si http://h/employees", 'HTTP/1.1 200 OK\r\n\r\n[{"id":1}]'),
+                                        ("curl -si http://h/employees/9", 'HTTP/1.1 404 Not Found\r\n\r\n{"error":"nope"}')):
+                    [exchange] = workflow_module.http_exchanges(command, output)
+                    ui.on_event({'type': 'http_exchange', 'phase': 'review', 'exchange': exchange})
+                def press():
+                    for keys in (b'\x1b[A', b'\x1b'):
+                        time.sleep(0.15)
+                        os.write(master, keys)
+                presser = threading.Thread(target=press, daemon=True)
+                presser.start()
+                terminal.seek(0); terminal.truncate()
+                ui.show_requests()
+                presser.join(timeout=5)
+                frames = terminal.getvalue().split('\x1b[H\x1b[2J')
+            first, moved = frames[1], frames[-1]
+            # Opens on the newest request; ↑ selects the one before it.
+            self.assertIn('REQUESTS (2)', first)
+            self.assertIn('GET http://h/employees/9', first)
+            self.assertIn('Response · 404 Not Found', first)
+            self.assertIn('GET http://h/employees', moved)
+            self.assertIn('Response · 200 OK', moved)
+            self.assertIn('│', moved)
+        finally:
+            stdin.close()
+            os.close(master)
+
+    def test_codex_curl_reaches_requests_log_and_the_tui(self):
+        self.workflow(builder='codex')
+        run = self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CASE': 'curl_build'})
+        self.assertIn('⇄ GET http://localhost:8080/health 200', run.stdout)
+        log = sorted((self.root / 'config' / 'runs').glob('team-*/requests.jsonl'))[-1]
+        [record] = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual((record['phase'], record['status'], record['response_body']),
+                         ('build', 200, '{"ok": true}'))
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')
@@ -882,11 +985,11 @@ class IntegrationTests(unittest.TestCase):
         keys = ui._compose_keys
         # A leading slash lists commands; the exact or first prefix match is highlighted.
         self.assertIsNone(keys('/r'))
-        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/route'])
+        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/requests', '/route'])
         self.assertEqual(keys('\r'), '/result')
         # Arrow keys choose, Tab completes and leaves room for an argument.
         keys('/r')
-        keys('\x1b[B\x1b[B\x1b[B')
+        keys('\x1b[B\x1b[B\x1b[B\x1b[B')
         self.assertEqual(ui.suggestions[ui.suggestion_index][0], '/route')
         keys('\t')
         self.assertEqual(ui.input_buffer, '/route ')
