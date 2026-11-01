@@ -461,6 +461,34 @@ session starts with a clean-checkout requirement unless a matching run is resume
 Follow-up tasks may use unchanged work from the same session; unrelated external
 edits require inspection. Redirected output remains a plain one-task log.
 
+### API checks
+
+For an HTTP API task the planner adds **API checks**: requests that prove the acceptance
+criteria (method, path from the server root, headers, body, expected status and a text
+the body must contain). They are written into `PLAN.md`, so the reviewer judges them and
+the plan hash binds them. After the verification command passes, ccx starts the server,
+waits until it answers, sends each request itself (Python's `urllib`, no curl needed),
+checks the expectations and stops the server. Each request appears in the conversation
+with ✓ or ✗ and in `/requests`; a failed check goes back to the builder like a failed
+verification, and acceptance needs every check to pass. The results are kept in
+`api-checks-<round>.json`, the server output in `api-server-<round>.log`.
+
+Server settings come from `.ccx/api.json` in the project:
+
+```json
+{"server": "go run ./cmd/api", "base_url": "http://127.0.0.1:8080", "ready_path": "/health", "startup_timeout": 30}
+```
+
+Without a `server`, the team TUI offers the commands it detects (`go run ./cmd/<name>`,
+`npm start`, `python3 manage.py runserver $PORT`, …), **Server is already running**,
+**Type a command** or **Skip API checks**, and remembers the choice for the session;
+without a terminal ccx expects the server to be running already. `PORT` is set from the
+base URL. Standing checks can be committed in `.ccx/api-checks.json` (same fields as the
+planner's) and run with every task. Both files are project definitions and need the same
+trust as `.ccx/agents/`. Checks only reach a local base URL (`localhost`, `127.0.0.1`,
+`::1`); new files the server writes into the project during the checks are removed, and
+a change to an existing file fails the round.
+
 ### Agents and skills per role
 
 Each role (orchestrator, planner, builder, reviewer) has an editable definition: a

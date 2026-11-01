@@ -93,10 +93,27 @@ if schema and 'route' in schema['properties']:
         value['questions'] = json.loads(os.environ['FAKE_QUESTIONS'])
 elif schema and 'plan' in schema['properties']:
     value = {'plan':'Create implemented.py; verify with the configured command.'}
+    if case.startswith('api_checks'):
+        value['api_checks'] = [{'name':'Employee is ' + ('inactive' if case == 'api_checks_fail' else 'active'),
+            'method':'GET','path':'/employees/1','headers':[],'body':'','expect_status':200,
+            'expect_contains':'inactive' if case == 'api_checks_fail' else 'active'}]
     if case == 'planner_questions' and 'add up to three questions' in prompt:
         value['questions'] = [{'question':'Which status values?','options':['active/inactive','active/suspended/left']}]
 elif schema and 'status' in schema['properties']:
     pathlib.Path('implemented.py').write_text('print(42)\n')
+    if case.startswith('api_checks'):
+        pathlib.Path('server.py').write_text(
+            'import http.server, json, os, pathlib\n'
+            'class H(http.server.BaseHTTPRequestHandler):\n'
+            '    def log_message(self, *a): pass\n'
+            '    def do_GET(self):\n'
+            '        pathlib.Path("server-data.db").write_text("rows")\n'
+            '        code, body = (200, {"ok": True}) if self.path == "/health" else '
+            '(200, {"id": 1, "status": "active"}) if self.path == "/employees/1" else (404, {"error": "nope"})\n'
+            '        data = json.dumps(body).encode()\n'
+            '        self.send_response(code); self.send_header("Content-Type", "application/json")\n'
+            '        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)\n'
+            'http.server.HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()\n')
     feedback = json.loads(prompt.split('PREVIOUS ROUND / FIX REQUEST:\n',1)[1].split('\nReturn only a JSON object',1)[0])
     findings = (feedback.get('checker') or {}).get('findings',[]) if feedback else []
     if feedback and not feedback.get('checker'):
@@ -675,6 +692,66 @@ class IntegrationTests(unittest.TestCase):
         [record] = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual((record['phase'], record['status'], record['response_body']),
                          ('build', 200, '{"ok": true}'))
+
+    def api_project(self):
+        import socket
+        with socket.socket() as probe:
+            probe.bind(('127.0.0.1', 0))
+            port = probe.getsockname()[1]
+        (self.repo / '.ccx').mkdir(exist_ok=True)
+        (self.repo / '.ccx' / 'api.json').write_text(json.dumps(
+            {'server': 'python3 server.py', 'base_url': f'http://127.0.0.1:{port}', 'ready_path': '/health'}))
+        subprocess.run(['git', 'add', '-A'], cwd=self.repo, check=True)
+        subprocess.run(['git', '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'api'], cwd=self.repo, check=True)
+        return {**self.env, 'CCX_TRUST_PROJECT_AGENTS': '1'}
+
+    def test_api_checks_start_the_server_and_gate_acceptance(self):
+        self.workflow()
+        env = self.api_project()
+        log = self.root / 'api-prompts.jsonl'
+        run = self.ccx('team', 'Add employee endpoint', env={**env, 'FAKE_CASE': 'api_checks', 'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('✓ Employee is active — GET /employees/1 200', run.stdout)
+        self.assertIn('API checks: 1/1 passed', run.stdout)
+        run_dir = sorted((self.root / 'config' / 'runs').glob('team-*/api-checks-0.json'))[-1].parent
+        results = json.loads((run_dir / 'api-checks-0.json').read_text())['results']
+        self.assertEqual([(item['name'], item['passed']) for item in results], [('Employee is active', True)])
+        self.assertIn('## API checks (run by ccx after verification)', (run_dir / 'PLAN.md').read_text())
+        [record] = [json.loads(line) for line in (run_dir / 'requests.jsonl').read_text().splitlines()]
+        self.assertEqual((record['phase'], record['status'], record['passed']), ('api', 200, True))
+        # Files the server wrote during the checks are removed; the build output stays.
+        self.assertFalse((self.repo / 'server-data.db').exists())
+        self.assertTrue((self.repo / 'server.py').exists())
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any('api_checks' in p and 'Produce an implementation plan' in p for p in prompts))
+
+    def test_failing_api_checks_go_back_to_the_builder(self):
+        self.workflow()
+        env = self.api_project()
+        log = self.root / 'api-fail-prompts.jsonl'
+        run = self.ccx('team', 'Add employee endpoint', ok=False,
+                       env={**env, 'FAKE_CASE': 'api_checks_fail', 'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('✗ Employee is inactive', run.stdout)
+        self.assertIn('API checks failed (1 of 1: Employee is inactive: body does not contain "inactive")', run.stderr)
+        builder_prompts = [p for p in map(json.loads, log.read_text().splitlines()) if 'Implement the approved work order' in p]
+        self.assertGreater(len(builder_prompts), 1)
+        self.assertIn('"api_checks"', builder_prompts[1])
+        self.assertFalse((self.repo / 'server-data.db').exists())
+
+    def test_api_check_validation_and_local_base_url(self):
+        checks = workflow_module.validate_api_checks([
+            {'name': 'list', 'method': 'get', 'path': '/employees', 'headers': [{'name': 'Accept', 'value': 'json'}],
+             'body': '', 'expect_status': 200, 'expect_contains': '['}])
+        self.assertEqual((checks[0]['method'], checks[0]['headers']), ('GET', [['Accept', 'json']]))
+        self.assertIn('`GET /employees` → status 200, body contains "["', workflow_module.render_api_checks(checks))
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.validate_api_checks([{'method': 'GET', 'path': 'http://evil.example/x'}])
+        self.assertEqual(workflow_module.local_base_url('http://localhost:3000/'), ('http://localhost:3000', 3000))
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.local_base_url('https://api.example.com')
+        (self.repo / 'go.mod').write_text('module x\n')
+        (self.repo / 'cmd' / 'api').mkdir(parents=True)
+        (self.repo / 'cmd' / 'api' / 'main.go').write_text('package main\n')
+        self.assertEqual(workflow_module.server_candidates(self.repo)[0], 'go run ./cmd/api')
 
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')

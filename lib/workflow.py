@@ -85,7 +85,9 @@ def find_definition(kind, name, repo, use_project=True):
 
 def project_definition_files(repo):
     root = Path(repo) / '.ccx'
-    return sorted(path for kind in ('agents', 'skills') for path in (root / kind).glob('*.md') if path.is_file())
+    files = [path for kind in ('agents', 'skills') for path in (root / kind).glob('*.md') if path.is_file()]
+    files += [root / name for name in ('api.json', 'api-checks.json') if (root / name).is_file()]
+    return sorted(files)
 
 
 def project_definitions_digest(repo):
@@ -466,7 +468,7 @@ def save(path, value):
 
 
 # Required by strict schemas, but a model may omit them when they are empty.
-OMITTABLE_LISTS = {'questions'}
+OMITTABLE_LISTS = {'questions', 'api_checks'}
 
 
 def extract_json_response(text, expected):
@@ -1918,7 +1920,7 @@ class TeamUI:
 
     @staticmethod
     def panel_for(label):
-        return {'orchestrate': 'orchestrate', 'plan': 'plan', 'build': 'build', 'verification': 'build',
+        return {'orchestrate': 'orchestrate', 'plan': 'plan', 'build': 'build', 'verification': 'build', 'api': 'build',
                 'review': 'review', 'inspect': 'review', 'analysis': 'review'}.get(label)
 
     def begin(self, phase, name, model, effort):
@@ -2221,13 +2223,19 @@ class TeamUI:
         right = status_text + (' · ' + ' · '.join(extra) if extra else '')
         method = exchange.get('method', 'GET')
         path_room = max(8, text_width - len(method) - len(right) - 6)
-        line = (head + self._paint('⇄ ', 'accent') + self._paint(method, self.method_style(method) + 'b') + ' '
+        verdict = ''
+        if 'passed' in exchange:
+            verdict = self._paint('✓ ', 'okb') if exchange['passed'] else self._paint('✗ ', 'errb')
+        line = (head + verdict + self._paint('⇄ ', 'accent') + self._paint(method, self.method_style(method) + 'b') + ' '
                 + self._truncate(self.http_path(exchange.get('url', '')), path_room))
         gap = max(1, width - len(self._plain(line)) - len(right))
         rows = [self._fit(line + ' ' * gap + self._paint(status_text, self.status_style(exchange.get('status')) + 'b')
                           + (self._paint(' · ' + ' · '.join(extra), 'muted') if extra else ''), width)]
         body = exchange.get('response_body') or exchange.get('request_body') or ''
-        if body:
+        if exchange.get('failure'):
+            rows.append(self._fit(indent + self._paint('└ ' + self._truncate(f"{exchange.get('check', '')}: {exchange['failure']}",
+                                                                          text_width - 2), 'err'), width))
+        elif body:
             preview = ' '.join(body.split())
             rows.append(self._fit(indent + self._paint('└ ' + self._truncate(preview, text_width - 2), 'muted'), width))
         return rows
@@ -2268,6 +2276,9 @@ class TeamUI:
         if exchange.get('exit_code') is not None:
             meta.append(f"exit {exchange['exit_code']}")
         rows.append(self._paint(' · '.join(part for part in meta if part), 'muted'))
+        if 'passed' in exchange:
+            rows.append(self._paint(f"✓ check passed: {exchange.get('check', '')}", 'okb') if exchange['passed']
+                        else self._paint(f"✗ check failed: {exchange.get('check', '')} — {exchange.get('failure', '')}", 'errb'))
         rows.append('')
 
         def section(title, style):
@@ -3798,12 +3809,29 @@ QUESTIONS_PROPERTY = {'type': 'array', 'items': {
     'required': ['question', 'options'],
 }}
 
+API_CHECKS_PROPERTY = {'type': 'array', 'items': {
+    'type': 'object', 'additionalProperties': False,
+    'properties': {
+        'name': {'type': 'string'},
+        'method': {'type': 'string', 'enum': list(('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'))},
+        'path': {'type': 'string'},
+        'headers': {'type': 'array', 'items': {
+            'type': 'object', 'additionalProperties': False,
+            'properties': {'name': {'type': 'string'}, 'value': {'type': 'string'}},
+            'required': ['name', 'value']}},
+        'body': {'type': 'string'},
+        'expect_status': {'type': 'integer'},
+        'expect_contains': {'type': 'string'},
+    },
+    'required': ['name', 'method', 'path', 'headers', 'body', 'expect_status', 'expect_contains'],
+}}
+
 PLAN_SCHEMA = {
     'type': 'object', 'additionalProperties': False,
-    'properties': {'plan': {'type': 'string'}, 'questions': QUESTIONS_PROPERTY},
+    'properties': {'plan': {'type': 'string'}, 'questions': QUESTIONS_PROPERTY, 'api_checks': API_CHECKS_PROPERTY},
     # Codex (strict structured outputs) needs every property listed as required;
-    # an empty list means no questions.
-    'required': ['plan', 'questions'],
+    # an empty list means no questions or no API checks.
+    'required': ['plan', 'questions', 'api_checks'],
 }
 
 ROUTE_SCHEMA = {
@@ -3822,6 +3850,194 @@ ROUTE_SCHEMA = {
     },
     'required': ['route', 'reason', 'questions'],
 }
+
+
+LOCAL_HOSTS = ('127.0.0.1', 'localhost', '::1', '[::1]', '0.0.0.0')
+API_DEFAULT_BASE = 'http://127.0.0.1:8080'
+
+
+def validate_api_checks(value):
+    """Usable API checks: a method, a path under the base URL, and an expectation."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 30:
+        raise WorkflowError('Planner returned an invalid API check list.')
+    checks = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise WorkflowError('Planner returned an invalid API check.')
+        method = str(item.get('method', 'GET')).upper()
+        path = str(item.get('path', ''))
+        if method not in HTTP_METHODS or not path.startswith('/') or '://' in path:
+            raise WorkflowError(f'Invalid API check {item.get("name", path)!r}: need a method and a path starting with /.')
+        headers = [[str(h.get('name', '')), str(h.get('value', ''))] for h in item.get('headers') or []
+                   if isinstance(h, dict) and h.get('name')]
+        status = item.get('expect_status', 0)
+        checks.append({'name': str(item.get('name') or f'{method} {path}')[:120], 'method': method, 'path': path,
+                       'headers': headers, 'body': str(item.get('body') or ''),
+                       'expect_status': status if isinstance(status, int) and 0 <= status < 600 else 0,
+                       'expect_contains': str(item.get('expect_contains') or '')})
+    return checks
+
+
+def render_api_checks(checks):
+    """Plan section listing the checks, so the reviewer sees them and the plan hash binds them."""
+    if not checks:
+        return ''
+    lines = ['', '', '## API checks (run by ccx after verification)', '']
+    for check in checks:
+        expect = f"status {check['expect_status']}" if check['expect_status'] else 'any 2xx status'
+        if check['expect_contains']:
+            expect += f", body contains {json.dumps(check['expect_contains'])}"
+        body = f" with body `{check['body'][:200]}`" if check['body'] else ''
+        lines.append(f"- **{check['name']}**: `{check['method']} {check['path']}`{body} → {expect}")
+    return '\n'.join(lines)
+
+
+def load_api_config(repo, use_project=True):
+    """Server settings and standing checks from .ccx/api.json and .ccx/api-checks.json."""
+    config = {'server': '', 'base_url': '', 'ready_path': '/', 'startup_timeout': 30, 'checks': []}
+    if not use_project:
+        return config
+    try:
+        data = json.loads((Path(repo) / '.ccx' / 'api.json').read_text())
+        if isinstance(data, dict):
+            for key in ('server', 'base_url', 'ready_path'):
+                if isinstance(data.get(key), str):
+                    config[key] = data[key]
+            if isinstance(data.get('startup_timeout'), int) and 1 <= data['startup_timeout'] <= 600:
+                config['startup_timeout'] = data['startup_timeout']
+    except (OSError, ValueError):
+        pass
+    try:
+        config['checks'] = validate_api_checks(json.loads((Path(repo) / '.ccx' / 'api-checks.json').read_text()))
+    except (OSError, ValueError):
+        pass
+    except WorkflowError as error:
+        status(f'ignoring .ccx/api-checks.json: {error}')
+    return config
+
+
+def local_base_url(base_url):
+    """The base URL when it points at this machine; API checks never leave it."""
+    match = re.match(r'^(https?)://([^/:]+|\[[^\]]+\])(?::(\d+))?/?$', base_url or '')
+    if not match or match.group(2) not in LOCAL_HOSTS:
+        raise WorkflowError(f'API checks need a local base URL such as {API_DEFAULT_BASE}; got {base_url!r}.')
+    return base_url.rstrip('/'), int(match.group(3) or (443 if match.group(1) == 'https' else 80))
+
+
+def server_candidates(repo):
+    """Commands that probably start the project's HTTP server, best first."""
+    repo = Path(repo)
+    candidates = []
+    if (repo / 'go.mod').is_file():
+        commands = sorted(path.parent for path in (repo / 'cmd').glob('*/main.go')) if (repo / 'cmd').is_dir() else []
+        candidates += [f'go run ./{path.relative_to(repo).as_posix()}' for path in commands]
+        if (repo / 'main.go').is_file():
+            candidates.append('go run .')
+    if (repo / 'package.json').is_file():
+        try:
+            scripts = json.loads((repo / 'package.json').read_text()).get('scripts', {})
+        except (OSError, ValueError, AttributeError):
+            scripts = {}
+        candidates += [f'npm run {name}' if name != 'start' else 'npm start'
+                       for name in ('start', 'dev', 'serve') if isinstance(scripts, dict) and name in scripts]
+    if (repo / 'manage.py').is_file():
+        candidates.append('python3 manage.py runserver $PORT')
+    for name in ('main.py', 'app.py', 'server.py'):
+        if (repo / name).is_file():
+            candidates.append(f'python3 {name}')
+    return candidates
+
+
+def run_api_checks(checks, server, base_url, ready_path, startup_timeout, repo, log_path, label='api'):
+    """Start the server, run each check over HTTP, stop the server; returns results.
+
+    Each request is published as an http_exchange (masked like agent requests)
+    with the check's verdict, so it shows in the conversation and /requests.
+    """
+    import urllib.request
+    import urllib.error
+    base, port = local_base_url(base_url)
+    results = []
+    process = None
+    log = open(log_path, 'wb')
+    try:
+        if server:
+            process = subprocess.Popen(['bash', '-c', server], cwd=repo, stdin=subprocess.DEVNULL, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True,
+                                       env={**os.environ, 'PORT': str(port)})
+        deadline = time.monotonic() + startup_timeout
+        while True:
+            try:
+                urllib.request.urlopen(base + (ready_path or '/'), timeout=2).close()
+                break
+            except urllib.error.HTTPError:
+                break
+            except (urllib.error.URLError, OSError):
+                if process is not None and process.poll() is not None:
+                    raise WorkflowError(f'API server exited with {process.returncode} before it was ready; '
+                                        f'see {log_path}')
+                if time.monotonic() > deadline:
+                    raise WorkflowError(f'API server did not answer at {base} within {startup_timeout}s; '
+                                        f'see {log_path}')
+                time.sleep(0.3)
+        for check in checks:
+            headers = dict(check['headers'])
+            data = check['body'].encode() if check['body'] else None
+            if data and not any(key.lower() == 'content-type' for key in headers):
+                headers['Content-Type'] = 'application/json' if check['body'].lstrip()[:1] in '{[' else 'text/plain'
+            request = urllib.request.Request(base + check['path'], data=data, method=check['method'], headers=headers)
+            started = time.monotonic()
+            status_code, reason, response_headers, body, error = None, '', [], b'', ''
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    status_code, reason = response.status, response.reason
+                    response_headers, body = list(response.headers.items()), response.read(HTTP_BODY_LIMIT + 1)
+            except urllib.error.HTTPError as failure:
+                status_code, reason = failure.code, failure.reason
+                response_headers, body = list(failure.headers.items()), failure.read(HTTP_BODY_LIMIT + 1)
+            except (urllib.error.URLError, OSError) as failure:
+                error = str(getattr(failure, 'reason', failure))
+            duration = int((time.monotonic() - started) * 1000)
+            text = body[:HTTP_BODY_LIMIT].decode('utf-8', errors='replace')
+            if error:
+                passed, why = False, f'request failed: {error}'
+            elif check['expect_status'] and status_code != check['expect_status']:
+                passed, why = False, f"expected status {check['expect_status']}, got {status_code}"
+            elif not check['expect_status'] and not 200 <= (status_code or 0) < 300:
+                passed, why = False, f'expected a 2xx status, got {status_code}'
+            elif check['expect_contains'] and check['expect_contains'] not in text:
+                passed, why = False, f"body does not contain {json.dumps(check['expect_contains'])}"
+            else:
+                passed, why = True, ''
+            exchange = {'client': 'ccx', 'method': check['method'], 'url': base + check['path'],
+                        'request_headers': mask_headers([list(item) for item in headers.items()]),
+                        'request_body': mask_body(check['body'])[:HTTP_BODY_LIMIT],
+                        'status': status_code, 'reason': reason or '',
+                        'response_headers': mask_headers([list(item) for item in response_headers]),
+                        'response_body': mask_body(text), 'response_size': len(body),
+                        'truncated': len(body) > HTTP_BODY_LIMIT, 'duration_ms': duration, 'exit_code': None,
+                        'check': check['name'], 'passed': passed, 'failure': why}
+            emit_event('http_exchange', phase=label, exchange=exchange)
+            if not (team_ui and team_ui.enabled):
+                print(f"ccx: {label}: {'✓' if passed else '✗'} {check['name']} — {check['method']} {check['path']} "
+                      f"{status_code or '—'}{' (' + why + ')' if why else ''}", flush=True)
+            results.append({'name': check['name'], 'passed': passed, 'failure': why, 'status': status_code,
+                            'method': check['method'], 'path': check['path'], 'body': text[:2000]})
+    finally:
+        if process is not None and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=5)
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        log.close()
+    return results
 
 
 def settle_follow_up(review, previous):
@@ -4239,6 +4455,62 @@ class Loop:
             raise WorkflowError('Reviewer blocked: ' + value['summary'])
         return value
 
+    def api_server(self):
+        """Command that starts the server for API checks; '' when it is already running."""
+        if 'CCX_API_SERVER' in self.config:
+            return self.config['CCX_API_SERVER']
+        if self.api['server']:
+            return self.api['server']
+        base = self.config.get('CCX_API_BASE') or self.api['base_url'] or API_DEFAULT_BASE
+        if not (team_ui and team_ui._can_pick()):
+            status(f'no API server command; expecting the server at {base} (set "server" in .ccx/api.json)')
+            return ''
+        options = [(command, command, 'detected') for command in server_candidates(self.repo)]
+        options += [(f'Server is already running at {base}', '-', ''), ('Type a command', '', ''),
+                    ('Skip API checks', None, 'verification still runs')]
+        chosen = team_ui.select_choice('API SERVER', options,
+                                       subtitle=f'{len(self.api_checks)} API check(s) need the server running at {base}. '
+                                                'PORT is set from the base URL.')
+        if chosen == '':
+            try:
+                chosen = team_ui.read_command('Server command: ').strip() or None
+            except (EOFError, KeyboardInterrupt):
+                chosen = None
+        if chosen is None:
+            self.config['CCX_API_SKIP'] = '1'
+            return None
+        self.config['CCX_API_SERVER'] = '' if chosen == '-' else chosen
+        self.config['CCX_API_SOURCE'] = 'prompt'
+        return self.config['CCX_API_SERVER']
+
+    def verify_api(self, attempt, base):
+        """Run the approved API checks against a fresh server; files it creates are removed."""
+        if self.config.get('CCX_API_SKIP') == '1':
+            return []
+        server = self.api_server()
+        if server is None:
+            return []
+        url = self.config.get('CCX_API_BASE') or self.api['base_url'] or API_DEFAULT_BASE
+        status(f'running {len(self.api_checks)} API check(s) against {url}')
+        before = project_snapshot(self.repo, base, self.tracked)
+        try:
+            results = run_api_checks(self.api_checks, server, url, self.api['ready_path'],
+                                     self.api['startup_timeout'], self.repo,
+                                     self.run_dir / f'api-server-{attempt}.log')
+        except WorkflowError as error:
+            results = [{'name': 'API server', 'passed': False, 'failure': str(error), 'status': None,
+                        'method': '', 'path': '', 'body': ''}]
+        after = project_snapshot(self.repo, base, self.tracked)
+        known = {item['path']: item['sha256'] for item in before['files']}
+        for item in after['files']:
+            if item['path'] not in known and item['kind'] == 'file':
+                (self.repo / item['path']).unlink(missing_ok=True)
+            elif item['path'] in known and known[item['path']] != item['sha256']:
+                results.append({'name': 'checkout', 'passed': False, 'status': None, 'method': '', 'path': '',
+                                'body': '', 'failure': f"the server changed {item['path']} during the checks"})
+        save(self.run_dir / f'api-checks-{attempt}.json', {'base_url': url, 'server': server, 'results': results})
+        return results
+
     def plan_budget_exhausted(self, plan, review, review_only):
         """The plan ran out of review rounds: let the user decide instead of discarding it.
 
@@ -4329,6 +4601,8 @@ class Loop:
                 status('project agents in .ccx/ are not trusted yet; using user and built-in agents '
                        '(review them in the team TUI or set CCX_TRUST_PROJECT_AGENTS=1)')
         self.agents, warnings = load_agents(self.repo, use_project)
+        self.api = load_api_config(self.repo, use_project)
+        self.api_checks = list(self.api['checks'])
         for warning in warnings:
             status('agents: ' + warning)
         save(self.run_dir / 'agents.json', {role: {key: value for key, value in agent.items() if key != 'body'}
@@ -4454,11 +4728,15 @@ class Loop:
                        'answers them before the next plan. ' if interactive else
                        'Record those as unresolved questions in the plan. ') +
                     'Treat the USER ANSWERS section as decisions already made by the user. '
-                    'Return JSON with field plan (markdown string) and questions (an empty list when there '
-                    'are none).\nTASK:\n' + task + answer_block +
+                    'If the task builds or changes an HTTP API, add api_checks: requests the host will send to '
+                    'the running server after verification to prove the acceptance criteria (method, a path from '
+                    'the server root, headers, a JSON body as a string or empty, the expected status, and a text '
+                    'the response body must contain or empty). Otherwise api_checks is an empty list. '
+                    'Return JSON with field plan (markdown string), questions and api_checks (empty lists when '
+                    'there are none).\nTASK:\n' + task + answer_block +
                     '\nVERIFICATION COMMAND:\n' + self.config['CCX_PROOF'] + '\nPREVIOUS PLAN:\n' + plan +
                     '\nREVIEW FEEDBACK:\n' + feedback, PLAN_SCHEMA)
-                if (not isinstance(value, dict) or 'plan' not in value or set(value) - {'plan', 'questions'}
+                if (not isinstance(value, dict) or 'plan' not in value or set(value) - {'plan', 'questions', 'api_checks'}
                         or not isinstance(value['plan'], str) or not value['plan'].strip()):
                     raise WorkflowError('Planner did not return a nonempty plan.')
                 if project_snapshot(self.repo, base, self.tracked) != original:
@@ -4472,17 +4750,20 @@ class Loop:
                     plan = value['plan']
                     status('planning again with your answers')
                     continue
-                plan = value['plan']
+                plan_checks = validate_api_checks(value.get('api_checks'))
+                plan = value['plan'] + render_api_checks(plan_checks)
                 (self.run_dir / 'PLAN.md').write_text(plan)
                 if previous:
                     review = self.review('review', plan, base, {'previous_findings': previous})
                 else:
                     review = self.review('review', plan, base)
                 done_rounds += 1
+                self.plan_checks = plan_checks
                 if review['verdict'] == 'APPROVED':
                     break
                 previous = [f for f in review['findings'] if f['severity'] in ('high', 'medium')]
                 feedback = json.dumps(review)
+            self.api_checks = self.api_checks + getattr(self, 'plan_checks', [])
             if review_only:
                 return ('Plan approved; review-only run finished.\n\nPlan:\n' + plan +
                         '\n\nReview:\n' + review['summary'])
@@ -4525,28 +4806,39 @@ class Loop:
             proof = {'command': self.config['CCX_PROOF'], 'exit_code': code}
             for stream in ('stdout', 'stderr'):
                 proof[stream] = (self.run_dir / f'proof-{attempt}.{stream}.txt').read_text(errors='replace')[-65536:]
+            api_results = self.verify_api(attempt, base) if code == 0 and self.api_checks else []
+            api_ok = all(item['passed'] for item in api_results)
+            if api_results:
+                proof['api_checks'] = api_results
             context = {'round': attempt + 1, 'builder': builder, 'proof': proof,
                        'previous_findings': findings, 'builder_snapshot': built_snapshot,
                        'proof_changed_checkout': proof_snapshot != built_snapshot}
-            result = self.review('inspect', plan, base, context) if code == 0 else None
+            result = self.review('inspect', plan, base, context) if code == 0 and api_ok else None
             if sha((self.run_dir / 'PLAN.md').read_bytes()) != approval['plan_sha256']:
                 raise WorkflowError('Plan changed during implementation or inspection.')
             feedback = {**context, 'checker': result}
             history.append(feedback)
             save(self.run_dir / 'consensus-rounds.json', history)
             expected = project_snapshot(self.repo, base, self.tracked)
-            if code == 0 and builder['status'] == 'READY' and result['verdict'] == 'APPROVED' and expected == built_snapshot:
+            if (code == 0 and api_ok and builder['status'] == 'READY' and result['verdict'] == 'APPROVED'
+                    and expected == built_snapshot):
                 save(self.run_dir / 'consensus.json', {'plan_sha256': approval['plan_sha256'],
                      'snapshot': expected, 'builder': builder, 'checker': result,
                      'proof': proof, 'round': attempt + 1})
                 return ('Builder and checker agree. Build verified and independently inspected. Changes are ready to review.'
                         + '\n\nBuilder: ' + builder['summary'] + '\n\nReviewer: ' + result['summary']
-                        + '\n\nVerification: ' + proof['command'] + ' (passed)')
+                        + '\n\nVerification: ' + proof['command'] + ' (passed)'
+                        + (f"\n\nAPI checks: {len(api_results)}/{len(api_results)} passed" if api_results else ''))
             if result is not None:
                 findings = result['findings']
             status(f'no agreement in round {attempt + 1}')
         if code:
             raise WorkflowError(f'Verification failed (exit {code}); consensus budget exhausted; changes preserved.')
+        if not api_ok:
+            failed = [item for item in api_results if not item['passed']]
+            raise WorkflowError(f'API checks failed ({len(failed)} of {len(api_results)}: '
+                                + '; '.join(f"{item['name']}: {item['failure']}" for item in failed[:3])
+                                + '); consensus budget exhausted; changes preserved.')
         raise WorkflowError('Builder/checker consensus budget exhausted; unresolved responses and findings preserved.')
 
 
@@ -5015,6 +5307,9 @@ def main():
                     if run_config.get('CCX_PROOF_SOURCE') == 'prompt':
                         config['CCX_PROOF'] = run_config['CCX_PROOF']
                         config['CCX_PROOF_SOURCE'] = 'session'
+                    for key in ('CCX_API_SERVER', 'CCX_API_SKIP'):
+                        if key in run_config:
+                            config[key] = run_config[key]
                     event_journal = None
                     team_ui = None
         finally:
