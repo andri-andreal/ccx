@@ -180,10 +180,13 @@ elif codex:
         print(json.dumps({'type':'item.started','item':{'type':'command_execution','command':command}}))
         print(json.dumps({'type':'item.completed','item':{'type':'command_execution','command':command,
                                                            'aggregated_output':'{"ok":true}\n200','exit_code':0}}))
-    print(json.dumps({'type':'turn.failed' if case == 'failed_turn' else 'turn.completed'}))
+    print(json.dumps({'type':'turn.failed' if case == 'failed_turn' else 'turn.completed',
+                      'usage':{'input_tokens':1200,'cached_input_tokens':1000,'output_tokens':80}}))
 else:
     print(json.dumps({'type':'result','subtype':'success','session_id':session,
-        'structured_output':value if schema else None,'result':value if not schema else '', 'is_error':False}))
+        'structured_output':value if schema else None,'result':value if not schema else '', 'is_error':False,
+        'usage':{'input_tokens':10,'cache_creation_input_tokens':100,'cache_read_input_tokens':400,'output_tokens':50},
+        'total_cost_usd':0.002}))
 '''
 
 
@@ -771,6 +774,46 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotIn(str(resolved / 'Documents'), args)
         with mock.patch.dict(os.environ, {'CCX_SANDBOX_HOME': 'open'}):
             self.assertEqual(workflow_module.home_isolation(self.repo), [])
+
+    def test_token_usage_is_normalized_recorded_and_shown(self):
+        normalize = workflow_module.normalize_usage
+        self.assertEqual(normalize({'input_tokens': 2, 'cache_creation_input_tokens': 771,
+                                    'cache_read_input_tokens': 4333, 'output_tokens': 133}),
+                         {'input': 2, 'cache_read': 4333, 'cache_write': 771, 'output': 133})
+        self.assertEqual(normalize({'input_tokens': 12000, 'cached_input_tokens': 9000, 'output_tokens': 800}),
+                         {'input': 3000, 'cache_read': 9000, 'cache_write': 0, 'output': 800})
+        self.assertEqual(normalize({'inputTokens': 149656, 'outputTokens': 45262, 'cacheReadTokens': 4048896}),
+                         {'input': 149656, 'cache_read': 4048896, 'cache_write': 0, 'output': 45262})
+        self.assertEqual(normalize({'prompt_tokens': 50, 'completion_tokens': 5}),
+                         {'input': 50, 'cache_read': 0, 'cache_write': 0, 'output': 5})
+        self.assertEqual(workflow_module.usage_text(
+            {'input': 2, 'cache_read': 4333, 'cache_write': 771, 'output': 133, 'cost_usd': 0.0049}),
+            'in 5.1k (cache 5.1k) · out 133 · $0.0049')
+        # End to end: claude planner/builder report cost, the codex reviewer only tokens.
+        self.workflow()
+        run = self.ccx('team', 'Implement fixture')
+        self.assertIn('ccx: tokens: in ', run.stderr)
+        usage_file = sorted((self.root / 'config' / 'runs').glob('team-*/usage.json'))[-1]
+        record = json.loads(usage_file.read_text())
+        self.assertEqual(record['phases']['plan'], {'input': 10, 'cache_read': 400, 'cache_write': 100,
+                                                    'output': 50, 'cost_usd': 0.002})
+        self.assertEqual(record['phases']['review']['cache_read'], 1000)
+        self.assertNotIn('cost_usd', record['phases']['review'])
+        self.assertEqual(record['total']['output'], sum(item['output'] for item in record['phases'].values()))
+        # The rail and status row read the same events.
+        ui = workflow_module.TeamUI({'CCX_ORCHESTRATOR': 'a', 'CCX_PLANNER': 'b', 'CCX_BUILDER': 'c',
+                                     'CCX_REVIEWER': 'd'}, '/tmp/run')
+        ui.color = False
+        ui.begin('plan', 'claude', 'm', 'medium')
+        ui.on_event({'type': 'usage', 'phase': 'plan', 'final': False,
+                     'usage': {'input': 1, 'cache_read': 900, 'cache_write': 0, 'output': 20}})
+        self.assertIn('tokens: in 901 (cache 900) · out 20', '\n'.join(ui._agent_block(ui.panels['plan'], 60)[1]))
+        self.assertIn('in 901 (cache 900) · out 20', ui._plain(ui._status_row(120)))
+        ui.on_event({'type': 'usage', 'phase': 'plan', 'final': True,
+                     'usage': {'input': 1, 'cache_read': 900, 'cache_write': 0, 'output': 40, 'cost_usd': 0.01}})
+        self.assertEqual(ui.task_usage()['output'], 40)
+        ui.reset_task()
+        self.assertEqual(ui.task_usage(), {})
 
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')

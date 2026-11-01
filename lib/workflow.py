@@ -503,6 +503,16 @@ class EventJournal:
                  'type': kind, **payload}
         with self.path.open('a', encoding='utf-8') as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + '\n')
+        if kind == 'usage' and payload.get('final'):
+            target = self.path.parent / 'usage.json'
+            try:
+                record = json.loads(target.read_text())
+            except (OSError, ValueError):
+                record = {'phases': {}, 'total': {}}
+            phase = str(payload.get('phase', 'agent'))
+            record['phases'][phase] = add_usage(record['phases'].get(phase, {}), payload.get('usage', {}))
+            record['total'] = add_usage(record.get('total', {}), payload.get('usage', {}))
+            target.write_text(json.dumps(record, indent=2) + '\n')
         if kind == 'http_exchange':
             with (self.path.parent / 'requests.jsonl').open('a', encoding='utf-8') as stream:
                 stream.write(json.dumps({'phase': payload.get('phase'), **payload.get('exchange', {})},
@@ -794,6 +804,16 @@ class TeamUI:
             self.done(phase, event.get('ok', True))
         elif kind == 'activity':
             self.update(phase, event.get('message', ''), event.get('category'))
+        elif kind == 'usage':
+            key = self.panel_for(phase)
+            usage = event.get('usage') if isinstance(event.get('usage'), dict) else {}
+            if key:
+                panel = self.panels[key]
+                if event.get('final'):
+                    panel['usage'] = add_usage(dict(panel.get('usage') or {}), usage)
+                    panel['usage_live'] = None
+                else:
+                    panel['usage_live'] = usage
         elif kind == 'http_exchange':
             exchange = event.get('exchange')
             key = self.panel_for(phase)
@@ -1657,6 +1677,8 @@ class TeamUI:
             panel['model'] = ''
             panel['effort'] = ''
             panel['started_at'] = None
+            panel['usage'] = {}
+            panel['usage_live'] = None
 
     def show_text(self, title, body, allow_resume=False, actions=None, markdown=False, diff=False):
         """Show a scrollable text view with a picker of follow-up actions.
@@ -1913,6 +1935,12 @@ class TeamUI:
                             text += '\n\nRecent activity:\n' + '\n'.join(activity[-100:])
                 except (OSError, ValueError, TypeError):
                     text += '\n\nSome saved details could not be read.'
+                try:
+                    spent = json.loads((path / 'usage.json').read_text())
+                    lines = [f"- {phase}: {usage_text(usage)}" for phase, usage in spent.get('phases', {}).items()]
+                    text += '\n\nTokens: ' + usage_text(spent.get('total', {})) + ('\n' + '\n'.join(lines) if lines else '')
+                except (OSError, ValueError, AttributeError):
+                    pass
                 text += f'\n\nArtifacts: {path}'
                 can_resume = result.get('status') == 'completed' and isinstance(item.get('checkpoint'), dict)
                 if self.show_text('RUN DETAIL', text, allow_resume=can_resume, markdown=True):
@@ -1954,6 +1982,19 @@ class TeamUI:
             if started:
                 panel['lines'].append(f'finished in {time.monotonic() - started:.1f}s')
         self.render()
+
+    def panel_usage(self, panel):
+        """Finished turns plus the one still streaming."""
+        total = dict(panel.get('usage') or {})
+        if panel.get('usage_live'):
+            add_usage(total, panel['usage_live'])
+        return total
+
+    def task_usage(self):
+        total = {}
+        for panel in self.panels.values():
+            add_usage(total, self.panel_usage(panel))
+        return total
 
     def tick(self):
         """Redraw a few times a second while an agent runs: spinner and FLOW animation."""
@@ -2592,6 +2633,9 @@ class TeamUI:
             meta.append(f'effort {panel["effort"]}')
         if meta:
             details.append(self._paint(self._truncate('model: ' + ' · '.join(meta), width), 'muted'))
+        usage = self.panel_usage(panel)
+        if usage:
+            details.append(self._paint(self._truncate('tokens: ' + usage_text(usage), width), 'muted'))
         for line in list(panel['lines'])[-6:]:
             details.append(self._paint(self._truncate('▸ ' + str(line), width), 'muted'))
         return summary, details
@@ -2829,7 +2873,8 @@ class TeamUI:
             marker = frames[self.spinner_frame % len(frames)]
             self.spinner_frame += 1
             title = self.panels[self.active]['title']
-            tail = f' {title} is working · {self._elapsed()} · esc to interrupt'
+            tokens = usage_text(self.task_usage(), cost=False)
+            tail = f' {title} is working · {self._elapsed()}' + (f' · {tokens}' if tokens else '') + ' · esc to interrupt'
             return self._fit(self._paint(' ' + marker, 'accentb') + self._paint(tail, 'accent'), width)
         return self._fit(' ' + self._paint(self.footer, 'muted'), width)
 
@@ -3241,6 +3286,64 @@ def http_exchanges(command, output=None, duration_ms=None, exit_code=None):
 TOOL_LINE = re.compile(r'^(?:tool: |item\.(?:started|completed): |file changes: )')
 
 
+def normalize_usage(raw):
+    """Token counts in one shape: fresh input, cache read, cache write, output.
+
+    Claude reports cache reads and writes beside a small fresh input; Codex
+    (OpenAI) counts cached tokens inside input_tokens; minimax uses camelCase
+    with cache reads separate; OpenAI-style replies use prompt/completion.
+    """
+    if not isinstance(raw, dict):
+        return None
+    number = lambda *keys: next((int(raw[key]) for key in keys if isinstance(raw.get(key), (int, float))), 0)
+    if 'inputTokens' in raw or 'outputTokens' in raw:
+        usage = {'input': number('inputTokens'), 'cache_read': number('cacheReadTokens'),
+                 'cache_write': number('cacheWriteTokens', 'cacheCreationTokens'), 'output': number('outputTokens')}
+    elif 'cached_input_tokens' in raw:
+        cached = number('cached_input_tokens')
+        usage = {'input': max(0, number('input_tokens') - cached), 'cache_read': cached, 'cache_write': 0,
+                 'output': number('output_tokens')}
+    elif 'input_tokens' in raw or 'output_tokens' in raw:
+        usage = {'input': number('input_tokens'), 'cache_read': number('cache_read_input_tokens'),
+                 'cache_write': number('cache_creation_input_tokens'), 'output': number('output_tokens')}
+    elif 'prompt_tokens' in raw or 'completion_tokens' in raw:
+        details = raw.get('prompt_tokens_details') if isinstance(raw.get('prompt_tokens_details'), dict) else {}
+        cached = int(details.get('cached_tokens') or 0)
+        usage = {'input': max(0, number('prompt_tokens') - cached), 'cache_read': cached, 'cache_write': 0,
+                 'output': number('completion_tokens')}
+    else:
+        return None
+    return usage
+
+
+def add_usage(total, usage):
+    if not usage:
+        return total
+    for key in ('input', 'cache_read', 'cache_write', 'output'):
+        total[key] = total.get(key, 0) + usage.get(key, 0)
+    if usage.get('cost_usd') is not None:
+        total['cost_usd'] = round(total.get('cost_usd', 0) + usage['cost_usd'], 6)
+    return total
+
+
+def format_tokens(value):
+    value = int(value or 0)
+    return f'{value / 1_000_000:.1f}M' if value >= 1_000_000 else f'{value / 1000:.1f}k' if value >= 1000 else str(value)
+
+
+def usage_text(usage, cost=True):
+    """`in 5.1k (cache 4.3k) · out 133 · $0.0049`: input counts every prompt token."""
+    if not usage:
+        return ''
+    cached = usage.get('cache_read', 0) + usage.get('cache_write', 0)
+    total_in = usage.get('input', 0) + cached
+    text = f"in {format_tokens(total_in)}" + (f" (cache {format_tokens(cached)})" if cached else '')
+    text += f" · out {format_tokens(usage.get('output', 0))}"
+    if cost and usage.get('cost_usd') is not None:
+        text += f" · ${usage['cost_usd']:.4f}"
+    return text
+
+
 def text_content(value):
     """Text of a tool result given as a string or a list of text blocks."""
     if isinstance(value, str):
@@ -3277,6 +3380,17 @@ class Progress:
         self.label, self.kind = label, kind
         self.commands = {}
         self.started = {}
+        self.turns = {}
+        self.cost = False
+
+    def usage(self, usage, final, cost_usd=None):
+        """Publish token usage: live while a Claude turn streams, final at the end."""
+        if not usage:
+            return
+        usage = dict(usage)
+        if cost_usd is not None and self.cost:
+            usage['cost_usd'] = round(float(cost_usd), 6)
+        emit_event('usage', phase=self.label, usage=usage, final=final)
 
     def http(self, command, output, duration_ms=None, exit_code=None):
         """Publish every HTTP request found in a finished shell command."""
@@ -3317,8 +3431,17 @@ class Progress:
         if not isinstance(event, dict):
             return
         if self.kind == 'claude':
+            if event.get('type') == 'result':
+                self.usage(normalize_usage(event.get('usage')), True, event.get('total_cost_usd'))
             if event.get('type') == 'assistant':
                 message = event.get('message', {})
+                if isinstance(message, dict) and normalize_usage(message.get('usage')):
+                    # Each message reports its own usage; the live figure is their sum.
+                    self.turns[message.get('id') or len(self.turns)] = normalize_usage(message['usage'])
+                    total = {}
+                    for part in self.turns.values():
+                        add_usage(total, part)
+                    self.usage(total, False)
                 if not isinstance(message, dict) or not isinstance(message.get('content'), list):
                     return
                 for block in message['content']:
@@ -3343,6 +3466,8 @@ class Progress:
                         if command:
                             self.http(command, text_content(block.get('content')))
         elif self.kind == 'kimi-cli':
+            if normalize_usage(event.get('usage')):
+                self.usage(normalize_usage(event['usage']), False)
             if event.get('role') == 'assistant':
                 self.show(event.get('content', ''), 'text')
                 for tool in event.get('tool_calls', []):
@@ -3359,6 +3484,8 @@ class Progress:
                 if command:
                     self.http(command, text_content(event.get('content')))
         elif self.kind == 'mcode':
+            if event.get('type') == 'turn.completed':
+                self.usage(normalize_usage(event.get('usage')), True)
             item = event.get('item', {})
             if event.get('type') == 'item.started' and isinstance(item, dict):
                 self.started[item.get('id')] = event.get('timestampMs')
@@ -3374,6 +3501,8 @@ class Progress:
                     self.http(inputs.get('command'), text_content(output.get('content') if isinstance(output, dict) else output),
                               duration)
         elif self.kind == 'codex':
+            if event.get('type') == 'turn.completed':
+                self.usage(normalize_usage(event.get('usage')), True)
             item = event.get('item', {})
             if event.get('type') in ('item.started', 'item.completed') and isinstance(item, dict):
                 if item.get('type') == 'command_execution':
@@ -3455,8 +3584,9 @@ def read_running_input(ui, fd, decoder):
     return False
 
 
-def execute(command, cwd, prompt, timeout, output, error, label='process', kind='text'):
+def execute(command, cwd, prompt, timeout, output, error, label='process', kind='text', cost=False):
     progress = Progress(label, kind)
+    progress.cost = cost
     started = time.monotonic()
     next_heartbeat = started + 10
     terminal_state = None
@@ -4367,7 +4497,8 @@ class Loop:
             if output_schema:
                 command += ['--json-schema', json.dumps(output_schema)]
         code = execute(command, self.repo, prompt, self.timeout,
-                       directory / 'stdout.txt', directory / 'stderr.txt', phase, provider if is_extra else ('codex' if is_codex else 'claude'))
+                       directory / 'stdout.txt', directory / 'stderr.txt', phase, provider if is_extra else ('codex' if is_codex else 'claude'),
+                       cost=provider == 'claude')
         if code:
             emit_event('agent_finished', phase=phase, ok=False)
             if provider == 'mcode' and output_schema and 'STRUCTURED_OUTPUT_INVALID' in (directory / 'stdout.txt').read_text(errors='replace'):
@@ -5303,6 +5434,9 @@ def main():
                         ui.result_status = 'completed'
                         ui.enable_completion(repo)
                         done = f'✓ Completed in {ui._elapsed()}'
+                        tokens = usage_text(ui.task_usage())
+                        if tokens:
+                            done += ' · ' + tokens
                         if not tracked:
                             ui.footer = done + ' · /result · no git repository, undo unavailable'
                         elif checkpoint['error']:
@@ -5315,6 +5449,11 @@ def main():
                         ui.render()
                     else:
                         print(message)
+                        try:
+                            spent = json.loads((run_dir / 'usage.json').read_text())
+                            print('ccx: tokens: ' + usage_text(spent.get('total', {})), file=sys.stderr)
+                        except (OSError, ValueError, AttributeError):
+                            pass
                         return 0
                 except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     if run_dir:

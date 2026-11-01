@@ -362,6 +362,17 @@ again. The team asks the terminal for mouse reports so the wheel scrolls instead
 recalling input; select text with Shift+drag, or set `CCX_MOUSE=0` to leave the mouse
 to the terminal (the wheel then acts as ↑/↓). The layout redraws when the terminal is resized.
 
+Token use is read from each CLI's own stream and split into input and output. Input
+counts every prompt token, with the cached part shown separately, because Claude
+reports most of a prompt as cache reads. Each agent in the rail shows
+`tokens: in 154.2k (cache 4.0M) · out 45.3k`; the status row carries the running total
+for the task and the completion line ends with it. Claude reports per message, so its
+figure moves while it works; Codex and minimax report once, when the agent finishes.
+Cost (`· $0.0049`) is shown only for native Claude profiles, because profiles routed to
+other models report Anthropic prices. Each run keeps per-phase and total counts in
+`usage.json`; `/history` shows them for a run, and non-interactive runs print a
+`ccx: tokens:` line.
+
 HTTP requests the agents make with `curl`, HTTPie or `xh` are picked up from their tool
 calls (Claude, Codex, kimi and minimax) and shown as cards in the conversation:
 
