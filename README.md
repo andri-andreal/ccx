@@ -641,7 +641,11 @@ naming the open findings and the saved `PLAN.md`.
 
 Every agent prompt names the project directory and says that files elsewhere on the
 machine are not part of the project, so a reviewer of an empty folder does not borrow
-conventions from neighbouring repositories. A read-only agent (orchestrator, planner,
+conventions from neighbouring repositories. The kimi and minimax sandboxes enforce it: `bwrap`
+replaces `$HOME` with an empty tmpfs and binds back only its dot entries (configs,
+toolchains, CLI data) read-only, the project, the ccx install and the CLI install
+prefixes, so neighbouring repositories, `~/Documents` and similar folders are not
+visible. `CCX_SANDBOX_HOME=open` restores the previous read-only view of the whole home. A read-only agent (orchestrator, planner,
 reviewer) whose JSON reply is malformed, such as an unescaped quote inside a string,
 is asked once more with a note to escape quotes and keep findings short.
 

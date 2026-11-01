@@ -2993,6 +2993,40 @@ CURL_ARG_LONG = {'request', 'header', 'data', 'data-raw', 'data-binary', 'data-a
 CURL_ARG_SHORT = set('XHduwoFbmAeEKrxTUz')
 
 
+def home_isolation(repo, keep=()):
+    """bwrap arguments that hide the home directory except what an agent needs.
+
+    The root stays read-only and visible, but $HOME is replaced by an empty
+    tmpfs: dot entries (configs, toolchains, CLI data) come back read-only,
+    and so do the project, the ccx install and the CLI binaries' install
+    prefixes. Other folders, such as neighbouring repositories, stay hidden.
+    CCX_SANDBOX_HOME=open turns this off.
+    """
+    home = Path.home().resolve()
+    if os.environ.get('CCX_SANDBOX_HOME') == 'open' or not home.is_dir() or home == Path('/'):
+        return []
+    args = ['--tmpfs', str(home)]
+    try:
+        entries = sorted(home.iterdir())
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry.name.startswith('.'):
+            args += ['--ro-bind-try', str(entry), str(entry)]
+    for item in keep:
+        if not item:
+            continue
+        path = Path(item).resolve()
+        if path.is_file():
+            path = path.parent.parent if path.parent.name == 'bin' else path.parent
+        if home in path.parents and not path.relative_to(home).parts[0].startswith('.'):
+            args += ['--ro-bind-try', str(path), str(path)]
+    project = Path(repo).resolve()
+    if home in project.parents:
+        args += ['--ro-bind', str(project), str(project)]
+    return args
+
+
 def unwrap_shell(command):
     """`bash -lc 'curl …'` -> `curl …`; other commands are returned as they are."""
     try:
@@ -4281,8 +4315,11 @@ class Loop:
             if not data.is_dir():
                 raise WorkflowError(f'{provider} data directory missing: {data}; sign in first.')
             sandbox = ['bwrap', '--die-with-parent', '--ro-bind', '/', '/',
-                       '--dev-bind', '/dev', '/dev', '--proc', '/proc',
-                       '--bind', str(data), str(data)]
+                       '--dev-bind', '/dev', '/dev', '--proc', '/proc']
+            sandbox += home_isolation(self.repo, [Path(self.ccx).resolve().parent.parent,
+                                                  shutil.which(os.environ.get('CCX_KIMI_BIN', 'kimi')),
+                                                  shutil.which(os.environ.get('CCX_MCODE_BIN', 'mcode'))])
+            sandbox += ['--bind', str(data), str(data)]
             if provider == 'mcode':
                 scratch = directory / 'tmp'
                 scratch.mkdir(mode=0o700)

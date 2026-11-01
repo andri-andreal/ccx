@@ -753,6 +753,25 @@ class IntegrationTests(unittest.TestCase):
         (self.repo / 'cmd' / 'api' / 'main.go').write_text('package main\n')
         self.assertEqual(workflow_module.server_candidates(self.repo)[0], 'go run ./cmd/api')
 
+    def test_sandbox_hides_home_except_dot_entries_project_and_tools(self):
+        home = self.root / 'home'
+        for name in ('.config', '.local', 'Projects/other-repo', 'Projects/mine', 'Documents', 'apps/tool/bin'):
+            (home / name).mkdir(parents=True)
+        (home / 'apps' / 'tool' / 'bin' / 'tool').write_text('#!/bin/sh\n')
+        with mock.patch.object(workflow_module.Path, 'home', return_value=home), \
+             mock.patch.dict(os.environ, {'CCX_SANDBOX_HOME': ''}):
+            args = workflow_module.home_isolation(home / 'Projects' / 'mine', [home / 'apps' / 'tool' / 'bin' / 'tool'])
+        resolved = home.resolve()
+        self.assertEqual(args[:2], ['--tmpfs', str(resolved)])
+        self.assertIn(['--ro-bind-try', str(resolved / '.config'), str(resolved / '.config')],
+                      [args[i:i + 3] for i in range(len(args))])
+        self.assertIn(str(resolved / 'apps' / 'tool'), args)
+        self.assertIn(str(resolved / 'Projects' / 'mine'), args)
+        self.assertNotIn(str(resolved / 'Projects' / 'other-repo'), args)
+        self.assertNotIn(str(resolved / 'Documents'), args)
+        with mock.patch.dict(os.environ, {'CCX_SANDBOX_HOME': 'open'}):
+            self.assertEqual(workflow_module.home_isolation(self.repo), [])
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')
