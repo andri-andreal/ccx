@@ -1,8 +1,11 @@
-# ccx - Claude Code and Codex profile/provider switcher
+# ccx - Claude Code and Codex profile switcher, plus a multi-agent coding team
 
 `ccx` launches Claude Code, Codex, Kimi Code or MiniMax Code through named profiles. Use your existing
-CLI login, select another provider/model, or save a workflow that plans, builds,
-tests and checks changes until the builder and checker agree.
+CLI login, select another provider/model, or put several of those CLIs on one team:
+an orchestrator, a planner, a builder and a reviewer that plan, build, test and check
+changes until the builder and checker agree, all in one terminal window.
+
+![ccx team running a four-agent loop: Claude routes, Codex plans, MiniMax reviews and Kimi builds, with live HTTP request cards, token use and an animated hand-off diagram](images/team-running.png)
 
 Claude Code profiles support Anthropic-compatible providers and OpenAI-compatible
 backends through the bundled Rust translator, `ccx-router`. Native Codex profiles
@@ -10,9 +13,57 @@ run Codex CLI directly with its own authentication and configuration. Third-part
 Claude profiles are isolated by default; native Claude and Codex profiles reuse
 their existing login unless you request isolation. Neither CLI is patched.
 
-[Quick start](#quick-start) · [OAuth login](#login-and-default-cli-settings) ·
-[Workflows](#create-a-workflow-once-launch-by-name) · [CLI options](#cli-reference) ·
-[CachyOS / Arch](#cachyos--arch-linux) · [Desktop GUI](gui/README.md)
+[ccx team](#ccx-team-four-agents-one-window) · [Quick start](#quick-start) ·
+[OAuth login](#login-and-default-cli-settings) · [Workflows](#create-a-workflow-once-launch-by-name) ·
+[CLI options](#cli-reference) · [CachyOS / Arch](#cachyos--arch-linux) · [Desktop GUI](gui/README.md)
+
+## ccx team: four agents, one window
+
+Profiles answer "which model runs my Claude Code?". A **team workflow** goes further: it
+puts different CLIs and models on different jobs and makes them check each other.
+
+```bash
+# Uses existing profiles; create them first, e.g. ccx new --name kimi-native --provider kimi-cli
+ccx new --name team --type loop --orchestrator claude --planner codex \
+        --builder kimi-native --reviewer minimax-native --yes
+ccx default team    # optional: plain `ccx` now opens the team
+ccx team            # open the team TUI in your project
+```
+
+| | What you get |
+|---|---|
+| **Cross-model review** | The plan and the code are reviewed by a different model than the one that wrote them; the build is accepted only when the builder says `READY`, the reviewer says `APPROVED` and verification passes on the same code. |
+| **Modes** | Shift+Tab cycles **auto** (the orchestrator picks a route), **plan** (plan and review, then stop for your approval), **build** and **inspect** (read-only). |
+| **Proof, not promises** | Your test command runs after every build. For HTTP APIs the planner writes **API checks**; ccx starts the server, sends the requests and gates acceptance on them. |
+| **See every request** | `curl`/HTTPie calls from any agent become request cards; `/requests` opens a Postman-style view with headers and pretty JSON, secrets masked. |
+| **Know what it costs** | Input and output tokens per agent and per task, cache hits shown separately, cost for native Claude. |
+| **Watch the hand-offs** | The FLOW panel draws the four agents and animates each hand-off; the rail shows every agent's CLI, model, definition and skills. |
+| **Shape the agents** | Each role has an editable Markdown definition and skills (built-in, yours, or committed with the project), reviewed before use. |
+| **Change course in place** | `/config` swaps a role's CLI, model or effort, the budgets and verification without leaving the window; `/undo` restores the files of the last task. |
+| **Contained** | kimi and MiniMax agents run in a `bwrap` sandbox that hides the rest of your home directory. |
+
+When a task finishes, the answer lands in the conversation as Markdown and the
+composer is ready for the next one, like a chat:
+
+![ccx team after a run: the conclusion rendered as Markdown with a table, two passed API checks, and the token total in the status line](images/team-finished.png)
+
+<table>
+<tr>
+<td width="55%"><img src="images/team-requests.png" alt="The /requests view: a list of requests on the left and the selected POST with masked Authorization header, JSON request body and JSON response on the right"></td>
+<td width="45%"><img src="images/team-config.png" alt="The /config screen listing each role's CLI profile, model and effort, the loop budgets, verification, API checks and display settings"></td>
+</tr>
+<tr>
+<td><sub><code>/requests</code>: every HTTP call an agent made, like an API client</sub></td>
+<td><sub><code>/config</code>: change roles, models and budgets without leaving the TUI</sub></td>
+</tr>
+</table>
+
+The screenshots are drawn by the TUI's own rendering code from a demo run:
+`python3 scripts/readme_screenshots.py` regenerates them.
+Details: [workflows](#create-a-workflow-once-launch-by-name), [API checks](#api-checks),
+[agents and skills](#agents-and-skills-per-role), [default profile](#default-profile).
+
+### And still a profile switcher
 
 ![ccx running Claude Code under four profiles at once, each answering "which model are you using?" with a different model](images/ccx.png)
 
