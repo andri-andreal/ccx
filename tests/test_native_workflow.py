@@ -91,6 +91,10 @@ if schema and 'route' in schema['properties']:
     value = {'route':os.environ.get('FAKE_ROUTE', 'plan'), 'reason':'Fixture routing.'}
     if os.environ.get('FAKE_QUESTIONS'):
         value['questions'] = json.loads(os.environ['FAKE_QUESTIONS'])
+elif schema and 'milestones' in schema['properties']:
+    value = {'summary':'Two steps to an employee API.','decisions':['Go with net/http','SQLite store'],
+             'milestones':[{'id':'a','title':'Skeleton and tests','goal':'Create implemented.py','acceptance':['proof passes']},
+                           {'id':'b','title':'Status endpoint','goal':'Extend implemented.py','acceptance':['proof passes']}]}
 elif schema and 'plan' in schema['properties']:
     value = {'plan':'Create implemented.py; verify with the configured command.'}
     if case.startswith('api_checks'):
@@ -1032,6 +1036,92 @@ class IntegrationTests(unittest.TestCase):
         finally:
             os.close(master)
 
+    def test_roadmap_helpers_validate_render_carry_context_and_store(self):
+        roadmap = workflow_module.validate_roadmap({'summary': 's', 'decisions': ['Go', ' '], 'milestones': [
+            {'id': 'x', 'title': 'Skeleton', 'goal': 'Set up', 'acceptance': ['builds', '']},
+            {'id': 'y', 'title': 'Store', 'goal': 'Add store', 'acceptance': []},
+            {'id': 'z', 'title': 'API', 'goal': 'Add API', 'acceptance': []}]})
+        self.assertEqual([item['id'] for item in roadmap['milestones']], ['m1', 'm2', 'm3'])
+        self.assertEqual(roadmap['decisions'], ['Go'])
+        with self.assertRaises(workflow_module.WorkflowError):
+            workflow_module.validate_roadmap({'milestones': []})
+        roadmap['goal'] = 'Employee API'
+        roadmap['milestones'][0].update(status='done', outcome='Skeleton with go test passing.')
+        text = workflow_module.render_roadmap(roadmap)
+        self.assertIn('Roadmap · 1/3 done', text)
+        self.assertIn('✓ **Skeleton** · done', text)
+        task = workflow_module.milestone_task(roadmap, 'm2')
+        self.assertTrue(task.startswith('ROADMAP MILESTONE m2: Store'))
+        for piece in ('Project goal: Employee API', '- Go', 'm1 Skeleton: Skeleton with go test passing.',
+                      'Later milestones (do not start them): m3 API'):
+            self.assertIn(piece, task)
+        self.assertEqual(workflow_module.next_milestone(roadmap)['id'], 'm2')
+        revised = workflow_module.validate_roadmap({'summary': '', 'decisions': [], 'milestones': [
+            {'id': '1', 'title': 'skeleton', 'goal': 'Set up', 'acceptance': []},
+            {'id': '2', 'title': 'Auth', 'goal': 'Add auth', 'acceptance': []}]})
+        merged = workflow_module.merge_roadmap(roadmap, revised)
+        self.assertEqual([item['status'] for item in merged['milestones']], ['done', 'pending'])
+        with mock.patch.dict(os.environ, {'CCX_HOME': str(self.root / 'config')}):
+            workflow_module.save_roadmap(self.repo, roadmap)
+            path = workflow_module.roadmap_path(self.repo)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertFalse(str(path).startswith(str(self.repo)))
+            self.assertEqual(workflow_module.load_roadmap(self.repo)['goal'], 'Employee API')
+
+    def test_roadmap_plans_milestones_and_runs_them_in_order(self):
+        self.workflow()
+        log = self.root / 'roadmap-prompts.jsonl'
+        master, proc, read_until = self.tui_session({**self.env, 'TERM': 'xterm', 'FAKE_PROMPT_LOG': str(log)})
+        try:
+            with proc:
+                read_until(b'Describe a task')
+                os.write(master, b'/roadmap Build an employee API\n')
+                screen = read_until(b'Enter select')
+                self.assertIn(b'ROADMAP', screen)
+                self.assertIn(b'Skeleton and tests', screen)
+                os.write(master, b'\x1b[B')
+                read_until(b'Enter select')
+                os.write(master, b'\r')
+                done = read_until(b'roadmap complete')
+                self.assertIn(b'roadmap 2/2', done)
+                read_until(b'Describe a task')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=15), 0)
+            with mock.patch.dict(os.environ, {'CCX_HOME': str(self.root / 'config')}):
+                stored = workflow_module.load_roadmap(self.repo)
+            self.assertEqual([item['status'] for item in stored['milestones']], ['done', 'done'])
+            self.assertEqual(stored['goal'], 'Build an employee API')
+            prompts = [json.loads(line) for line in log.read_text().splitlines()]
+            second = [p for p in prompts if 'ROADMAP MILESTONE m2: Status endpoint' in p]
+            self.assertTrue(second)
+            self.assertIn('Completed milestones:', second[0])
+            self.assertIn('m1 Skeleton and tests:', second[0])
+            self.assertIn('- Go with net/http', second[0])
+        finally:
+            os.close(master)
+
+    def test_failed_milestone_pauses_the_roadmap(self):
+        self.workflow()
+        master, proc, read_until = self.tui_session({**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'builder_blocked'})
+        try:
+            with proc:
+                read_until(b'Describe a task')
+                os.write(master, b'/roadmap Build an employee API\n')
+                read_until(b'Enter select')
+                os.write(master, b'\x1b[B')
+                read_until(b'Enter select')
+                os.write(master, b'\r')
+                paused = read_until(b'roadmap paused')
+                self.assertIn(b'Milestone m1 failed', paused)
+                read_until(b'Describe a task')
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=15), 0)
+            with mock.patch.dict(os.environ, {'CCX_HOME': str(self.root / 'config')}):
+                stored = workflow_module.load_roadmap(self.repo)
+            self.assertEqual([item['status'] for item in stored['milestones']], ['failed', 'pending'])
+        finally:
+            os.close(master)
+
     def test_invalid_reviewer_json_is_asked_once_more(self):
         self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--yes')
         self.workflow(reviewer='mcode')
@@ -1132,7 +1222,7 @@ class IntegrationTests(unittest.TestCase):
             elif isinstance(node, list):
                 for child in node:
                     check(child, where)
-        for name in ('PLAN_SCHEMA', 'ROUTE_SCHEMA', 'REVIEW_SCHEMA', 'BUILD_SCHEMA'):
+        for name in ('PLAN_SCHEMA', 'ROUTE_SCHEMA', 'REVIEW_SCHEMA', 'BUILD_SCHEMA', 'ROADMAP_SCHEMA'):
             check(getattr(workflow_module, name), name)
 
     def test_settle_follow_up_keeps_unresolved_and_new_high_findings(self):
@@ -1341,11 +1431,11 @@ class IntegrationTests(unittest.TestCase):
         keys = ui._compose_keys
         # A leading slash lists commands; the exact or first prefix match is highlighted.
         self.assertIsNone(keys('/r'))
-        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/requests', '/route'])
+        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/requests', '/roadmap', '/route'])
         self.assertEqual(keys('\r'), '/result')
         # Arrow keys choose, Tab completes and leaves room for an argument.
         keys('/r')
-        keys('\x1b[B\x1b[B\x1b[B\x1b[B')
+        keys('\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B')
         self.assertEqual(ui.suggestions[ui.suggestion_index][0], '/route')
         keys('\t')
         self.assertEqual(ui.input_buffer, '/route ')

@@ -309,6 +309,7 @@ COMMANDS = [
     ('/queue', 'Show queued tasks'),
     ('/mode', 'Pick the mode: auto, plan (stop for approval), build, inspect'),
     ('/build', 'Build the plan you approved in plan mode'),
+    ('/roadmap', 'Plan a large goal as milestones, then run them one by one'),
     ('/route', 'Show or set the route: auto, plan, direct, inspect'),
     ('/proof', 'Show or set the verification command'),
     ('/editor', 'Write a multiline task in $EDITOR'),
@@ -799,6 +800,8 @@ class TeamUI:
         # Composer mode and the plan approved in plan mode, waiting for /build.
         self.mode = 'auto'
         self.approved = None
+        # Roadmap progress for the header, e.g. 'roadmap 2/6'.
+        self.roadmap_label = ''
         self.flow_used = set()
         self._last_tick = 0.0
         # Mouse reports let the wheel scroll the conversation while ↑/↓ keep
@@ -1336,6 +1339,31 @@ class TeamUI:
         elif self.panels['orchestrate']['status'] == 'not configured':
             self.panels['orchestrate']['status'] = 'waiting'
         self._previous_rows = None
+
+    def roadmap_menu(self, roadmap):
+        """Roadmap screen; returns ('run', id), ('all', None), ('revise', text) or None."""
+        upcoming = next_milestone(roadmap)
+        actions = []
+        if upcoming:
+            actions.append((f"Run next milestone: {upcoming['id']} {upcoming['title']}", ('run', upcoming['id'])))
+            actions.append(('Run all remaining milestones', ('all', None)))
+            actions.append(('Run a specific milestone', ('pick', None)))
+        actions += [('Revise the roadmap with feedback', ('revise', None)), ('Close', None)]
+        choice = self.show_text('ROADMAP', render_roadmap(roadmap), actions=actions, markdown=True)
+        if not choice:
+            return None
+        if choice[0] == 'pick':
+            options = [(f"{ROADMAP_MARKS.get(item['status'], '○')} {item['id']} {item['title']}", item['id'], item['status'])
+                       for item in roadmap['milestones']]
+            chosen = self.select_choice('MILESTONE', options)
+            return ('run', chosen) if chosen else None
+        if choice[0] == 'revise':
+            try:
+                text = self.read_command('Roadmap feedback: ').strip()
+            except (EOFError, KeyboardInterrupt):
+                text = ''
+            return ('revise', text) if text else None
+        return choice
 
     def show_roles(self, repo):
         """Pick a role, read its effective definition, and edit a project copy."""
@@ -2387,6 +2415,8 @@ class TeamUI:
         parts = [self._paint('ccx', 'accentb'), self._paint(' team', 'accent')]
         if self.route:
             parts.append('  ' + self._paint(self.route, 'userb'))
+        if self.roadmap_label:
+            parts.append('  ' + self._paint(self.roadmap_label, 'warnb'))
         context = str(Path.cwd())
         if self.branch:
             context += ' · ' + self.branch
@@ -4384,6 +4414,20 @@ PLAN_SCHEMA = {
     'required': ['plan', 'questions', 'api_checks'],
 }
 
+ROADMAP_SCHEMA = {
+    'type': 'object', 'additionalProperties': False,
+    'properties': {
+        'summary': {'type': 'string'},
+        'decisions': {'type': 'array', 'items': {'type': 'string'}},
+        'milestones': {'type': 'array', 'items': {
+            'type': 'object', 'additionalProperties': False,
+            'properties': {'id': {'type': 'string'}, 'title': {'type': 'string'}, 'goal': {'type': 'string'},
+                           'acceptance': {'type': 'array', 'items': {'type': 'string'}}},
+            'required': ['id', 'title', 'goal', 'acceptance']}},
+    },
+    'required': ['summary', 'decisions', 'milestones'],
+}
+
 ROUTE_SCHEMA = {
     'type': 'object', 'additionalProperties': False,
     'properties': {
@@ -4588,6 +4632,105 @@ def run_api_checks(checks, server, base_url, ready_path, startup_timeout, repo, 
                 process.wait()
         log.close()
     return results
+
+
+def validate_roadmap(value):
+    """A usable roadmap: a summary, kept decisions and 1-15 ordered milestones."""
+    if not isinstance(value, dict) or not isinstance(value.get('milestones'), list):
+        raise WorkflowError('Planner did not return a roadmap.')
+    milestones = []
+    for number, item in enumerate(value['milestones'], start=1):
+        if not isinstance(item, dict) or not str(item.get('title', '')).strip() or not str(item.get('goal', '')).strip():
+            raise WorkflowError('Roadmap milestone without a title or goal.')
+        acceptance = [str(line).strip() for line in item.get('acceptance') or [] if str(line).strip()]
+        milestones.append({'id': f'm{number}', 'title': str(item['title']).strip()[:120],
+                           'goal': str(item['goal']).strip()[:4000], 'acceptance': acceptance[:12],
+                           'status': 'pending', 'outcome': '', 'run': ''})
+    if not 1 <= len(milestones) <= 15:
+        raise WorkflowError('A roadmap needs between 1 and 15 milestones.')
+    decisions = [str(line).strip()[:400] for line in value.get('decisions') or [] if str(line).strip()][:20]
+    return {'summary': str(value.get('summary', '')).strip()[:4000], 'decisions': decisions, 'milestones': milestones}
+
+
+ROADMAP_MARKS = {'pending': '○', 'running': '●', 'done': '✓', 'failed': '✗'}
+
+
+def render_roadmap(roadmap):
+    """Markdown view of a roadmap with each milestone's status."""
+    done = sum(item['status'] == 'done' for item in roadmap['milestones'])
+    lines = [f"## Roadmap · {done}/{len(roadmap['milestones'])} done", '', f"**Goal:** {roadmap.get('goal', '')}", '']
+    if roadmap.get('summary'):
+        lines += [roadmap['summary'], '']
+    if roadmap.get('decisions'):
+        lines += ['### Decisions to keep', ''] + [f'- {line}' for line in roadmap['decisions']] + ['']
+    lines += ['### Milestones', '']
+    for item in roadmap['milestones']:
+        lines.append(f"{item['id'][1:]}. {ROADMAP_MARKS.get(item['status'], '○')} **{item['title']}** · {item['status']}")
+        lines.append(f"   {item['goal']}")
+        for criterion in item.get('acceptance', []):
+            lines.append(f'   - {criterion}')
+        if item.get('outcome'):
+            lines.append(f"   > {' '.join(item['outcome'].split())[:300]}")
+    return '\n'.join(lines)
+
+
+def roadmap_path(repo):
+    return ccx_home() / 'roadmaps' / (sha(os.fsencode(str(Path(repo).resolve()))) + '.json')
+
+
+def load_roadmap(repo):
+    try:
+        value = json.loads(roadmap_path(repo).read_text())
+        return value if isinstance(value, dict) and isinstance(value.get('milestones'), list) else None
+    except (OSError, ValueError):
+        return None
+
+
+def save_roadmap(repo, roadmap):
+    """Keep the roadmap outside the checkout, private, one file per project."""
+    path = roadmap_path(repo)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    roadmap['repo'] = str(Path(repo).resolve())
+    roadmap['updated'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(roadmap, indent=2, ensure_ascii=False) + '\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def merge_roadmap(previous, revised):
+    """A revised roadmap keeps the outcome of milestones already done under the same title."""
+    finished = {item['title'].lower(): item for item in (previous or {}).get('milestones', []) if item['status'] == 'done'}
+    for item in revised['milestones']:
+        old = finished.get(item['title'].lower())
+        if old:
+            item.update(status='done', outcome=old.get('outcome', ''), run=old.get('run', ''))
+    return revised
+
+
+def next_milestone(roadmap):
+    return next((item for item in roadmap['milestones'] if item['status'] != 'done'), None)
+
+
+def milestone_task(roadmap, milestone_id):
+    """Task text for one milestone, carrying the goal, decisions and finished work."""
+    current = next(item for item in roadmap['milestones'] if item['id'] == milestone_id)
+    done = [item for item in roadmap['milestones'] if item['status'] == 'done']
+    later = [item for item in roadmap['milestones'] if item['status'] != 'done' and item['id'] != milestone_id]
+    parts = [f"ROADMAP MILESTONE {current['id']}: {current['title']}", '',
+             f"Project goal: {roadmap.get('goal', '')}"]
+    if roadmap.get('decisions'):
+        parts += ['', 'Architecture decisions to keep:'] + [f'- {line}' for line in roadmap['decisions']]
+    if done:
+        parts += ['', 'Completed milestones:'] + [f"- {item['id']} {item['title']}: {' '.join(item['outcome'].split())[:400]}"
+                                                 for item in done]
+    parts += ['', 'This milestone:', current['goal']]
+    if current.get('acceptance'):
+        parts += ['Acceptance criteria:'] + [f'- {line}' for line in current['acceptance']]
+    if later:
+        parts += ['', 'Later milestones (do not start them): ' + '; '.join(f"{item['id']} {item['title']}" for item in later)]
+    parts += ['', 'If docs/ARCHITECTURE.md exists, follow it and update it when this milestone changes a decision.']
+    return '\n'.join(parts)
 
 
 def settle_follow_up(review, previous):
@@ -5069,6 +5212,51 @@ class Loop:
         save(self.run_dir / f'api-checks-{attempt}.json', {'base_url': url, 'server': server, 'results': results})
         return results
 
+    def make_roadmap(self, goal, previous, base, original):
+        """Planner drafts milestones, reviewer checks them; result goes to roadmap.json."""
+        emit_event('route_selected', route='plan', review_only=True)
+        save(self.run_dir / 'route.json', {'route': 'roadmap', 'reason': 'roadmap planning', 'source': 'user'})
+        current = render_roadmap(previous) if previous else ''
+        feedback, review, previous_findings, roadmap, text = '', None, [], None, ''
+        rounds = int(self.config['CCX_ROUNDS'])
+        for round_number in range(rounds):
+            status(f'roadmap round {round_number + 1}/{rounds}')
+            value = self.call('planner', 'plan',
+                'Read the project, then turn the goal into a roadmap: 3 to 10 milestones, each small enough for one '
+                'plan, build, verify and review task, and each leaving the project working and tested. Order them so '
+                'each builds on the previous ones. The first milestone sets up the skeleton, a verification command '
+                'and docs/ARCHITECTURE.md recording the decisions. List as decisions the architecture choices later '
+                'milestones must keep (stack, layout, data model, API style, conventions); pick conventional defaults '
+                'where the goal is silent. Do not edit files or run commands. Give each milestone an id, a title, '
+                'a goal and observable acceptance criteria.\nGOAL:\n' + goal
+                + ('\nCURRENT ROADMAP (revise it; keep finished milestones):\n' + current if current else '')
+                + '\nREVIEW FEEDBACK:\n' + feedback, ROADMAP_SCHEMA)
+            if project_snapshot(self.repo, base, self.tracked) != original:
+                raise WorkflowError(self.changed('changed during roadmap planning.'))
+            roadmap = merge_roadmap(previous, validate_roadmap(value))
+            roadmap['goal'] = goal.split('\n\nFeedback on the roadmap:')[0]
+            text = render_roadmap(roadmap)
+            (self.run_dir / 'ROADMAP.md').write_text(text)
+            if previous_findings:
+                review = self.review('review', text, base, {'previous_findings': previous_findings})
+            else:
+                review = self.review('review', text, base)
+            if review['verdict'] == 'APPROVED':
+                break
+            previous_findings = [f for f in review['findings'] if f['severity'] in ('high', 'medium')]
+            feedback = json.dumps(review)
+        else:
+            if not (team_ui and team_ui._can_pick()):
+                raise WorkflowError(f'Roadmap review round budget exhausted; the latest draft is in {self.run_dir / "ROADMAP.md"}.')
+            choice = team_ui.select_choice('ROADMAP REVIEW BUDGET USED UP', [
+                ('Accept this roadmap', 'accept', f"{len(previous_findings)} high/medium finding(s) open"),
+                ('Stop', None, 'keep the draft file, change nothing')],
+                subtitle='The reviewer still has open findings on the roadmap.')
+            if choice != 'accept':
+                raise WorkflowError(f'Roadmap not accepted; the latest draft is in {self.run_dir / "ROADMAP.md"}.')
+        save(self.run_dir / 'roadmap.json', roadmap)
+        return text + '\n\nOpen /roadmap to run the milestones.'
+
     def plan_budget_exhausted(self, plan, review, review_only):
         """The plan ran out of review rounds: let the user decide instead of discarding it.
 
@@ -5195,11 +5383,13 @@ class Loop:
                 return False
             raise WorkflowError('Stopped: project agents were not accepted.')
 
-    def run(self, task, review_only, route_override='auto', approved=None):
+    def run(self, task, review_only, route_override='auto', approved=None, roadmap=None):
         self.prepare_agents()
         self.approved_from = Path(approved) if approved else None
         base = git(self.repo, 'rev-parse', 'HEAD').decode().strip() if self.tracked else ''
         original = project_snapshot(self.repo, base, self.tracked)
+        if roadmap is not None:
+            return self.make_roadmap(task, roadmap, base, original)
         route = 'plan'
         answers = []
         if route_override != 'auto':
@@ -5478,6 +5668,7 @@ def main():
         team_name = config_path.parent.name
         pending = args.task
         selected_route = args.route
+        roadmap_running, roadmap_auto, roadmap_previous, roadmap_feedback = None, False, None, ''
         if ui:
             ui.mode = 'plan' if args.review_only else ROUTE_MODES.get(args.route, 'auto')
         last_result = ''
@@ -5493,6 +5684,11 @@ def main():
                 workspace, tracked = resolve_workspace()
                 ui.tracked = tracked
                 ui.enable_completion(workspace)
+                saved_roadmap = load_roadmap(workspace)
+                if saved_roadmap:
+                    finished = sum(item['status'] == 'done' for item in saved_roadmap['milestones'])
+                    ui.roadmap_label = f"roadmap {finished}/{len(saved_roadmap['milestones'])}"
+
             except (WorkflowError, OSError):
                 pass
             ui.enter()
@@ -5508,6 +5704,7 @@ def main():
                 task = pending.strip()
                 pending = None
                 approved_from = None
+                roadmap_goal = None
                 if ui and task.lower() in ('/quit', '/exit', 'q'):
                     break
                 if ui and task.lower() in ('/', '/commands'):
@@ -5757,6 +5954,39 @@ def main():
                     else:
                         ui.footer = 'Invalid mode; use auto, plan, build, or inspect'
                     continue
+                if ui and (task.lower() == '/roadmap' or task.lower().startswith('/roadmap ')):
+                    try:
+                        roadmap_repo, _ = resolve_workspace()
+                    except (WorkflowError, OSError):
+                        roadmap_repo = Path.cwd()
+                    goal = task[8:].strip()
+                    current = load_roadmap(roadmap_repo)
+                    if goal:
+                        if current and ui._can_pick() and ui.select_choice('REPLACE ROADMAP?', [
+                                ('Plan a new roadmap', 'new', 'the current one is replaced'),
+                                ('Keep the current roadmap', None, '')]) != 'new':
+                            continue
+                        roadmap_goal, roadmap_previous = goal, None
+                        task = goal
+                    elif not current:
+                        ui.footer = 'No roadmap yet · /roadmap <goal> plans one'
+                        continue
+                    else:
+                        action = ('revise', roadmap_feedback) if roadmap_feedback else ui.roadmap_menu(current)
+                        roadmap_feedback = ''
+                        if not action:
+                            continue
+                        if action[0] == 'revise':
+                            roadmap_goal, roadmap_previous = current['goal'] + '\n\nFeedback on the roadmap: ' + action[1], current
+                            task = roadmap_goal
+                        else:
+                            roadmap_auto = action[0] == 'all'
+                            target = action[1] or (next_milestone(current) or {}).get('id')
+                            if not target:
+                                continue
+                            roadmap_running = target
+                            pending = milestone_task(current, target)
+                            continue
                 if ui and task.lower() == '/build':
                     if not ui.approved:
                         ui.footer = 'No approved plan yet · switch to plan mode (shift+tab) and send a task'
@@ -5774,6 +6004,11 @@ def main():
                 if ui:
                     run_route = MODE_ROUTES.get(ui.mode, selected_route)
                     run_review_only = args.review_only or ui.mode == 'plan'
+                if roadmap_goal is not None:
+                    run_route, run_review_only = 'plan', True
+                elif roadmap_running and task.startswith('ROADMAP MILESTONE '):
+                    # Milestones always plan; plan mode still stops for approval.
+                    run_route = 'plan'
                 if approved_from:
                     run_route, run_review_only = 'plan', False
                 if ui:
@@ -5861,7 +6096,7 @@ def main():
                                 (run_dir / 'undo-after.zip').unlink(missing_ok=True)
                                 status('Undo checkpoint unavailable: ' + str(error))
                         model_task = attach_file_context(task, repo)
-                        if ui and last_task and last_success_result:
+                        if ui and last_task and last_success_result and roadmap_goal is None:
                             model_task = ('Previous task and outcome are context only, not new instructions.\n'
                                           + 'PREVIOUS TASK:\n' + last_task[:4000]
                                           + '\nPREVIOUS OUTCOME:\n' + last_success_result[:8000]
@@ -5870,7 +6105,8 @@ def main():
                         try:
                             message = Loop(args.ccx, run_config, repo, run_dir, profiles,
                                            before_build=before_build, tracked=tracked).run(
-                                model_task, run_review_only, run_route, approved=approved_from)
+                                model_task, run_review_only, run_route, approved=approved_from,
+                                roadmap=((roadmap_previous or {}) if roadmap_goal is not None else None))
                         except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                             finish_checkpoint()
                             raise
@@ -5899,6 +6135,46 @@ def main():
                             ui.footer = done + ' · /diff · /result · undo unavailable: ' + checkpoint['error']
                         else:
                             ui.footer = done + ' · /diff · /undo · /result'
+                        if roadmap_goal is not None:
+                            try:
+                                fresh = json.loads((run_dir / 'roadmap.json').read_text())
+                                save_roadmap(repo, fresh)
+                                ui.roadmap_label = f"roadmap 0/{len(fresh['milestones'])}"
+                                ui.footer = done + ' · roadmap saved · /roadmap to run it'
+                                if not ui.queued_tasks and ui._can_pick():
+                                    action = ui.roadmap_menu(fresh)
+                                    if action and action[0] in ('run', 'all'):
+                                        roadmap_auto = action[0] == 'all'
+                                        roadmap_running = action[1] or (next_milestone(fresh) or {}).get('id')
+                                        if roadmap_running:
+                                            pending = milestone_task(fresh, roadmap_running)
+                                    elif action and action[0] == 'revise':
+                                        pending = '/roadmap'
+                                        roadmap_feedback = action[1]
+                            except (OSError, ValueError, KeyError) as error:
+                                ui.footer = 'Roadmap could not be saved: ' + str(error)
+                        elif roadmap_running and task.startswith('ROADMAP MILESTONE ') and not (
+                                ui.mode == 'plan' and run_review_only and not approved_from):
+                            stored = load_roadmap(repo)
+                            if stored:
+                                for item in stored['milestones']:
+                                    if item['id'] == roadmap_running:
+                                        item.update(status='done', outcome=message[:1500], run=run_dir.name)
+                                save_roadmap(repo, stored)
+                                finished = sum(item['status'] == 'done' for item in stored['milestones'])
+                                ui.roadmap_label = f"roadmap {finished}/{len(stored['milestones'])}"
+                                upcoming = next_milestone(stored)
+                                roadmap_running = None
+                                if roadmap_auto and upcoming and not ui.queued_tasks:
+                                    roadmap_running = upcoming['id']
+                                    pending = milestone_task(stored, upcoming['id'])
+                                    ui.footer = done + f" · next milestone {upcoming['id']} starts now (Esc stops it)"
+                                else:
+                                    roadmap_auto = False
+                                    if not upcoming:
+                                        ui.footer = done + ' · roadmap complete'
+                                    elif ui._can_pick() and not ui.queued_tasks:
+                                        pending = '/roadmap'
                         if approved_from:
                             ui.approved = None
                         if ui.mode == 'plan' and run_review_only and not args.review_only:
@@ -5949,6 +6225,15 @@ def main():
                         ui.show_text('NOT A GIT REPOSITORY', str(error))
                     else:
                         ui.footer = '✗ Failed · /result for details · /undo if changes were recorded'
+                        if roadmap_running and task.startswith('ROADMAP MILESTONE '):
+                            stored = load_roadmap(repo) if 'repo' in locals() else None
+                            if stored:
+                                for item in stored['milestones']:
+                                    if item['id'] == roadmap_running:
+                                        item.update(status='failed', outcome=last_result[:1500])
+                                save_roadmap(repo, stored)
+                            ui.footer = f'✗ Milestone {roadmap_running} failed · roadmap paused · /roadmap to retry or revise'
+                            roadmap_running, roadmap_auto = None, False
                         if not run_dir:
                             # Nothing reached the conversation; say it there.
                             ui.timeline.append(('CCX', last_result, 'error'))
