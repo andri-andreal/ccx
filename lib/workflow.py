@@ -4190,6 +4190,41 @@ def resolve_workspace(start=None):
         return start.resolve(), False
 
 
+def failed_run_file(root, repo, team):
+    """Where the last failed run of this team in this checkout is remembered."""
+    return Path(root) / (sha(os.fsencode(f'{repo}\0{team}')) + '.failed.json')
+
+
+def remember_failed_run(root, repo, team, failed):
+    """Keep a resumable failure on disk so /resume still works after ccx is reopened."""
+    path = failed_run_file(root, repo, team)
+    try:
+        if not failed:
+            path.unlink(missing_ok=True)
+            return
+        save(path, {'run_dir': str(failed['run_dir']), 'stage': failed['stage'], 'task': failed['task'],
+                    'checkpoint': list(failed['checkpoint'])})
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def recall_failed_run(root, repo, team):
+    """The remembered failure, or None when it is gone, no longer resumable or from another checkout."""
+    record = _load_json(failed_run_file(root, repo, team), None)
+    if not isinstance(record, dict):
+        return None
+    try:
+        run_dir = Path(record['run_dir'])
+        checkpoint = record['checkpoint']
+        if not run_dir.is_dir() or resume_stage(run_dir) != record['stage'] or checkpoint[0] != str(repo):
+            return None
+        return {'run_dir': run_dir, 'stage': record['stage'], 'task': record['task'],
+                'checkpoint': (checkpoint[0], checkpoint[1])}
+    except (KeyError, IndexError, TypeError):
+        return None
+
+
 # A short message asks to carry on when it holds a cue word or phrase and nothing
 # but filler besides, in Indonesian or English. "add a continue button" stays a task.
 RESUME_CUES = ('lanjut', 'teruskan', 'terusin', 'sambung', 'continu', 'resum', 'proceed', 'retry', 'gas')
@@ -5762,6 +5797,9 @@ def main():
                 workspace, tracked = resolve_workspace()
                 ui.tracked = tracked
                 ui.enable_completion(workspace)
+                failed_run = recall_failed_run(root, workspace, team_name) if tracked else None
+                if failed_run:
+                    ui.footer = 'The last run failed · /resume continues it, or send a new task'
             except (WorkflowError, OSError):
                 pass
             ui.enter()
@@ -6162,6 +6200,7 @@ def main():
                         save(run_dir / 'result.json', {'status': 'completed', 'summary': message})
                     parent_run = run_dir
                     failed_run = None
+                    remember_failed_run(root, repo, team_name, None)
                     last_result = message
                     last_success_result = message
                     last_task = task
@@ -6243,6 +6282,8 @@ def main():
                                           'checkpoint': (str(repo), project_snapshot(repo, failed_head, tracked))}
                         except (WorkflowError, OSError, ValueError):
                             failed_run = None
+                    if run_dir:
+                        remember_failed_run(root, repo, team_name, failed_run)
                     if isinstance(error, NotARepositoryError):
                         # Nothing ran, so there is no failed task to explain —
                         # name the actual blocker instead.

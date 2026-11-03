@@ -2214,6 +2214,42 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(classify('Codex returned a failed turn.', 'invalid_json_schema: Missing x'), 'other')
         self.assertEqual(classify('Planner did not return a nonempty plan.'), 'other')
 
+    def test_failed_run_can_be_resumed_after_ccx_is_reopened(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        def session(*steps):
+            master, slave = pty.openpty()
+            try:
+                with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
+                                      env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'blocked_once',
+                                           'FAKE_PROMPT_LOG': str(log)},
+                                      stdin=slave, stdout=slave, stderr=slave) as proc:
+                    os.close(slave)
+                    def read_until(token):
+                        data = b''
+                        deadline = time.monotonic() + 15
+                        while token not in data:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                                proc.kill()
+                                self.fail(f'Missing {token!r}: {data[-800:]!r}')
+                            data += os.read(master, 65536)
+                        return data
+                    for send, expect in steps:
+                        if send:
+                            os.write(master, send)
+                        self.assertIn(expect, read_until(expect))
+                    os.write(master, b'/quit\n')
+                    self.assertEqual(proc.wait(timeout=10), 0)
+            finally:
+                os.close(master)
+        session((None, b'Describe a task'), (b'Build the thing\n', b'RUN FAILED'), (b'q', b'Describe a task'))
+        session((None, b'/resume continues it'), (b'lanjutkan\n', b'Completed in'))
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(sum('Produce an implementation plan' in p for p in prompts), 1)
+        self.assertEqual(sum('Implement the approved work order' in p for p in prompts), 2)
+        self.assertEqual(list((self.root / 'config' / 'runs').glob('*.failed.json')), [])
+
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
         self.ccx('team', '--review-only', 'Previous run')
