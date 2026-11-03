@@ -694,6 +694,15 @@ trap 'rm -rf "$CCX_HOME" "$codex_home" "$non_git"' EXIT
 export CCX_CODEX_BIN=true
 "$CCX" new --name codexfix --provider codex --yes >/dev/null 2>&1
 
+# doctor must not demand an Anthropic model, endpoint or Claude Code from a native CLI profile
+out="$(CCX_CLAUDE_BIN=/nonexistent "$CCX" doctor codexfix --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 0 "doctor passes a native codex profile without Claude Code"
+assert_contains "$out" '"status":"pass"' "native codex profile is reported healthy"
+assert_not_contains "$out" "ANTHROPIC_MODEL" "native profile is not asked for an Anthropic model"
+out="$(CCX_CODEX_BIN=/nonexistent "$CCX" doctor codexfix --json --no-network 2>&1)"; rc=$?
+assert_exit "$rc" 1 "doctor fails a native profile whose CLI is missing"
+assert_contains "$out" "was not found" "doctor names the missing native CLI"
+
 out="$(cd "$non_git" && CODEX_HOME="$codex_home" CCX_DRY_RUN=1 "$CCX" codexfix exec --input - 2>&1)"
 assert_contains "$out" "--skip-git-repo-check" "codex skips the repository check outside a git checkout"
 assert_contains "$out" "exec: true exec" "the codex command is still assembled"

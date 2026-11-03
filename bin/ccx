@@ -1083,6 +1083,20 @@ profile_diagnostics() { # profile network(true|false); sets PROFILE_* globals
   else
     diag_add profile.provider 'Provider' fail 'CCX_PROVIDER is missing.' true
   fi
+  case "$PROFILE_PROVIDER" in
+    codex | kimi-cli | mcode)
+      # Native CLIs keep their own model, login and endpoint; only the program must exist.
+      local native_bin
+      case "$PROFILE_PROVIDER" in codex) native_bin="$CCX_CODEX_BIN" ;; kimi-cli) native_bin="$CCX_KIMI_BIN" ;; *) native_bin="$CCX_MCODE_BIN" ;; esac
+      if command -v "$native_bin" >/dev/null 2>&1; then
+        diag_add profile.native_cli 'Native CLI' pass "$native_bin is available; it manages its own login, model and endpoint." true
+      else
+        diag_add profile.native_cli 'Native CLI' fail "$native_bin was not found. Install it or set its CCX_*_BIN override." true
+      fi
+      [ "$network" = omit ] || diag_add endpoint.reachable 'Endpoint reachability' skip 'The native CLI manages its own connection.' false
+      return
+      ;;
+  esac
   if [ -n "$PROFILE_MODEL" ]; then
     diag_add profile.model 'Model' pass 'A default model is configured.' true
   else
@@ -1260,12 +1274,17 @@ profile_diagnostics() { # profile network(true|false); sets PROFILE_* globals
   fi
 }
 
-common_system_diagnostics() {
+common_system_diagnostics() { # [profile]; native CLI profiles do not need Claude Code
+  local native_provider=""
+  if [ -n "${1:-}" ] && valid_profile_name "$1" && [ -f "$(profile_env "$1")" ]; then
+    native_provider="$(kv_get "$(profile_env "$1")" CCX_PROVIDER)"
+  fi
   if [ -d "$CCX_HOME" ]; then
     diag_add system.config_dir 'Config directory' pass 'CCX configuration directory exists.' false
   else
     diag_add system.config_dir 'Config directory' warn 'CCX configuration directory does not exist yet.' false
   fi
+  case "$native_provider" in codex | kimi-cli | mcode) return 0 ;; esac
   if command -v "$CCX_CLAUDE_BIN" >/dev/null 2>&1; then
     diag_add system.claude_binary 'Claude binary' pass 'Claude Code is available.' true
   else
@@ -1288,7 +1307,7 @@ cmd_doctor() {
     esac
   done
   diag_reset doctor "$name"
-  common_system_diagnostics
+  common_system_diagnostics "$name"
   if [ -n "$name" ]; then
     profile_diagnostics "$name" "$network"
   else
