@@ -1978,6 +1978,9 @@ class IntegrationTests(unittest.TestCase):
                 os.write(master, b'\n')
                 read_until(b'Describe a task')
                 os.write(master, b'Third task\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'UNCOMMITTED CHANGES', picker)
+                os.write(master, b'q')
                 failure = read_until(b'Describe a task')
                 self.assertIn(b'clean Git checkout', failure)
                 os.write(master, b'/quit\n')
@@ -1988,6 +1991,34 @@ class IntegrationTests(unittest.TestCase):
             os.close(master)
             if slave is not None:
                 os.close(slave)
+
+    def test_dirty_checkout_picker_commits_or_stashes_instead_of_failing(self):
+        def git(*args):
+            return subprocess.run(['git', *args], cwd=self.repo, capture_output=True, text=True, check=True).stdout
+        class FakeUi:
+            footer = ''
+            def __init__(self, choice): self.choice, self.asked = choice, None
+            def _can_pick(self): return True
+            def select_choice(self, title, options, subtitle=''):
+                self.asked = (title, [o[1] for o in options], subtitle)
+                return self.choice
+        (self.repo / 'scratch.txt').write_text('mine\n')
+        ui = FakeUi('commit')
+        self.assertTrue(workflow_module.resolve_dirty_checkout(ui, self.repo))
+        self.assertEqual(ui.asked[1], ['commit', 'stash', 'cancel'])
+        self.assertIn('1 untracked', ui.asked[2])
+        self.assertEqual(git('status', '--porcelain'), '')
+        self.assertIn('wip: save changes', git('log', '-1', '--format=%s'))
+        self.assertEqual((self.repo / 'scratch.txt').read_text(), 'mine\n')
+        (self.repo / 'scratch.txt').write_text('changed\n')
+        self.assertTrue(workflow_module.resolve_dirty_checkout(FakeUi('stash'), self.repo))
+        self.assertEqual(git('status', '--porcelain'), '')
+        self.assertIn('ccx: before team run', git('stash', 'list'))
+        git('stash', 'pop')
+        self.assertEqual((self.repo / 'scratch.txt').read_text(), 'changed\n')
+        self.assertFalse(workflow_module.resolve_dirty_checkout(FakeUi('cancel'), self.repo))
+        self.assertEqual(git('status', '--porcelain').strip(), 'M scratch.txt')
+        self.assertFalse(workflow_module.resolve_dirty_checkout(None, self.repo))
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()

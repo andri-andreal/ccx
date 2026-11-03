@@ -4047,8 +4047,8 @@ def _execute_child(command, cwd, prompt, timeout, output, error, progress, start
             return process.returncode
 
 
-def git(repo, *args):
-    result = subprocess.run(['git', *args], cwd=repo, capture_output=True, timeout=30)
+def git(repo, *args, timeout=30):
+    result = subprocess.run(['git', *args], cwd=repo, capture_output=True, timeout=timeout)
     if result.returncode:
         raise WorkflowError(result.stderr.decode(errors='replace').strip())
     return result.stdout
@@ -4086,6 +4086,45 @@ def resolve_workspace(start=None):
         return repo_root(start), True
     except NotARepositoryError:
         return start.resolve(), False
+
+
+DIRTY_CHECKOUT_MESSAGE = ('Workflow requires a clean Git checkout or unchanged results from this '
+                          'session. Commit/stash changes or use a clean worktree.')
+
+
+def resolve_dirty_checkout(ui, repo):
+    """Offer to clean a dirty checkout so the run can start; True when it is clean now.
+
+    Undo and the acceptance fingerprints are measured against a clean base, so
+    the run cannot start on top of uncommitted work. Instead of failing, the
+    team TUI asks what to do with that work and does it. Nothing is discarded:
+    the changes end up in a commit or in a stash.
+    """
+    if not ui or not ui._can_pick():
+        return False
+    lines = [l for l in git(repo, 'status', '--porcelain', '--untracked-files=all').decode(errors='replace').splitlines() if l.strip()]
+    if not lines:
+        return True
+    untracked = sum(1 for l in lines if l.startswith('??'))
+    detail = f'{len(lines)} changed file(s)' + (f', {untracked} untracked' if untracked else '')
+    choice = ui.select_choice('UNCOMMITTED CHANGES', [
+        ('Commit them as a WIP commit and continue', 'commit', 'adds everything, including untracked files'),
+        ('Stash them and continue', 'stash', 'restore later with: git stash pop'),
+        ('Cancel', 'cancel', 'leave the checkout as it is'),
+    ], subtitle=f'{repo.name} has {detail}. ccx needs a clean checkout to undo and verify this task.')
+    if choice not in ('commit', 'stash'):
+        return False
+    try:
+        if choice == 'commit':
+            git(repo, 'add', '-A', timeout=120)
+            git(repo, 'commit', '-m', 'wip: save changes before ccx team run', timeout=300)
+            ui.footer = 'Committed your changes as a WIP commit'
+        else:
+            git(repo, 'stash', 'push', '--include-untracked', '-m', 'ccx: before team run', timeout=120)
+            ui.footer = 'Stashed your changes · restore later with: git stash pop'
+    except (WorkflowError, subprocess.TimeoutExpired) as error:
+        raise WorkflowError(f'Could not {choice} the uncommitted changes: {error}') from error
+    return not git(repo, 'status', '--porcelain', '--untracked-files=all').strip()
 
 
 def snapshot(repo, base):
@@ -5794,7 +5833,8 @@ def main():
                         head = git(repo, 'rev-parse', 'HEAD').decode().strip()
                         current = snapshot(repo, head)
                         if not ui or last_checkpoint != (str(repo), current):
-                            raise WorkflowError('Workflow requires a clean Git checkout or unchanged results from this session. Commit/stash changes or use a clean worktree.')
+                            if not resolve_dirty_checkout(ui, repo):
+                                raise WorkflowError(DIRTY_CHECKOUT_MESSAGE)
                     if not run_config.get('CCX_PROOF', '').strip():
                         run_config['CCX_PROOF'] = detect_proof(repo)
                     # Only routes that change files need a proof command. An
