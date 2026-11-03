@@ -309,6 +309,7 @@ COMMANDS = [
     ('/queue', 'Show queued tasks'),
     ('/mode', 'Pick the mode: auto, plan (stop for approval), build, inspect'),
     ('/build', 'Build the plan you approved in plan mode'),
+    ('/resume', 'Continue the last failed run from where it stopped'),
     ('/route', 'Show or set the route: auto, plan, direct, inspect'),
     ('/proof', 'Show or set the verification command'),
     ('/editor', 'Write a multiline task in $EDITOR'),
@@ -4088,6 +4089,54 @@ def resolve_workspace(start=None):
         return start.resolve(), False
 
 
+# A short message asks to carry on when it holds a cue word or phrase and nothing
+# but filler besides, in Indonesian or English. "add a continue button" stays a task.
+RESUME_CUES = ('lanjut', 'teruskan', 'terusin', 'sambung', 'continu', 'resum', 'proceed', 'retry', 'gas')
+RESUME_PHRASES = ('go on', 'go ahead', 'keep going', 'carry on', 'try again', 'coba lagi', 'ulangi lagi')
+RESUME_FILLER = frozenset(
+    'ok oke okay okey ya yaa yes yep yup sip yuk ayo dong deh aja saja tolong please pls kak bro '
+    'lagi again the it this that its task run work build job pekerjaan tadi itu ini nya dari yang di '
+    'sana situ awal from where left off stopped stop error errors failed fail gagal berhenti '
+    'terakhir sebelumnya sebelum previous last with to and dan then lalu terus now sekarang up '
+    'was let lets let\'s us kita saya aku i you we go on ahead keep going carry try coba ulangi'.split())
+
+
+def is_resume_request(text):
+    """True when a short message just asks to continue the failed run, in any phrasing."""
+    text = (text or '').strip().lower()
+    if not text or text.startswith('/') or '\n' in text:
+        return False
+    words = re.findall(r"[a-z']+", text)
+    if not words or len(words) > 8:
+        return False
+    cue = lambda word: word.startswith(RESUME_CUES)
+    if not (any(cue(w) for w in words) or any(p in ' '.join(words) for p in RESUME_PHRASES)):
+        return False
+    return all(w in RESUME_FILLER or cue(w) for w in words)
+
+
+def resume_stage(run_dir):
+    """Return how far a failed run got: 'build' (plan approved), 'plan' (route chosen) or ''."""
+    run_dir = Path(run_dir)
+    try:
+        approval = json.loads((run_dir / 'review-approval.json').read_text())
+        plan = (run_dir / 'PLAN.md').read_text()
+        if isinstance(approval, dict) and sha(plan.encode()) == approval.get('plan_sha256'):
+            return 'build'
+    except (OSError, ValueError):
+        pass
+    if (run_dir / 'route.json').is_file():
+        return 'plan'
+    return ''
+
+
+def _load_json(path, default):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
 DIRTY_CHECKOUT_MESSAGE = ('Workflow requires a clean Git checkout or unchanged results from this '
                           'session. Commit/stash changes or use a clean worktree.')
 
@@ -5234,13 +5283,26 @@ class Loop:
                 return False
             raise WorkflowError('Stopped: project agents were not accepted.')
 
-    def run(self, task, review_only, route_override='auto', approved=None):
+    def run(self, task, review_only, route_override='auto', approved=None, resume=None):
         self.prepare_agents()
         self.approved_from = Path(approved) if approved else None
         base = git(self.repo, 'rev-parse', 'HEAD').decode().strip() if self.tracked else ''
         original = project_snapshot(self.repo, base, self.tracked)
         route = 'plan'
         answers = []
+        resume = Path(resume) if resume else None
+        resume_build = bool(resume) and resume_stage(resume) == 'build'
+        if resume and not resume_build:
+            # The plan was not approved yet: keep the route and the answers the
+            # user already gave, and plan again from there.
+            saved = _load_json(resume / 'route.json', {})
+            if saved.get('route') in ('plan', 'direct', 'inspect'):
+                route_override = saved['route']
+            earlier_answers = _load_json(resume / 'clarifications.json', {})
+            if isinstance(earlier_answers, dict) and isinstance(earlier_answers.get('answers'), list):
+                answers = list(earlier_answers['answers'])
+                save(self.run_dir / 'clarifications.json', earlier_answers)
+            status(f'resuming {resume.name}: reusing its route and answers')
         if route_override != 'auto':
             route = route_override
             status(f'route selected by user: {route}')
@@ -5275,7 +5337,8 @@ class Loop:
             route = 'plan'
             save(self.run_dir / 'route.json', {'route': route, 'reason': 'review-only', 'source': 'user'})
         elif route_override != 'auto':
-            save(self.run_dir / 'route.json', {'route': route, 'reason': 'manual override', 'source': 'user'})
+            save(self.run_dir / 'route.json', {'route': route, 'source': 'user',
+                 'reason': f'resumed from {resume.name}' if resume else 'manual override'})
         emit_event('route_selected', route=route, review_only=review_only)
         if route == 'inspect':
             status('read-only analysis')
@@ -5291,7 +5354,38 @@ class Loop:
             # The proof was asked for after the run folder was written, so the
             # saved configuration has to learn the command that was picked.
             save(self.run_dir / 'workflow.json', self.config)
-        if self.approved_from:
+        feedback = None
+        findings = []
+        history = []
+        if resume_build:
+            # Continue from the approved plan and the work already in the checkout.
+            plan = (resume / 'PLAN.md').read_text()
+            earlier = _load_json(resume / 'review-approval.json', {})
+            old_head = (earlier.get('snapshot') or {}).get('head')
+            if self.tracked and old_head and old_head != original.get('head'):
+                raise WorkflowError('Cannot resume: HEAD changed since that run; start the task again.')
+            try:
+                self.api_checks = self.api_checks + validate_api_checks(_load_json(resume / 'plan-checks.json', []))
+            except WorkflowError:
+                pass
+            answer_block = _load_json(resume / 'answer-block.json', {}).get('text', '')
+            (self.run_dir / 'PLAN.md').write_text(plan)
+            approval = {'plan_sha256': sha(plan.encode()), 'snapshot': original}
+            save(self.run_dir / 'review-approval.json', {**approval, 'resumed_from': resume.name,
+                                                          'review': earlier.get('review')})
+            save(self.run_dir / 'route.json', {'route': 'plan', 'source': 'user',
+                                               'reason': f'resumed from {resume.name}'})
+            history = _load_json(resume / 'consensus-rounds.json', [])
+            if not isinstance(history, list):
+                history = []
+            if history:
+                feedback = history[-1]
+                checker = feedback.get('checker') if isinstance(feedback, dict) else None
+                if isinstance(checker, dict):
+                    findings = checker.get('findings', [])
+            status(f'resuming the build of {resume.name} from the approved plan'
+                   + (f' (round {len(history) + 1})' if history else ''))
+        elif self.approved_from:
             # Build the plan the user approved in plan mode, without planning again.
             previous = self.approved_from
             plan = (previous / 'PLAN.md').read_text()
@@ -5390,12 +5484,13 @@ class Loop:
                 return ('Plan approved; review-only run finished.\n\nPlan:\n' + plan +
                         '\n\nReview:\n' + review['summary'])
             approval = json.loads((self.run_dir / 'review-approval.json').read_text())
+        save(self.run_dir / 'answer-block.json', {'text': answer_block})
+        if not resume_build:
+            # Planning reused these names; the first build starts without history.
+            feedback, findings, history = None, [], []
         if self.before_build:
             self.before_build()
-        feedback = None
-        findings = []
         expected = approval['snapshot']
-        history = []
         for attempt in range(int(self.config['CCX_FIX_ROUNDS']) + 1):
             status(f"build/check round {attempt + 1}/{int(self.config['CCX_FIX_ROUNDS']) + 1}")
             if sha((self.run_dir / 'PLAN.md').read_bytes()) != approval['plan_sha256']:
@@ -5523,6 +5618,7 @@ def main():
         last_success_result = ''
         last_task = ''
         last_checkpoint = None
+        failed_run = None
         undo_stack = []
         redo_stack = []
         conversation_id = str(uuid.uuid4())
@@ -5547,6 +5643,7 @@ def main():
                 task = pending.strip()
                 pending = None
                 approved_from = None
+                resume_from = None
                 if ui and task.lower() in ('/quit', '/exit', 'q'):
                     break
                 if ui and task.lower() in ('/', '/commands'):
@@ -5802,6 +5899,14 @@ def main():
                         continue
                     task = ui.approved['task']
                     approved_from = ui.approved['run_dir']
+                if ui and (task.lower() == '/resume' or (failed_run and is_resume_request(task))):
+                    if not failed_run:
+                        ui.footer = 'Nothing to resume: the last run did not fail, or it stopped before any step was saved'
+                        continue
+                    task = failed_run['task']
+                    resume_from = failed_run['run_dir']
+                    if last_checkpoint != failed_run['checkpoint']:
+                        last_checkpoint = failed_run['checkpoint']
                 if ui and task.startswith('/'):
                     ui.footer = 'Unknown command; use /help'
                     continue
@@ -5910,7 +6015,8 @@ def main():
                         try:
                             message = Loop(args.ccx, run_config, repo, run_dir, profiles,
                                            before_build=before_build, tracked=tracked).run(
-                                model_task, run_review_only, run_route, approved=approved_from)
+                                model_task, run_review_only, run_route, approved=approved_from,
+                                resume=resume_from)
                         except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                             finish_checkpoint()
                             raise
@@ -5921,6 +6027,7 @@ def main():
                         emit_event('task_finished', status='completed', summary=message)
                         save(run_dir / 'result.json', {'status': 'completed', 'summary': message})
                     parent_run = run_dir
+                    failed_run = None
                     last_result = message
                     last_success_result = message
                     last_task = task
@@ -5981,6 +6088,16 @@ def main():
                     last_result = 'Failed: ' + str(error)
                     ui.result = last_result
                     ui.result_status = 'failed'
+                    failed_run = None
+                    stage = resume_stage(run_dir) if run_dir else ''
+                    if stage and not isinstance(error, NotARepositoryError):
+                        try:
+                            failed_head = git(repo, 'rev-parse', 'HEAD').decode().strip() if tracked else ''
+                            failed_run = {'run_dir': run_dir, 'stage': stage,
+                                          'task': task,
+                                          'checkpoint': (str(repo), project_snapshot(repo, failed_head, tracked))}
+                        except (WorkflowError, OSError, ValueError):
+                            failed_run = None
                     if isinstance(error, NotARepositoryError):
                         # Nothing ran, so there is no failed task to explain —
                         # name the actual blocker instead.
@@ -5988,12 +6105,24 @@ def main():
                         ui.render()
                         ui.show_text('NOT A GIT REPOSITORY', str(error))
                     else:
-                        ui.footer = '✗ Failed · /result for details · /undo if changes were recorded'
+                        ui.footer = ('✗ Failed · /resume continues where it stopped · /result for details · /undo'
+                                     if failed_run else
+                                     '✗ Failed · /result for details · /undo if changes were recorded')
                         if not run_dir:
                             # Nothing reached the conversation; say it there.
                             ui.timeline.append(('CCX', last_result, 'error'))
                             ui._focus_last = True
                         ui.render()
+                        # Only an approved plan is worth a prompt; earlier failures keep /resume.
+                        if (failed_run and failed_run['stage'] == 'build' and not pending and ui._can_pick()
+                                and 'stopped by user' not in str(error)):
+                            choice = ui.select_choice('RUN FAILED', [
+                                ('Continue the build from the approved plan', 'resume',
+                                 'keeps the plan and the work already done'),
+                                ('Not now', None, 'type /resume later, or just send a new task')],
+                                subtitle=last_result[:300])
+                            if choice == 'resume':
+                                pending = '/resume'
                 finally:
                     # A verification command typed at the prompt becomes the
                     # session default, so the next task does not ask again.

@@ -122,6 +122,9 @@ elif schema and 'status' in schema['properties']:
              'responses':[{'id':f['id'],'disposition':'FIXED','evidence':'Updated implementation.'} for f in findings]}
     if case == 'builder_needs_work' and feedback is None: value['status'] = 'NEEDS_WORK'
     if case == 'builder_blocked': value.update(status='BLOCKED',limitations=['Required dependency unavailable.'])
+    if case == 'blocked_once' and not (pathlib.Path.cwd().parent / 'blocked-once').exists():
+        (pathlib.Path.cwd().parent / 'blocked-once').write_text('x')
+        value.update(status='BLOCKED',limitations=['Transient failure.'])
     if case == 'missing_response': value['responses'] = []
     if case == 'disputed':
         for response in value['responses']: response['disposition'] = 'DISPUTED'
@@ -1341,11 +1344,11 @@ class IntegrationTests(unittest.TestCase):
         keys = ui._compose_keys
         # A leading slash lists commands; the exact or first prefix match is highlighted.
         self.assertIsNone(keys('/r'))
-        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/requests', '/route'])
+        self.assertEqual([name for name, _ in ui.suggestions], ['/result', '/redo', '/roles', '/requests', '/resume', '/route'])
         self.assertEqual(keys('\r'), '/result')
         # Arrow keys choose, Tab completes and leaves room for an argument.
         keys('/r')
-        keys('\x1b[B\x1b[B\x1b[B\x1b[B')
+        keys('\x1b[B' * 5)
         self.assertEqual(ui.suggestions[ui.suggestion_index][0], '/route')
         keys('\t')
         self.assertEqual(ui.input_buffer, '/route ')
@@ -1923,6 +1926,8 @@ class IntegrationTests(unittest.TestCase):
                     return data
                 read_until(b'Describe a task')
                 os.write(master, b'Attempt task\n')
+                self.assertIn(b'RUN FAILED', read_until(b'q cancel'))
+                os.write(master, b'q')
                 self.assertIn(b'Failed', read_until(b'Describe a task'))
                 self.assertTrue((self.repo / 'implemented.py').exists())
                 os.write(master, b'/undo\n')
@@ -2019,6 +2024,118 @@ class IntegrationTests(unittest.TestCase):
         self.assertFalse(workflow_module.resolve_dirty_checkout(FakeUi('cancel'), self.repo))
         self.assertEqual(git('status', '--porcelain').strip(), 'M scratch.txt')
         self.assertFalse(workflow_module.resolve_dirty_checkout(None, self.repo))
+
+    def test_failed_run_resumes_the_build_without_planning_again(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        master, slave = pty.openpty()
+        try:
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'blocked_once',
+                                       'FAKE_PROMPT_LOG': str(log)},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Describe a task')
+                os.write(master, b'Build the thing\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'RUN FAILED', picker)
+                self.assertIn(b'Continue the build from the approved plan', picker)
+                os.write(master, b'\n')
+                self.assertIn(b'Completed in', read_until(b'Describe a task'))
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(sum('Produce an implementation plan' in p for p in prompts), 1)
+        self.assertEqual(sum('Implement the approved work order' in p for p in prompts), 2)
+        runs = sorted((self.root / 'config' / 'runs').glob('team-*/result.json'),
+                      key=lambda path: path.stat().st_mtime)
+        self.assertEqual([json.loads(path.read_text())['status'] for path in runs], ['failed', 'completed'])
+        resumed = json.loads((runs[-1].parent / 'review-approval.json').read_text())
+        self.assertEqual(resumed['resumed_from'], runs[0].parent.name)
+
+    def test_typing_a_free_form_continue_resumes_the_failed_run(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        master, slave = pty.openpty()
+        try:
+            with KillOnErrorPopen([str(CCX), 'team'], cwd=self.repo,
+                                  env={**self.env, 'TERM': 'xterm', 'FAKE_CASE': 'blocked_once',
+                                       'FAKE_PROMPT_LOG': str(log)},
+                                  stdin=slave, stdout=slave, stderr=slave) as proc:
+                os.close(slave)
+                slave = None
+                def read_until(token):
+                    data = b''
+                    deadline = time.monotonic() + 15
+                    while token not in data:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not select.select([master], [], [], remaining)[0]:
+                            proc.kill()
+                            self.fail(f'Missing {token!r}: {data[-1000:]!r}')
+                        data += os.read(master, 65536)
+                    return data
+                read_until(b'Describe a task')
+                os.write(master, b'Build the thing\n')
+                picker = read_until(b'q cancel')
+                self.assertIn(b'RUN FAILED', picker)
+                self.assertIn(b'Continue the build from the approved plan', picker)
+                os.write(master, b'q')
+                read_until(b'Describe a task')
+                os.write(master, b'ok lanjutkan dong\n')
+                self.assertIn(b'Completed in', read_until(b'Describe a task'))
+                os.write(master, b'/quit\n')
+                self.assertEqual(proc.wait(timeout=10), 0)
+        finally:
+            os.close(master)
+            if slave is not None:
+                os.close(slave)
+        prompts = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(sum('Produce an implementation plan' in p for p in prompts), 1)
+        self.assertEqual(sum('Implement the approved work order' in p for p in prompts), 2)
+        runs = sorted((self.root / 'config' / 'runs').glob('team-*/result.json'),
+                      key=lambda path: path.stat().st_mtime)
+        self.assertEqual([json.loads(path.read_text())['status'] for path in runs], ['failed', 'completed'])
+        resumed = json.loads((runs[-1].parent / 'review-approval.json').read_text())
+        self.assertEqual(resumed['resumed_from'], runs[0].parent.name)
+
+    def test_resume_stage_reads_what_a_failed_run_saved(self):
+        run = self.root / 'run'
+        run.mkdir()
+        self.assertEqual(workflow_module.resume_stage(run), '')
+        (run / 'route.json').write_text('{"route": "plan"}')
+        self.assertEqual(workflow_module.resume_stage(run), 'plan')
+        (run / 'PLAN.md').write_text('the plan')
+        (run / 'review-approval.json').write_text(json.dumps(
+            {'plan_sha256': workflow_module.sha(b'the plan')}))
+        self.assertEqual(workflow_module.resume_stage(run), 'build')
+        (run / 'PLAN.md').write_text('edited after approval')
+        self.assertEqual(workflow_module.resume_stage(run), 'plan')
+
+    def test_any_short_message_asking_to_continue_counts_as_resume(self):
+        yes = ['lanjutkan', 'Lanjut', 'continue', 'Continue.', 'resume', 'ok lanjut dong', 'lanjutkan yang tadi',
+               'teruskan dari yang gagal', 'go on', 'keep going', 'coba lagi', 'try again', 'please continue',
+               'continue from where it stopped', 'oke gas lanjut', 'proceed', 'retry', 'ya lanjutin aja']
+        no = ['add a continue button', 'lanjutkan dengan membuat endpoint baru untuk karyawan', 'fix the login bug',
+              'buat fitur export', '/resume', '', 'continue\nand also rewrite the readme', 'resume page layout']
+        for text in yes:
+            self.assertTrue(workflow_module.is_resume_request(text), text)
+        for text in no:
+            self.assertFalse(workflow_module.is_resume_request(text), text)
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
