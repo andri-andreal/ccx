@@ -50,6 +50,12 @@ if mcode and '--output-schema' in args and 'Return only a JSON object matching t
     sys.exit(2)
 case = os.environ.get('FAKE_CASE', '')
 if case == 'empty': sys.exit(0)
+marker = pathlib.Path.cwd().parent / 'failed-once'
+if case == 'transient_once' and os.environ.get('FAKE_FAIL_ON', '') in prompt and not marker.exists():
+    marker.write_text('x')
+    print('API Error: 529 overloaded, please try again', file=sys.stderr); sys.exit(1)
+if case == 'auth_fail':
+    print('Error: 401 Unauthorized: invalid API key', file=sys.stderr); sys.exit(1)
 codex = 'exec' in args and not mcode
 if case == 'stream':
     if codex:
@@ -223,6 +229,7 @@ class IntegrationTests(unittest.TestCase):
         self.kimi_data = self.root / 'kimi-data'; self.kimi_data.mkdir()
         self.mcode_data = self.root / 'mcode-data'; self.mcode_data.mkdir()
         self.env.update(KIMI_CODE_HOME=str(self.kimi_data), MINIMAX_DATA_DIR=str(self.mcode_data))
+        self.env['CCX_RETRY_DELAY'] = '0'
         for key in ('CCX_DRY_RUN', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'FAKE_CASE'):
             self.env.pop(key, None)
         for args in (('init','-q'), ('config','user.email','test@example.invalid'),
@@ -2167,6 +2174,45 @@ class IntegrationTests(unittest.TestCase):
         write(json.dumps(good) + json.dumps({**good, 'summary': 'different'}))
         self.assertIsNone(workflow_module.salvage_mcode_reply(path, schema))
         self.assertIsNone(workflow_module.salvage_mcode_reply(self.root / 'missing', schema))
+
+    def test_temporary_provider_errors_are_retried_automatically(self):
+        self.workflow()
+        for fail_on, repeated in (('implementation plan', 'implementation plan'),
+                                  ('Implement the approved work order', 'Implement the approved work order')):
+            marker = self.root / 'failed-once'
+            marker.unlink(missing_ok=True)
+            log = self.root / 'prompts.log'
+            log.unlink(missing_ok=True)
+            (self.repo / 'implemented.py').unlink(missing_ok=True)
+            run = self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CASE': 'transient_once',
+                           'FAKE_FAIL_ON': fail_on, 'FAKE_PROMPT_LOG': str(log)})
+            self.assertIn('Builder and checker agree', run.stdout)
+            self.assertIn('retrying', run.stdout + run.stderr)
+            prompts = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(sum(repeated in p for p in prompts), 2, fail_on)
+            if fail_on.startswith('Implement'):
+                self.assertEqual(sum('CUT OFF BY A TEMPORARY ERROR' in p for p in prompts), 1)
+
+    def test_a_rejected_login_is_not_retried_and_says_how_to_fix_it(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        run = self.ccx('team', 'Implement fixture', ok=False,
+                       env={**self.env, 'FAKE_CASE': 'auth_fail', 'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('ccx claude login', run.stderr)
+        self.assertEqual(len(log.read_text().splitlines()), 1)
+
+    def test_failures_are_told_apart(self):
+        classify = workflow_module.classify_failure
+        self.assertEqual(classify('plan failed (exit 1)', 'API Error: 429 rate limit'), 'transient')
+        self.assertEqual(classify('plan failed (exit 1)', 'overloaded_error 529'), 'transient')
+        self.assertEqual(classify('Empty model result.'), 'transient')
+        self.assertEqual(classify('plan failed (exit 1)', 'Unauthorized: invalid API key'), 'auth')
+        self.assertEqual(classify('plan failed', 'sign in to MiniMax'), 'auth')
+        self.assertEqual(classify('plan failed', 'You exceeded your current quota, insufficient credits'), 'quota')
+        self.assertEqual(classify('Process interrupted or timed out; inspect run diagnostics.'), 'timeout')
+        self.assertEqual(classify('Current process stopped by user; inspect run diagnostics.'), 'stopped')
+        self.assertEqual(classify('Codex returned a failed turn.', 'invalid_json_schema: Missing x'), 'other')
+        self.assertEqual(classify('Planner did not return a nonempty plan.'), 'other')
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()

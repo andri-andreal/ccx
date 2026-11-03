@@ -23,6 +23,7 @@ import termios
 import tty
 import textwrap
 import time
+import traceback
 import uuid
 import zipfile
 
@@ -34,6 +35,66 @@ class WorkflowError(Exception):
 RETRY_JSON_NOTE = ('\n\nYOUR PREVIOUS REPLY WAS NOT VALID JSON. Reply again with exactly one valid JSON object '
                    'matching the schema: escape every double quote inside a string as \\" and keep each text '
                    'field short.')
+
+
+BUILD_RETRY_NOTE = ('A PREVIOUS ATTEMPT OF THIS TASK WAS CUT OFF BY A TEMPORARY ERROR. The checkout may already '
+                    'hold part of the work. Inspect it, keep what is correct and finish the rest; do not start over.\n\n')
+
+# How a failed agent call is told apart, so each kind gets the right reaction.
+AUTH_PATTERN = re.compile(r'\b401\b|\b403\b|unauthori[sz]ed|invalid.{0,12}api.?key|not logged in|log ?in required|'
+                          r'sign in|please log in|authentication (failed|error|required)|token (has )?expired|'
+                          r'credentials', re.I)
+QUOTA_PATTERN = re.compile(r'insufficient.{0,12}(quota|credit|balance|funds)|quota (exceeded|exhausted)|'
+                           r'out of credits|usage limit|billing|payment required|\b402\b', re.I)
+TRANSIENT_PATTERN = re.compile(r'rate.?limit|too many requests|\b429\b|overloaded|\b50[0234]\b|\b529\b|'
+                               r'temporar|try again|retry after|connection (reset|refused|closed|error|recovers)|'
+                               r'econnreset|econnrefused|etimedout|eai_again|enotfound|network|socket hang up|'
+                               r'unavailable|server error|at capacity|gateway|stream (ended|closed|error)|'
+                               r'empty model result|failed turn|completion.{0,20}missing|did not complete', re.I)
+
+
+def classify_failure(message, tail=''):
+    """Sort a failed agent call into stopped, timeout, auth, quota, transient or other."""
+    text = f'{message}\n{tail}'
+    lowered = message.lower()
+    if 'stopped by user' in lowered:
+        return 'stopped'
+    if 'timed out' in lowered:
+        return 'timeout'
+    if re.search(r'invalid_json_schema|invalid schema', text, re.I):
+        return 'other'
+    if AUTH_PATTERN.search(text):
+        return 'auth'
+    if QUOTA_PATTERN.search(text):
+        return 'quota'
+    if TRANSIENT_PATTERN.search(text):
+        return 'transient'
+    return 'other'
+
+
+def failure_hint(kind, profile, retried):
+    """One actionable sentence for the failure kinds ccx cannot fix by itself."""
+    if kind == 'auth':
+        return (f'The provider rejected the login. Sign in again with `ccx {profile} login` (or fix the key '
+                f'with `ccx edit {profile}`), then /resume.')
+    if kind == 'quota':
+        return 'The provider reports the quota or balance is used up. Switch this role to another model in /config, then /resume.'
+    if kind == 'timeout':
+        return 'The agent hit the time limit. Raise CCX_TIMEOUT or choose a faster model in /config, then /resume.'
+    if kind == 'transient':
+        return f'Still failing after {retried} automatic retr{"y" if retried == 1 else "ies"}. Wait a little, then /resume.'
+    return ''
+
+
+def read_tail(path, size=6000):
+    """The end of a possibly huge log; empty when it cannot be read."""
+    try:
+        with open(path, 'rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - size))
+            return stream.read().decode(errors='replace')
+    except OSError:
+        return ''
 
 
 # Editable role definitions: agents/<role>.md and skills/<name>.md, looked up in
@@ -4079,6 +4140,15 @@ def _execute_child(command, cwd, prompt, timeout, output, error, progress, start
             return process.returncode
 
 
+def wait_with_ui(seconds):
+    """Sleep between retries while the team window keeps redrawing."""
+    end = time.monotonic() + seconds
+    while (left := end - time.monotonic()) > 0:
+        time.sleep(min(0.2, left))
+        if team_ui:
+            team_ui.tick()
+
+
 def git(repo, *args, timeout=30):
     result = subprocess.run(['git', *args], cwd=repo, capture_output=True, timeout=timeout)
     if result.returncode:
@@ -4886,13 +4956,39 @@ class Loop:
                  'Do not read, cite or borrow conventions from other directories on this machine; an empty '
                  'project directory means a new project.\n\n')
         scope += role_guidance(getattr(self, 'agents', {}).get(role))
+        retries = max(0, int(self.config.get('CCX_RETRIES', 2) or 0))
+        attempt, note = 0, ''
+        while True:
+            try:
+                return self._call_with_json_retry(role, phase, note + scope + prompt, output_schema)
+            except WorkflowError as error:
+                directory = self.run_dir / f'{self.turn:02d}-{phase}'
+                tail = read_tail(directory / 'stderr.txt') + read_tail(directory / 'stdout.txt')
+                kind = classify_failure(str(error), tail)
+                if kind == 'transient' and attempt < retries:
+                    delay = float(os.environ.get('CCX_RETRY_DELAY', '5')) * (4 ** attempt)
+                    attempt += 1
+                    Progress(phase, 'text').show(f'temporary error ({str(error)[:120]}); retrying in {delay:g}s '
+                                                 f'({attempt}/{retries})', 'status')
+                    emit_event('activity', phase=phase, message=f'temporary error, retry {attempt}/{retries}')
+                    wait_with_ui(delay)
+                    if phase == 'build':
+                        note = BUILD_RETRY_NOTE
+                    continue
+                hint = failure_hint(kind, self.config.get('CCX_' + role.upper(), role), attempt)
+                if hint and hint not in str(error):
+                    raise type(error)(f'{error} {hint}') from error
+                raise
+
+    def _call_with_json_retry(self, role, phase, prompt, output_schema):
+        """Run one agent turn; a read-only turn with malformed JSON is asked once more."""
         try:
-            return self._call_once(role, phase, scope + prompt, output_schema)
+            return self._call_once(role, phase, prompt, output_schema)
         except StructuredOutputError as error:
             if not output_schema or phase == 'build':
                 raise
             Progress(phase, 'text').show(f'reply was not valid JSON ({error}); asking once more', 'status')
-            return self._call_once(role, phase, scope + prompt + RETRY_JSON_NOTE, output_schema)
+            return self._call_once(role, phase, prompt + RETRY_JSON_NOTE, output_schema)
 
     def _call_once(self, role, phase, prompt, output_schema=None):
         self.turn += 1
@@ -6055,7 +6151,7 @@ def main():
                                            before_build=before_build, tracked=tracked).run(
                                 model_task, run_review_only, run_route, approved=approved_from,
                                 resume=resume_from)
-                        except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                        except Exception:
                             finish_checkpoint()
                             raise
                         finish_checkpoint()
@@ -6117,7 +6213,18 @@ def main():
                         except (OSError, ValueError, AttributeError):
                             pass
                         return 0
-                except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+                except Exception as error:
+                    if not isinstance(error, (WorkflowError, OSError, ValueError, KeyError, TypeError,
+                                              subprocess.SubprocessError)):
+                        # A bug must not take the whole session down: keep the traceback and carry on.
+                        where = ''
+                        if run_dir:
+                            try:
+                                (run_dir / 'crash.txt').write_text(traceback.format_exc())
+                                where = f' Details: {run_dir}/crash.txt'
+                            except OSError:
+                                pass
+                        error = WorkflowError(f'Internal error ({type(error).__name__}: {error}).{where}')
                     if run_dir:
                         emit_event('task_finished', status='failed', error=str(error))
                         save(run_dir / 'result.json', {'status': 'failed', 'error': str(error)})
@@ -6177,7 +6284,10 @@ def main():
                 ui.exit()
                 ui.exit_banner(last_result, last_task)
         return 0
-    except (WorkflowError, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+    except Exception as error:
+        if not isinstance(error, (WorkflowError, OSError, ValueError, KeyError, TypeError,
+                                  subprocess.SubprocessError)):
+            error = WorkflowError(f'Internal error ({type(error).__name__}: {error}). {traceback.format_exc().strip().splitlines()[-1]}')
         if run_dir:
             save(run_dir / 'result.json', {'status': 'failed', 'error': str(error)})
         print(f'ccx: {error}', file=sys.stderr)
