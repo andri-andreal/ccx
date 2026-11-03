@@ -130,6 +130,12 @@ elif schema and 'status' in schema['properties']:
         for response in value['responses']: response['disposition'] = 'DISPUTED'
     if case == 'repair_proof' and feedback:
         pathlib.Path('repaired.py').write_text('fixed')
+    if case == 'mcode_wrapped' and mcode:
+        reply = 'All verification passes. Here is my report:\n\n```json\n' + json.dumps(value, indent=2) + '\n```\n\n**Files:** implemented.py'
+        print(json.dumps({'type':'item.completed','item':{'id':'m:message','type':'agent_message','content':reply}}))
+        print(json.dumps({'type':'turn.failed','error':{'code':'STRUCTURED_OUTPUT_INVALID','retryable':True}}))
+        print(json.dumps({'type':'exec.completed','result':{'status':'failed','error':{'code':'STRUCTURED_OUTPUT_INVALID'}}}))
+        sys.exit(4)
 elif schema and case == 'bad_review_json' and 'YOUR PREVIOUS REPLY WAS NOT VALID JSON' not in prompt and mcode:
     print(json.dumps({'type':'turn.failed','error':{'code':'STRUCTURED_OUTPUT_INVALID','retryable':True}}))
     print(json.dumps({'type':'exec.completed','result':{'status':'failed','error':{'code':'STRUCTURED_OUTPUT_INVALID'}}}))
@@ -2136,6 +2142,31 @@ class IntegrationTests(unittest.TestCase):
             self.assertTrue(workflow_module.is_resume_request(text), text)
         for text in no:
             self.assertFalse(workflow_module.is_resume_request(text), text)
+
+    def test_mcode_reply_wrapped_in_prose_is_recovered_instead_of_failing_the_build(self):
+        self.ccx('new', '--name', 'mcode', '--provider', 'mcode', '--model', 'chosen', '--yes')
+        self.workflow(builder='mcode')
+        run = self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CASE': 'mcode_wrapped'})
+        self.assertIn('Builder and checker agree', run.stdout)
+        self.assertTrue((self.repo / 'implemented.py').exists())
+        recovered = list((self.root / 'config' / 'runs').glob('team-*/*-build/result.json'))
+        self.assertEqual(len(recovered), 1)
+        self.assertIn('recovered', json.loads(recovered[0].read_text()))
+
+    def test_salvage_needs_exactly_one_complete_object_in_the_final_reply(self):
+        schema = workflow_module.BUILD_SCHEMA
+        path = self.root / 'mcode.out'
+        good = {'status': 'READY', 'summary': 'ok', 'responses': [], 'limitations': []}
+        def write(*contents):
+            path.write_text(''.join(json.dumps({'type': 'item.completed', 'item': {
+                'type': 'agent_message', 'content': c}}) + '\n' for c in contents))
+        write('Intro\n```json\n' + json.dumps(good) + '\n```\nFiles: a.py')
+        self.assertEqual(workflow_module.salvage_mcode_reply(path, schema)['status'], 'READY')
+        write(json.dumps(good), 'no json here')
+        self.assertIsNone(workflow_module.salvage_mcode_reply(path, schema))
+        write(json.dumps(good) + json.dumps({**good, 'summary': 'different'}))
+        self.assertIsNone(workflow_module.salvage_mcode_reply(path, schema))
+        self.assertIsNone(workflow_module.salvage_mcode_reply(self.root / 'missing', schema))
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()

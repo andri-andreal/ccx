@@ -621,6 +621,37 @@ def extract_json_response(text, expected):
     return matches[0]
 
 
+def salvage_mcode_reply(stdout_path, schema):
+    """Recover the answer from an mcode turn that failed structured-output validation.
+
+    mcode finishes the work, then rejects a final reply that wraps its JSON in prose
+    or a Markdown fence and exits non-zero. The reply itself is still in the event
+    stream, so a single complete object matching the schema is taken from it instead
+    of throwing away a long build. Returns None when nothing usable is there.
+    """
+    reply = None
+    try:
+        with open(stdout_path, errors='replace') as stream:
+            for line in stream:
+                if '"agent_message"' not in line or '"item.completed"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                item = event.get('item') if isinstance(event, dict) else None
+                if isinstance(item, dict) and item.get('type') == 'agent_message' and isinstance(item.get('content'), str):
+                    reply = item['content']
+    except OSError:
+        return None
+    if not reply:
+        return None
+    try:
+        return extract_json_response(reply, schema)
+    except StructuredOutputError:
+        return None
+
+
 class EventJournal:
     """Persist normalized workflow events and optionally forward them to a view."""
     def __init__(self, run_dir, observer=None):
@@ -4980,7 +5011,14 @@ class Loop:
         if code:
             emit_event('agent_finished', phase=phase, ok=False)
             if provider == 'mcode' and output_schema and 'STRUCTURED_OUTPUT_INVALID' in (directory / 'stdout.txt').read_text(errors='replace'):
-                raise StructuredOutputError(f'mcode reported invalid structured output; see {directory}')
+                salvaged = salvage_mcode_reply(directory / 'stdout.txt', output_schema)
+                if salvaged is None:
+                    raise StructuredOutputError(f'mcode reported invalid structured output; see {directory}')
+                Progress(phase, 'text').show('mcode wrapped its JSON in prose; recovered it from the final reply', 'status')
+                emit_event('agent_finished', phase=phase, ok=True)
+                save(directory / 'result.json', {'profile': name, 'session': None, 'response': salvaged,
+                                                 'recovered': 'structured output taken from the final reply'})
+                return salvaged
             detail = ''
             if provider == 'mcode':
                 error_text = (directory / 'stderr.txt').read_text(errors='replace').lower()
