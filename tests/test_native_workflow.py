@@ -1037,7 +1037,7 @@ class IntegrationTests(unittest.TestCase):
                 choose(b'5', b'LOOP')
                 choose(b'1', b'PLAN REVIEW ROUNDS')
                 choose(b'5', b'LOOP')          # 5 rounds
-                choose(b'4', b'CONFIG')        # back
+                choose(b'5', b'CONFIG')        # back (token budget is row 4)
                 os.write(master, b'9')
                 read_until(b'q cancel')
                 os.write(master, b'\x1b[B')
@@ -2307,6 +2307,26 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('same findings as round 1', run.stderr)
         builds = [line for line in log.read_text().splitlines() if 'Implement the approved work order' in line]
         self.assertEqual(len(builds), 2)
+
+    def test_token_and_cost_budgets_stop_the_task_between_calls(self):
+        self.workflow()
+        env_file = self.root / 'config' / 'profiles' / 'team' / 'workflow.env'
+        base = env_file.read_text()
+        log = self.root / 'prompts.log'
+        env_file.write_text(base + 'CCX_MAX_TOKENS=300\n')
+        run = self.ccx('team', 'Implement fixture', ok=False, env={**self.env, 'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('Token budget reached', run.stderr)
+        self.assertIn('CCX_MAX_TOKENS', run.stderr)
+        self.assertEqual(sum('Implement the approved work order' in p for p in log.read_text().splitlines()), 0)
+        env_file.write_text(base + 'CCX_MAX_COST_USD=0.001\n')
+        run = self.ccx('team', 'Implement fixture', ok=False)
+        self.assertIn('Cost budget reached', run.stderr)
+        env_file.write_text(base + 'CCX_MAX_TOKENS=0\nCCX_MAX_COST_USD=\n')
+        (self.repo / 'implemented.py').unlink(missing_ok=True)
+        self.assertIn('Builder and checker agree', self.ccx('team', 'Implement fixture').stdout)
+        env_file.write_text(base + 'CCX_MAX_TOKENS=lots\n')
+        bad = self.ccx('team', 'Implement fixture', ok=False)
+        self.assertIn('CCX_MAX_TOKENS must be a whole number', bad.stderr)
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()

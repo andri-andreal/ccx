@@ -472,6 +472,10 @@ def load_role_profiles(config, profiles_dir):
     for key in ('CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT'):
         if not re.fullmatch(r'[1-9][0-9]*', config.get(key, '')):
             raise WorkflowError(f'{key} must be a positive integer.')
+    if not re.fullmatch(r'[0-9]*', config.get('CCX_MAX_TOKENS', '')):
+        raise WorkflowError('CCX_MAX_TOKENS must be a whole number (0 or empty for no limit).')
+    if not re.fullmatch(r'([0-9]+(\.[0-9]+)?)?', config.get('CCX_MAX_COST_USD', '')):
+        raise WorkflowError('CCX_MAX_COST_USD must be a number such as 5 or 2.50 (0 or empty for no limit).')
     return profiles
 
 
@@ -488,7 +492,7 @@ WORKFLOW_KEYS = ('CCX_PLANNER', 'CCX_BUILDER', 'CCX_REVIEWER', 'CCX_ORCHESTRATOR
                  'CCX_ORCHESTRATOR_EFFORT', 'CCX_PROOF', 'CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT',
                  'CCX_PLANNER_EFFORT', 'CCX_BUILDER_EFFORT', 'CCX_REVIEWER_EFFORT', 'CCX_PLANNER_MODEL',
                  'CCX_BUILDER_MODEL', 'CCX_REVIEWER_MODEL', 'CCX_ORCHESTRATOR_FALLBACK', 'CCX_PLANNER_FALLBACK',
-                 'CCX_BUILDER_FALLBACK', 'CCX_REVIEWER_FALLBACK')
+                 'CCX_BUILDER_FALLBACK', 'CCX_REVIEWER_FALLBACK', 'CCX_MAX_TOKENS', 'CCX_MAX_COST_USD')
 
 
 def write_workflow_env(path, config):
@@ -1395,9 +1399,12 @@ class TeamUI:
     def _config_loop(self, draft):
         fields = (('CCX_ROUNDS', 'Plan review rounds', ('1', '2', '3', '4', '5', '8')),
                   ('CCX_FIX_ROUNDS', 'Fix rounds after the first build', ('1', '2', '3', '5', '10')),
-                  ('CCX_TIMEOUT', 'Timeout per agent (seconds)', ('300', '600', '900', '1800', '3600')))
+                  ('CCX_TIMEOUT', 'Timeout per agent (seconds)', ('300', '600', '900', '1800', '3600')),
+                  ('CCX_MAX_TOKENS', 'Token budget per task (0 = no limit)',
+                   ('0', '200000', '500000', '1000000', '2000000', '5000000')))
         while True:
-            options = [(f'{label}: {draft.get(key)}', key, '') for key, label, _ in fields] + [('Back', None, '')]
+            options = [(f"{label}: {draft.get(key) or ('0' if key == 'CCX_MAX_TOKENS' else '')}", key, '')
+                       for key, label, _ in fields] + [('Back', None, '')]
             chosen = self.select_choice('LOOP', options)
             if chosen is None:
                 return
@@ -1406,10 +1413,12 @@ class TeamUI:
             picks.append(('Type a number', '', ''))
             value = self._pick_or_type(label.upper(), picks, f'{label}: ')
             if value is not None:
-                if re.fullmatch(r'[1-9][0-9]{0,5}', value):
+                allowed = r'0|[1-9][0-9]{0,9}' if key == 'CCX_MAX_TOKENS' else r'[1-9][0-9]{0,5}'
+                if re.fullmatch(allowed, value):
                     draft[key] = value
                 else:
-                    self.show_text('CONFIG ERROR', f'{label} must be a positive whole number.')
+                    self.show_text('CONFIG ERROR', f'{label} must be a whole number' +
+                                   ('.' if key == 'CCX_MAX_TOKENS' else ' above zero.'))
 
     def _config_api(self, draft, repo):
         while True:
@@ -5067,6 +5076,7 @@ class Loop:
         scope += role_guidance(getattr(self, 'agents', {}).get(role))
         retries = max(0, int(self.config.get('CCX_RETRIES', 2) or 0))
         attempt, note = 0, ''
+        self.check_budget()
         while True:
             try:
                 return self._call_with_json_retry(role, phase, note + scope + prompt, output_schema)
@@ -5106,6 +5116,27 @@ class Loop:
                 if hint and hint not in str(error):
                     raise type(error)(f'{error} {hint}') from error
                 raise
+
+    def check_budget(self):
+        """Stop before the next agent call once the task has used its token or cost allowance.
+
+        Only finished calls are counted, so one call can overshoot the limit. Cache reads are
+        not counted: they are what makes long agent sessions cheap.
+        """
+        max_tokens = int(self.config.get('CCX_MAX_TOKENS') or 0)
+        max_cost = float(self.config.get('CCX_MAX_COST_USD') or 0)
+        if not max_tokens and not max_cost:
+            return
+        total = (_load_json(self.run_dir / 'usage.json', {}) or {}).get('total', {})
+        used = total.get('input', 0) + total.get('output', 0) + total.get('cache_write', 0)
+        if max_tokens and used >= max_tokens:
+            raise WorkflowError(f'Token budget reached: {format_tokens(used)} used of {format_tokens(max_tokens)} '
+                                'for this task. The work so far is kept. Raise CCX_MAX_TOKENS in /config '
+                                '(0 means no limit), then /resume.')
+        cost = total.get('cost_usd')
+        if max_cost and cost is not None and cost >= max_cost:
+            raise WorkflowError(f'Cost budget reached: ${cost:.2f} spent of ${max_cost:.2f} for this task. The work '
+                                'so far is kept. Raise CCX_MAX_COST_USD in /config (0 means no limit), then /resume.')
 
     def _call_with_json_retry(self, role, phase, prompt, output_schema):
         """Run one agent turn; a read-only turn with malformed JSON is asked once more."""
