@@ -2936,6 +2936,39 @@ class IntegrationTests(unittest.TestCase):
         self.assertNotEqual(before['sha256'],after['sha256'])
         self.assertIn({'path':'staged.py','kind':'deleted','sha256':workflow_module.sha(b'')},after['files'])
 
+    def test_snapshot_fingerprints_submodule_and_ignores_its_dirty_state_in_status(self):
+        sub = self.root / 'subsrc'
+        sub.mkdir()
+        git = lambda cwd, *a: subprocess.run(['git', '-c', 'protocol.file.allow=always', *a], cwd=cwd, check=True,
+                                             capture_output=True)
+        git(sub, 'init', '-q')
+        git(sub, 'config', 'user.email', 't@t')
+        git(sub, 'config', 'user.name', 't')
+        (sub / 'a.txt').write_text('a')
+        git(sub, 'add', '.')
+        git(sub, 'commit', '-qm', 'sub')
+        git(self.repo, 'submodule', 'add', '-q', str(sub), 'child')
+        git(self.repo, 'commit', '-qm', 'add submodule')
+        base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo).decode().strip()
+        (self.repo / 'child' / 'a.txt').write_text('changed')
+        status = workflow_module.git(self.repo, 'status', '--porcelain', '--untracked-files=all',
+                                     '--ignore-submodules=dirty')
+        self.assertEqual(status.strip(), b'')
+        before = workflow_module.snapshot(self.repo, base)
+        entry = [f for f in before['files'] if f['path'] == 'child']
+        self.assertEqual([f['kind'] for f in entry], ['submodule'])
+        (self.repo / 'child' / 'a.txt').write_text('changed again')
+        after = workflow_module.snapshot(self.repo, base)
+        self.assertNotEqual(before['sha256'], after['sha256'])
+
+    def test_snapshot_lists_files_inside_untracked_directory(self):
+        subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'base'], cwd=self.repo, check=True)
+        base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.repo).decode().strip()
+        (self.repo / 'plain').mkdir()
+        (self.repo / 'plain' / 'f.txt').write_text('x')
+        files = workflow_module.snapshot(self.repo, base)['files']
+        self.assertEqual([f['path'] for f in files], ['plain/f.txt'])
+
     def test_dirty_checkout_preserved(self):
         self.workflow()
         (self.repo / 'mine.txt').write_text('my work')

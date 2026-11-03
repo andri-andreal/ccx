@@ -4409,7 +4409,7 @@ def resolve_dirty_checkout(ui, repo):
     """
     if not ui or not ui._can_pick():
         return False
-    lines = [l for l in git(repo, 'status', '--porcelain', '--untracked-files=all').decode(errors='replace').splitlines() if l.strip()]
+    lines = [l for l in git(repo, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=dirty').decode(errors='replace').splitlines() if l.strip()]
     if not lines:
         return True
     untracked = sum(1 for l in lines if l.startswith('??'))
@@ -4431,7 +4431,7 @@ def resolve_dirty_checkout(ui, repo):
             ui.footer = 'Stashed your changes · restore later with: git stash pop'
     except (WorkflowError, subprocess.TimeoutExpired) as error:
         raise WorkflowError(f'Could not {choice} the uncommitted changes: {error}') from error
-    return not git(repo, 'status', '--porcelain', '--untracked-files=all').strip()
+    return not git(repo, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=dirty').strip()
 
 
 def snapshot(repo, base):
@@ -4446,7 +4446,13 @@ def snapshot(repo, base):
         elif path.is_file():
             kind, body = 'file', path.read_bytes()
         elif path.is_dir():
-            raise WorkflowError(f'Submodule/directory changes need manual inspection: {name}')
+            if not (path / '.git').exists():
+                raise WorkflowError(f'Directory changes need manual inspection: {name}')
+            # A submodule: fingerprint its commit and its own working changes.
+            kind = 'submodule'
+            body = b'\0'.join([git(path, 'rev-parse', 'HEAD'),
+                               git(path, 'status', '--porcelain', '--untracked-files=all'),
+                               git(path, 'diff', '--no-ext-diff', '--no-textconv', '--binary', 'HEAD', '--')])
         else:
             kind, body = 'deleted', b''
         files.append({'path': name, 'kind': kind, 'sha256': sha(body)})
@@ -6289,7 +6295,7 @@ def main():
                         status('no git repository: undo and diff are unavailable for this run')
                         if ui:
                             ui.footer = 'No git repository · undo and diff unavailable'
-                    if tracked and git(repo, 'status', '--porcelain', '--untracked-files=all').strip():
+                    if tracked and git(repo, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=dirty').strip():
                         head = git(repo, 'rev-parse', 'HEAD').decode().strip()
                         current = snapshot(repo, head)
                         if not ui or last_checkpoint != (str(repo), current):
