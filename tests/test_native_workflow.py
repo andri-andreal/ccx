@@ -2250,6 +2250,16 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(sum('Implement the approved work order' in p for p in prompts), 2)
         self.assertEqual(list((self.root / 'config' / 'runs').glob('*.failed.json')), [])
 
+    def test_preflight_stops_before_any_agent_runs_when_a_cli_is_missing(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        run = self.ccx('team', 'Implement fixture', ok=False,
+                       env={**self.env, 'CCX_CLAUDE_BIN': str(self.root / 'missing-claude'),
+                            'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('Setup problem found before starting', run.stderr)
+        self.assertIn('claude', run.stderr)
+        self.assertFalse(log.exists())
+
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
         self.ccx('team', '--review-only', 'Previous run')

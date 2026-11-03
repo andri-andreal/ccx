@@ -4140,6 +4140,38 @@ def _execute_child(command, cwd, prompt, timeout, output, error, progress, start
             return process.returncode
 
 
+def preflight(ccx, config, checked):
+    """Check every role's profile locally before any agent runs.
+
+    A missing CLI or an unusable profile should stop the task in a second, not
+    after the planner already spent minutes. Only definite failures block; a
+    check that cannot run is ignored. Profiles that passed are not checked again
+    in the same session.
+    """
+    names = []
+    for role in ('ORCHESTRATOR', 'PLANNER', 'BUILDER', 'REVIEWER'):
+        name = config.get('CCX_' + role, '')
+        if name and name not in names and name not in checked:
+            names.append(name)
+    problems = []
+    for name in names:
+        try:
+            result = subprocess.run([ccx, 'doctor', name, '--no-network', '--json'],
+                                    capture_output=True, text=True, timeout=30)
+            report = json.loads(result.stdout)
+            failed = [c for c in report.get('checks', []) if c.get('status') == 'fail']
+        except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+            checked.add(name)
+            continue
+        if failed:
+            problems.append(f'{name}: ' + '; '.join(f"{c.get('label')}: {c.get('message')}" for c in failed[:3]))
+        else:
+            checked.add(name)
+    if problems:
+        raise WorkflowError('Setup problem found before starting, so nothing ran. ' + ' | '.join(problems)
+                            + f' Fix it (`ccx doctor <profile>` shows details), then send the task again.')
+
+
 def wait_with_ui(seconds):
     """Sleep between retries while the team window keeps redrawing."""
     end = time.monotonic() + seconds
@@ -5788,6 +5820,7 @@ def main():
         last_task = ''
         last_checkpoint = None
         failed_run = None
+        preflight_ok = set()
         undo_stack = []
         redo_stack = []
         conversation_id = str(uuid.uuid4())
@@ -6122,6 +6155,7 @@ def main():
                         require_proof(run_config, repo)
                     if root == repo or repo in root.parents:
                         raise WorkflowError('CCX runs directory must be outside the target repository.')
+                    preflight(args.ccx, run_config, preflight_ok)
                     root.mkdir(mode=0o700, parents=True, exist_ok=True)
                     with (root / (sha(os.fsencode(str(repo))) + '.lock')).open('w') as lock:
                         try:
