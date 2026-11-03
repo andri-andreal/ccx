@@ -46,6 +46,8 @@ AUTH_PATTERN = re.compile(r'\b401\b|\b403\b|unauthori[sz]ed|invalid.{0,12}api.?k
                           r'credentials', re.I)
 QUOTA_PATTERN = re.compile(r'insufficient.{0,12}(quota|credit|balance|funds)|quota (exceeded|exhausted)|'
                            r'out of credits|usage limit|billing|payment required|\b402\b', re.I)
+CONTEXT_PATTERN = re.compile(r'prompt is too long|context.{0,12}(length|window|limit)|maximum context|too many tokens|'
+                             r'exceeds the (model|context)|context_length_exceeded|input is too long|token limit', re.I)
 TRANSIENT_PATTERN = re.compile(r'rate.?limit|too many requests|\b429\b|overloaded|\b50[0234]\b|\b529\b|'
                                r'temporar|try again|retry after|connection (reset|refused|closed|error|recovers)|'
                                r'econnreset|econnrefused|etimedout|eai_again|enotfound|network|socket hang up|'
@@ -67,9 +69,26 @@ def classify_failure(message, tail=''):
         return 'auth'
     if QUOTA_PATTERN.search(text):
         return 'quota'
+    if CONTEXT_PATTERN.search(text):
+        return 'context'
     if TRANSIENT_PATTERN.search(text):
         return 'transient'
     return 'other'
+
+
+def retry_after_seconds(text):
+    """How long the provider asked us to wait (Retry-After or "try again in 20s"), capped at five minutes."""
+    match = re.search(r'retry[-_ ]after["\':=\s]+(\d+(?:\.\d+)?)', text, re.I)
+    if match:
+        return min(float(match.group(1)), 300.0)
+    match = re.search(r'(?:try|retry) again in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?)\b',
+                      text, re.I)
+    if not match:
+        return None
+    seconds = float(match.group(1)) * {'m': 60.0}.get(match.group(2)[0].lower(), 1.0)
+    if match.group(2).lower().startswith('ms') or match.group(2).lower().startswith('milli'):
+        seconds = float(match.group(1)) / 1000
+    return min(seconds, 300.0)
 
 
 def failure_hint(kind, profile, retried):
@@ -79,6 +98,9 @@ def failure_hint(kind, profile, retried):
                 f'with `ccx edit {profile}`), then /resume.')
     if kind == 'quota':
         return 'The provider reports the quota or balance is used up. Switch this role to another model in /config, then /resume.'
+    if kind == 'context':
+        return ("The conversation no longer fits the model's context window. Pick a model with a larger context "
+                'for this role (or set a fallback profile) in /config, then /resume.')
     if kind == 'timeout':
         return 'The agent hit the time limit. Raise CCX_TIMEOUT or choose a faster model in /config, then /resume.'
     if kind == 'transient':
@@ -428,6 +450,14 @@ def load_role_profiles(config, profiles_dir):
             profiles[name] = read_env(Path(profiles_dir) / name / 'profile.env')
         except OSError:
             raise WorkflowError(f'Unknown {role.lower()} profile: {name}')
+        fallback = config.get('CCX_' + role + '_FALLBACK', '')
+        if fallback:
+            if not re.fullmatch(r'[A-Za-z0-9_-]+', fallback):
+                raise WorkflowError(f'Invalid {role.lower()} fallback profile.')
+            try:
+                profiles[fallback] = read_env(Path(profiles_dir) / fallback / 'profile.env')
+            except OSError:
+                raise WorkflowError(f'Unknown {role.lower()} fallback profile: {fallback}')
     for role in roles:
         key = 'CCX_' + role + '_EFFORT'
         config[key] = config.get(key) or 'default'
@@ -457,7 +487,8 @@ def role_efforts(provider):
 WORKFLOW_KEYS = ('CCX_PLANNER', 'CCX_BUILDER', 'CCX_REVIEWER', 'CCX_ORCHESTRATOR', 'CCX_ORCHESTRATOR_MODEL',
                  'CCX_ORCHESTRATOR_EFFORT', 'CCX_PROOF', 'CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT',
                  'CCX_PLANNER_EFFORT', 'CCX_BUILDER_EFFORT', 'CCX_REVIEWER_EFFORT', 'CCX_PLANNER_MODEL',
-                 'CCX_BUILDER_MODEL', 'CCX_REVIEWER_MODEL')
+                 'CCX_BUILDER_MODEL', 'CCX_REVIEWER_MODEL', 'CCX_ORCHESTRATOR_FALLBACK', 'CCX_PLANNER_FALLBACK',
+                 'CCX_BUILDER_FALLBACK', 'CCX_REVIEWER_FALLBACK')
 
 
 def write_workflow_env(path, config):
@@ -1311,7 +1342,9 @@ class TeamUI:
             model, effort = draft.get(f'CCX_{role}_MODEL', ''), draft.get(f'CCX_{role}_EFFORT') or 'default'
             options = [(f'CLI profile: {name or "none"}', 'profile', provider)]
             if name:
-                options += [(f'Model: {model or "CLI default"}', 'model', ''), (f'Effort: {effort}', 'effort', '')]
+                options += [(f'Model: {model or "CLI default"}', 'model', ''), (f'Effort: {effort}', 'effort', ''),
+                            (f"Fallback: {draft.get(f'CCX_{role}_FALLBACK') or 'none'}", 'fallback',
+                             'used when this profile is overloaded, out of quota or too small')]
             options.append(('Back', None, ''))
             chosen = self.select_choice(f'ROLE · {role.lower()}', options)
             if chosen is None:
@@ -1345,6 +1378,14 @@ class TeamUI:
                         self.show_text('CONFIG ERROR', f'Invalid model name: {value}')
                     else:
                         draft[f'CCX_{role}_MODEL'] = '' if value == '-' else value
+            elif chosen == 'fallback':
+                current = draft.get(f'CCX_{role}_FALLBACK', '')
+                picks = [(candidate, candidate, 'current' if candidate == current else '')
+                         for candidate in single_profiles(profiles_dir) if candidate != name]
+                picks.append(('No fallback', '-', 'the run stops when this profile fails'))
+                value = self.select_choice('FALLBACK PROFILE', picks)
+                if value is not None:
+                    draft[f'CCX_{role}_FALLBACK'] = '' if value == '-' else value
             elif chosen == 'effort':
                 picks = [(level, level, 'current' if level == effort else '') for level in role_efforts(provider)]
                 value = self.select_choice('EFFORT', picks)
@@ -5012,6 +5053,7 @@ class Loop:
     def __init__(self, ccx, config, repo, run_dir, profiles, before_build=None, tracked=True):
         self.ccx, self.config, self.repo, self.run_dir = ccx, config, repo, run_dir
         self.profiles, self.turn = profiles, 0
+        self.fell_back = set()
         self.before_build = before_build
         self.tracked = tracked
         self.timeout = int(config['CCX_TIMEOUT'])
@@ -5033,7 +5075,9 @@ class Loop:
                 tail = read_tail(directory / 'stderr.txt') + read_tail(directory / 'stdout.txt')
                 kind = classify_failure(str(error), tail)
                 if kind == 'transient' and attempt < retries:
-                    delay = float(os.environ.get('CCX_RETRY_DELAY', '5')) * (4 ** attempt)
+                    base = float(os.environ.get('CCX_RETRY_DELAY', '5'))
+                    asked = retry_after_seconds(tail)
+                    delay = 0 if base == 0 else asked if asked is not None else base * (4 ** attempt)
                     attempt += 1
                     Progress(phase, 'text').show(f'temporary error ({str(error)[:120]}); retrying in {delay:g}s '
                                                  f'({attempt}/{retries})', 'status')
@@ -5041,6 +5085,22 @@ class Loop:
                     wait_with_ui(delay)
                     if phase == 'build':
                         note = BUILD_RETRY_NOTE
+                    continue
+                fallback = self.config.get('CCX_' + role.upper() + '_FALLBACK', '')
+                if (fallback and role not in self.fell_back and fallback in self.profiles
+                        and fallback != self.config.get('CCX_' + role.upper())
+                        and kind in ('transient', 'quota', 'context', 'auth')):
+                    # The profile cannot carry on (overloaded, out of quota, too small, signed out):
+                    # hand the role to its fallback for the rest of this run.
+                    self.fell_back.add(role)
+                    failed_profile = self.config.get('CCX_' + role.upper())
+                    self.config['CCX_' + role.upper()] = fallback
+                    self.config['CCX_' + role.upper() + '_MODEL'] = ''
+                    self.config['CCX_' + role.upper() + '_EFFORT'] = 'default'
+                    Progress(phase, 'text').show(f'{failed_profile} failed ({kind}); switching {role} to {fallback}', 'status')
+                    emit_event('activity', phase=phase,
+                               message=f'{failed_profile} failed ({kind}); {role} now uses fallback {fallback}')
+                    attempt = 0
                     continue
                 hint = failure_hint(kind, self.config.get('CCX_' + role.upper(), role), attempt)
                 if hint and hint not in str(error):
@@ -5068,11 +5128,11 @@ class Loop:
         is_extra = provider in ('kimi-cli', 'mcode')
         agent = getattr(self, 'agents', {}).get(role) or {}
         effort = self.config.get('CCX_' + role.upper() + '_EFFORT', 'default')
-        if effort in ('', 'default') and agent.get('effort'):
+        if effort in ('', 'default') and agent.get('effort') and role not in self.fell_back:
             effort = agent['effort']
         readonly = phase != 'build'
         command = [self.ccx, name]
-        model = self.config.get('CCX_' + role.upper() + '_MODEL', '') or agent.get('model', '')
+        model = self.config.get('CCX_' + role.upper() + '_MODEL', '') or ('' if role in self.fell_back else agent.get('model', ''))
         emit_event('agent_started', phase=phase, profile=name, model=model, effort=effort)
         if not (team_ui and team_ui.enabled):
             print(f'ccx: {phase} ({name}; model={model or "profile default"}; effort={effort})', flush=True)

@@ -54,6 +54,8 @@ marker = pathlib.Path.cwd().parent / 'failed-once'
 if case == 'transient_once' and os.environ.get('FAKE_FAIL_ON', '') in prompt and not marker.exists():
     marker.write_text('x')
     print('API Error: 529 overloaded, please try again', file=sys.stderr); sys.exit(1)
+if case == 'overloaded_claude' and not ('exec' in args and not mcode):
+    print('API Error: 529 overloaded_error', file=sys.stderr); sys.exit(1)
 if case == 'auth_fail':
     print('Error: 401 Unauthorized: invalid API key', file=sys.stderr); sys.exit(1)
 codex = 'exec' in args and not mcode
@@ -1016,7 +1018,7 @@ class IntegrationTests(unittest.TestCase):
                 choose(b'2', b'ROLE')          # planner
                 choose(b'3', b'EFFORT')        # effort
                 choose(b'4', b'ROLE')          # high
-                choose(b'4', b'CONFIG')        # back
+                choose(b'5', b'CONFIG')        # back (fallback is row 4)
                 os.write(master, b'9')
                 read_until(b'q cancel')
                 os.write(master, b'\r')
@@ -2259,6 +2261,42 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn('Setup problem found before starting', run.stderr)
         self.assertIn('claude', run.stderr)
         self.assertFalse(log.exists())
+
+    def test_a_fallback_profile_takes_over_when_the_role_keeps_failing(self):
+        self.workflow(planner='claude', builder='codex', reviewer='codex')
+        env_file = self.root / 'config' / 'profiles' / 'team' / 'workflow.env'
+        env_file.write_text(env_file.read_text() + 'CCX_PLANNER_FALLBACK=codex\n')
+        run = self.ccx('team', 'Implement fixture', env={**self.env, 'FAKE_CASE': 'overloaded_claude'})
+        self.assertIn('Builder and checker agree', run.stdout)
+        self.assertIn('switching planner to codex', run.stdout + run.stderr)
+        (self.repo / 'implemented.py').unlink()
+        # Without a fallback the same failure ends the run after the retries.
+        env_file.write_text(env_file.read_text().replace('CCX_PLANNER_FALLBACK=codex\n', ''))
+        failed = self.ccx('team', 'Implement fixture', ok=False, env={**self.env, 'FAKE_CASE': 'overloaded_claude'})
+        self.assertIn('automatic retr', failed.stderr)
+
+    def test_an_unknown_fallback_profile_is_rejected_at_start(self):
+        self.workflow()
+        env_file = self.root / 'config' / 'profiles' / 'team' / 'workflow.env'
+        env_file.write_text(env_file.read_text() + 'CCX_BUILDER_FALLBACK=nope\n')
+        run = self.ccx('team', 'Implement fixture', ok=False)
+        self.assertIn('Unknown builder fallback profile: nope', run.stderr)
+
+    def test_provider_wait_hints_and_context_overflow_are_understood(self):
+        wait = workflow_module.retry_after_seconds
+        self.assertEqual(wait('HTTP 429 Retry-After: 12'), 12)
+        self.assertEqual(wait('retry_after": 3.5'), 3.5)
+        self.assertEqual(wait('Rate limit reached. Please try again in 20s.'), 20)
+        self.assertEqual(wait('Please try again in 2 minutes'), 120)
+        self.assertEqual(wait('try again in 500ms'), 0.5)
+        self.assertEqual(wait('Retry-After: 99999'), 300)
+        self.assertIsNone(wait('overloaded, please try again later'))
+        classify = workflow_module.classify_failure
+        self.assertEqual(classify('plan failed (exit 1)', 'Prompt is too long: 250000 tokens > 200000 maximum'), 'context')
+        self.assertEqual(classify('x', 'context_length_exceeded'), 'context')
+        self.assertEqual(classify('x', 'This model\'s maximum context length is 128000 tokens'), 'context')
+        self.assertEqual(classify('x', '429 too many requests'), 'transient')
+        self.assertIn('larger context', workflow_module.failure_hint('context', 'claude', 0))
 
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
