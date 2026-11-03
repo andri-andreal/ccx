@@ -2298,6 +2298,16 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(classify('x', '429 too many requests'), 'transient')
         self.assertIn('larger context', workflow_module.failure_hint('context', 'claude', 0))
 
+    def test_a_round_that_changes_nothing_and_repeats_the_findings_stops_early(self):
+        self.workflow()
+        log = self.root / 'prompts.log'
+        run = self.ccx('team', 'Implement fixture', ok=False, env={**self.env, 'FAKE_CASE': 'always_revise',
+                       'FAKE_PROMPT_LOG': str(log)})
+        self.assertIn('Stopped early, no progress', run.stderr)
+        self.assertIn('same findings as round 1', run.stderr)
+        builds = [line for line in log.read_text().splitlines() if 'Implement the approved work order' in line]
+        self.assertEqual(len(builds), 2)
+
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
         self.ccx('team', '--review-only', 'Previous run')

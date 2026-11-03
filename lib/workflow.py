@@ -5752,6 +5752,7 @@ class Loop:
         if self.before_build:
             self.before_build()
         expected = approval['snapshot']
+        previous_round, stopped_early = None, ''
         for attempt in range(int(self.config['CCX_FIX_ROUNDS']) + 1):
             status(f"build/check round {attempt + 1}/{int(self.config['CCX_FIX_ROUNDS']) + 1}")
             if sha((self.run_dir / 'PLAN.md').read_bytes()) != approval['plan_sha256']:
@@ -5807,17 +5808,31 @@ class Loop:
                         + '\n\nBuilder: ' + builder['summary'] + '\n\nReviewer: ' + result['summary']
                         + '\n\nVerification: ' + proof['command'] + ' (passed)'
                         + (f"\n\nAPI checks: {len(api_results)}/{len(api_results)} passed" if api_results else ''))
+            # A round that leaves the code as it was and brings back the same findings or the same
+            # failing proof will not converge; say so now instead of spending the remaining rounds.
+            this_round = sha(json.dumps({
+                'code': built_snapshot, 'exit': code, 'api_ok': api_ok,
+                'findings': sorted((f['id'], f['path'], str(f['evidence'])[:160])
+                                   for f in (result['findings'] if result else [])),
+                'failure': proof['stderr'][-1500:] if code else ''}, sort_keys=True, default=str).encode())
+            if previous_round == this_round:
+                stopped_early = (f'Stopped early, no progress: round {attempt + 1} left the code unchanged and brought '
+                                 'back the same ' + ('proof failure' if code else 'findings') + f' as round {attempt}, '
+                                 'so more rounds would not help. Give the builder or reviewer another model in /config '
+                                 'or adjust the task, then send a new task. ')
+                break
+            previous_round = this_round
             if result is not None:
                 findings = result['findings']
             status(f'no agreement in round {attempt + 1}')
         if code:
-            raise WorkflowError(f'Verification failed (exit {code}); consensus budget exhausted; changes preserved.')
+            raise WorkflowError(stopped_early + f'Verification failed (exit {code}); consensus budget exhausted; changes preserved.')
         if not api_ok:
             failed = [item for item in api_results if not item['passed']]
-            raise WorkflowError(f'API checks failed ({len(failed)} of {len(api_results)}: '
+            raise WorkflowError(stopped_early + f'API checks failed ({len(failed)} of {len(api_results)}: '
                                 + '; '.join(f"{item['name']}: {item['failure']}" for item in failed[:3])
                                 + '); consensus budget exhausted; changes preserved.')
-        raise WorkflowError('Builder/checker consensus budget exhausted; unresolved responses and findings preserved.')
+        raise WorkflowError(stopped_early + 'Builder/checker consensus budget exhausted; unresolved responses and findings preserved.')
 
 
 def main():
