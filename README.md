@@ -1066,6 +1066,27 @@ existing values can be preserved, replaced, or removed, but never revealed.
   when an upstream processes a request and its response is lost. The default is
   one attempt per upstream.
 
+## Failures and recovery
+
+`ccx team` is built to keep a long task alive instead of ending it on the first error.
+
+| Situation | What ccx does |
+|---|---|
+| A CLI or profile is unusable | Checked before any agent runs (`ccx doctor <profile> --no-network`); the task stops in a second and names the profile |
+| Rate limit, overload, dropped connection | Retried twice (`CCX_RETRIES`), waiting as long as the provider asks (`Retry-After`) |
+| Profile still failing, out of quota, signed out or too small for the context | Handed to the role's **fallback profile** for the rest of the run (`CCX_<ROLE>_FALLBACK`, or `/config` > role > Fallback) |
+| Login rejected, quota used up, timeout, context overflow | Not retried; the message says how to fix it |
+| mcode wraps its JSON in prose | The JSON is recovered from the final reply instead of failing the build |
+| Builder and checker repeat themselves with unchanged code | Stops after the repeated round instead of using every remaining one |
+| The task would exceed its allowance | Stops between calls at `CCX_MAX_TOKENS` / `CCX_MAX_COST_USD` (0 or empty: no limit) |
+| A run fails halfway | `/resume`, or just type "lanjutkan" / "continue"; it picks up from the approved plan and the work already in the checkout, even after ccx was closed |
+| The checkout has uncommitted changes | Offers to commit them as a WIP commit or stash them, then starts |
+| A bug inside ccx | The window stays open; the traceback is saved as `crash.txt` in the run folder |
+| Old runs pile up | The newest 30 finished runs are kept (`CCX_KEEP_RUNS`, 0 keeps all) |
+
+The keys live in `workflow.env` next to `CCX_ROUNDS` and `CCX_TIMEOUT`; the token budget, fallbacks and
+loop limits are also editable in `/config`.
+
 ## Troubleshooting
 
 | Symptom | Check/action |
