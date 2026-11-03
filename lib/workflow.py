@@ -472,6 +472,8 @@ def load_role_profiles(config, profiles_dir):
     for key in ('CCX_ROUNDS', 'CCX_FIX_ROUNDS', 'CCX_TIMEOUT'):
         if not re.fullmatch(r'[1-9][0-9]*', config.get(key, '')):
             raise WorkflowError(f'{key} must be a positive integer.')
+    if not re.fullmatch(r'[0-9]*', config.get('CCX_KEEP_RUNS', '')):
+        raise WorkflowError('CCX_KEEP_RUNS must be a whole number (0 keeps every run).')
     if not re.fullmatch(r'[0-9]*', config.get('CCX_MAX_TOKENS', '')):
         raise WorkflowError('CCX_MAX_TOKENS must be a whole number (0 or empty for no limit).')
     if not re.fullmatch(r'([0-9]+(\.[0-9]+)?)?', config.get('CCX_MAX_COST_USD', '')):
@@ -4307,6 +4309,44 @@ def recall_failed_run(root, repo, team):
         return None
 
 
+KEEP_RUNS_DEFAULT = 30
+STALE_RUN_SECONDS = 7 * 24 * 3600
+
+
+def prune_runs(root, keep=KEEP_RUNS_DEFAULT):
+    """Delete old run folders so the runs directory does not grow without bound.
+
+    The newest ``keep`` finished runs stay, as does any run a remembered failure
+    points at (it can still be resumed). A run without a result is still in
+    progress or crashed: it is only removed once it is a week old. Returns how
+    many folders were removed; 0 as ``keep`` turns pruning off.
+    """
+    if keep <= 0:
+        return 0
+    root = Path(root)
+    try:
+        folders = [path for path in root.iterdir() if path.is_dir()]
+    except OSError:
+        return 0
+    protected = set()
+    for record in root.glob('*.failed.json'):
+        run_dir = (_load_json(record, {}) or {}).get('run_dir')
+        if run_dir:
+            protected.add(str(Path(run_dir).resolve()))
+    finished = sorted((path for path in folders if (path / 'result.json').is_file()),
+                      key=lambda path: path.stat().st_mtime, reverse=True)
+    doomed = finished[keep:]
+    now = time.time()
+    doomed += [path for path in folders if not (path / 'result.json').is_file()
+               and now - path.stat().st_mtime > STALE_RUN_SECONDS]
+    removed = 0
+    for path in doomed:
+        if str(path.resolve()) not in protected:
+            shutil.rmtree(path, ignore_errors=True)
+            removed += 1
+    return removed
+
+
 # A short message asks to carry on when it holds a cue word or phrase and nothing
 # but filler besides, in Indonesian or English. "add a continue button" stays a task.
 RESUME_CUES = ('lanjut', 'teruskan', 'terusin', 'sambung', 'continu', 'resum', 'proceed', 'retry', 'gas')
@@ -5927,6 +5967,10 @@ def main():
         last_checkpoint = None
         failed_run = None
         preflight_ok = set()
+        try:
+            prune_runs(root, int(config.get('CCX_KEEP_RUNS') or KEEP_RUNS_DEFAULT))
+        except (OSError, ValueError):
+            pass
         undo_stack = []
         redo_stack = []
         conversation_id = str(uuid.uuid4())

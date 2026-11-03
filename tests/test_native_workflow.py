@@ -2328,6 +2328,45 @@ class IntegrationTests(unittest.TestCase):
         bad = self.ccx('team', 'Implement fixture', ok=False)
         self.assertIn('CCX_MAX_TOKENS must be a whole number', bad.stderr)
 
+    def test_old_run_folders_are_pruned_but_resumable_and_active_ones_stay(self):
+        runs = self.root / 'runs'
+        runs.mkdir()
+        def folder(name, age_days, finished=True):
+            path = runs / name
+            path.mkdir()
+            (path / 'big.log').write_text('x' * 100)
+            if finished:
+                (path / 'result.json').write_text('{}')
+            stamp = time.time() - age_days * 86400
+            os.utime(path / 'big.log', (stamp, stamp))
+            if finished:
+                os.utime(path / 'result.json', (stamp, stamp))
+            os.utime(path, (stamp, stamp))
+            return path
+        for number in range(5):
+            folder(f'done-{number}', number + 1)
+        resumable = folder('done-resumable', 20)
+        (runs / 'x.failed.json').write_text(json.dumps({'run_dir': str(resumable)}))
+        running = folder('running-now', 0, finished=False)
+        crashed = folder('crashed-long-ago', 10, finished=False)
+        removed = workflow_module.prune_runs(runs, keep=2)
+        self.assertEqual(removed, 4)
+        self.assertEqual(sorted(path.name for path in runs.iterdir() if path.is_dir()),
+                         ['done-0', 'done-1', 'done-resumable', 'running-now'])
+        self.assertEqual(workflow_module.prune_runs(runs, keep=0), 0)
+        self.assertEqual(workflow_module.prune_runs(self.root / 'missing', keep=2), 0)
+        self.assertTrue(running.exists() and resumable.exists() and not crashed.exists())
+
+    def test_keep_runs_setting_prunes_when_a_team_starts(self):
+        self.workflow()
+        env_file = self.root / 'config' / 'profiles' / 'team' / 'workflow.env'
+        env_file.write_text(env_file.read_text() + 'CCX_KEEP_RUNS=1\n')
+        for number in range(3):
+            (self.repo / 'implemented.py').unlink(missing_ok=True)
+            self.ccx('team', f'Implement fixture {number}')
+        folders = [path for path in (self.root / 'config' / 'runs').iterdir() if path.is_dir()]
+        self.assertEqual(len(folders), 2)
+
     def test_history_survives_restarting_the_terminal_session(self):
         self.workflow()
         self.ccx('team', '--review-only', 'Previous run')
