@@ -1,0 +1,45 @@
+name: Native Windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            windows/.build/router
+            windows/.build/gui
+      - name: Test Windows router
+        run: python -X utf8 windows/build_router.py --test
+      - name: Build router for CLI integration tests
+        run: python -X utf8 windows/build_router.py
+      - name: Test native CMD launcher, workflow, console and local HTTP integration
+        run: python -X utf8 windows/test_windows.py -v
+      - name: Test Windows GUI core
+        run: python -X utf8 windows/build_gui.py --test-core
+      - name: Build Windows desktop
+        if: matrix.python == '3.13'
+        run: python -X utf8 windows/build_gui.py --no-bundle
+      - name: Start the native desktop with an isolated configuration
+        if: matrix.python == '3.13'
+        run: python -X utf8 windows/gui_smoke.py
