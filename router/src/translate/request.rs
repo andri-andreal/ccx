@@ -48,6 +48,9 @@ pub fn to_openai(req: &MessagesRequest) -> Result<ChatRequest, RequestTranslatio
         // absent, and Claude Code's non-streaming calls (auto mode classifier)
         // omit it, so the SSE body would fail to parse as a chat completion.
         stream: Some(req.stream.unwrap_or(false)),
+        stream_options: req.stream.unwrap_or(false).then_some(StreamOptions {
+            include_usage: true,
+        }),
         tools: req
             .tools
             .as_ref()
@@ -518,7 +521,17 @@ mod tests {
     #[test]
     fn missing_stream_sent_as_explicit_false() {
         let req = parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
-        let v = serde_json::to_value(to_openai(&req)).unwrap();
+        let v = serde_json::to_value(to_openai(&req).unwrap()).unwrap();
         assert_eq!(v["stream"], json!(false));
+        assert!(v.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn explicit_non_streaming_omits_usage_options() {
+        let req =
+            parse(r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":false}"#);
+        let v = serde_json::to_value(to_openai(&req).unwrap()).unwrap();
+        assert_eq!(v["stream"], json!(false));
+        assert!(v.get("stream_options").is_none());
     }
 }

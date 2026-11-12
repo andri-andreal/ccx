@@ -31,6 +31,14 @@ npm run tauri build
 
 ## Notes
 
+- **Teams** creates and edits shared workflow presets, assigns all four roles,
+  configures models/effort/fallbacks, budgets and verification, and runs an embedded
+  conversation with live activity, usage, clarifications and approval dialogs.
+- Team configuration also includes project API checks and an editor for layered
+  agent/skill definitions. Session actions provide resume, history, undo/redo,
+  diff/files and live configuration. Python 3.10+ is required for the bundled
+  Team runtime; model CLI authentication is completed separately.
+
 - Profiles are stored exactly like the CLI: `~/.config/ccx/profiles/<name>/profile.env`
   (mode 600). A profile made here works with `ccx <name>` and vice versa.
 - **Launch** opens your terminal running `claude` with the profile's environment.
@@ -49,6 +57,7 @@ npm run tauri build
   IPC, but no remote scripts or connections from the renderer.
 - Release automation builds deb/AppImage, macOS app/DMG, and Windows NSIS/MSI
   bundles. The current desktop runtime launches the existing `ccx` command, so the
-  CLI must still be on `PATH`.
+  CLI must still be on `PATH` for profile launching and diagnostics. Embedded Team
+  sessions use the bundled workflow runtime.
 - On Linux/Wayland, `npm run tauri` sets `WEBKIT_DISABLE_DMABUF_RENDERER=1`
   automatically to avoid a WebKitGTK rendering crash.

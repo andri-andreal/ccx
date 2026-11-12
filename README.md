@@ -801,7 +801,11 @@ Profiles it creates are fully interchangeable with the CLI.
 The GUI can create/edit/delete model profiles, launch a profile in your terminal,
 copy its `ccx <name>` command, reveal a stored provider key, and configure the
 terminal launcher. Native Codex profiles have their own provider choice and model
-field. Loop presets are currently created, listed and run through the CLI.
+field. The **Teams** workspace manages saved workflows and runs the team inside
+the desktop, including role/model/effort/fallback assignments, budgets,
+verification, API checks, agent/skill editing, live activity, approvals,
+undo/redo and run history. Python 3.10+ and the selected AI CLIs are required.
+See the [Team workspace guide](gui/README.md#team-workspace).
 
 ```bash
 cd gui

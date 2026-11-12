@@ -19,11 +19,58 @@ home. Login is completed through `ccx <profile> login`; the editor displays the
 command rather than handling OAuth itself. Claude login uses
 `ccx <profile> auth login`. See [authentication](../README.md#login-and-default-cli-settings).
 
-Loop presets are currently managed in the CLI. Run `ccx new`, choose
-**Plan/build/review loop** with ↑/↓ and Enter, then use the same menus to choose
-each role's profile, model and effort in that order. Roles can share
-the same profile/model. Verification is detected from the project at runtime;
-use `--proof` to supply a specific command.
+## Team workspace
+
+Open **Teams** to create, duplicate, edit, delete or set a default workflow.
+The desktop and CLI share `profiles/<name>/workflow.env`; existing CLI teams
+appear automatically, and teams saved in the desktop work with `ccx <name>`.
+
+1. Create model profiles under **Profiles** and complete their CLI login.
+2. Choose **New team** and assign the orchestrator, planner, builder and reviewer.
+   Roles can share profiles. Configure model overrides, effort and fallback
+   profiles under **Configuration → Roles**.
+3. Choose and load a project directory. Set revision limits, timeouts, retry,
+   token/cost budgets, retained runs and the verification command. An empty
+   verification command uses project detection and asks if none is available.
+4. Save the team, open **Session**, and choose **Open session**. Tasks run inside
+   the desktop conversation; no separate terminal is needed. The four role cards
+   show activity and usage, and **Requests** and **Result** show task evidence.
+
+Modes are **Auto**, **Plan**, **Build** and **Inspect**. Plan mode stops for your
+choice before building. Clarifications, project-instruction trust, dirty-checkout
+choices and failure recovery use desktop dialogs. Session actions include live
+configuration, resuming a failed task, restoring history, undo/redo, diff/files,
+and viewing results. Additional tasks sent while busy are queued. **Stop current
+task** cancels the active process; **Close session** ends the conversation.
+
+**API checks** contains team server/base/skip overrides and project server,
+readiness, startup timeout and standing HTTP checks. Project settings are saved
+to `.ccx/api.json` and `.ccx/api-checks.json`; explicit team overrides take
+precedence. **Agents & skills** shows effective project/user/built-in definitions,
+allows Markdown editing and new skills, and can copy built-ins or remove an
+override. Saving project definitions changes the selected checkout; the engine
+still asks for trust before using them. **Advanced** preserves and edits all
+workflow environment keys, including future CLI options.
+
+History retains the task, result and text artifacts, including individual agent
+logs. Restore sessions through the session's **Restore session** action; the
+engine verifies the project checkpoint before restoring them. Undo/redo requires
+Git. Native Kimi/mcode team roles remain unavailable on Windows; use kimi/minimax
+provider profiles through Claude Code instead.
+
+The Team runtime requires Python 3.10+, Git and the selected AI CLIs. It ships
+with the desktop resources and uses the same workflow engine as the CLI.
+`CCX_PYTHON` can select a Python executable; `CCX_SOURCE_ROOT` can select a source
+checkout during development. Token budgets exclude cache reads and are checked
+between agent calls, so a single call can exceed the configured budget. Cost
+budgets apply only when the CLI reports costs.
+
+**Settings → Workspace theme** offers default, ocean and high contrast themes,
+shared with the workflow's live theme command. The Windows build includes a
+locally built router when one is available; otherwise routed profiles need an
+installed `ccx-router` or `CCX_ROUTER_BIN`. `CCX_BIN` can explicitly select an
+installed CLI instead of the bundled launcher.
+
 See the [workflow guide](../README.md#create-a-workflow-once-launch-by-name).
 
 ## Prerequisites

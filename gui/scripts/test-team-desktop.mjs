@@ -1,0 +1,132 @@
+// Real Windows Tauri/WebView2 integration, using only fake CLIs and temp config.
+import { chromium, expect } from "@playwright/test";
+import { spawn, execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { resolve, join, dirname } from "node:path";
+import { createServer } from "node:net";
+
+if(process.platform !== "win32") throw new Error("This test targets native Windows WebView2.");
+let root=resolve(import.meta.dirname,"../..");
+while(!existsSync(join(root,"lib/gui_team.py"))){const parent=dirname(root);if(parent===root)throw new Error("CCX source tree missing");root=parent;}
+const fixture=mkdtempSync(join(tmpdir(),"ccx-team-desktop-"));
+const data=JSON.parse(execFileSync("python",["-X","utf8",join(root,"tests/gui_fixture.py"),fixture],{encoding:"utf8",windowsHide:true}));
+const executable=join(root,"windows/.build/gui/target/release/ccx-gui.exe");
+const port=await new Promise((resolvePort,reject)=>{const server=createServer();server.once("error",reject);server.listen(0,"127.0.0.1",()=>{const chosen=server.address().port;server.close(()=>resolvePort(chosen));});});
+const app=spawn(executable,[],{windowsHide:true,stdio:"ignore",env:{...process.env,CCX_HOME:data.home,CCX_SOURCE_ROOT:"",CCX_CODEX_BIN:data.fake,CCX_CLAUDE_BIN:data.fake,WEBVIEW2_USER_DATA_FOLDER:join(fixture,"webview"),WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS:`--remote-debugging-port=${port}`}});
+const shots=join(root,"gui/test-results");mkdirSync(shots,{recursive:true});
+let browser, page;
+try {
+  for(let i=0;i<150;i++){
+    try { const response=await fetch(`http://127.0.0.1:${port}/json/version`);if(response.ok)break; } catch{}
+    await new Promise(r=>setTimeout(r,200));
+  }
+  browser=await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+  const context=browser.contexts()[0];
+  page=context.pages()[0];
+  if(!page)page=await context.waitForEvent("page");
+  const errors=[];page.on("pageerror",e=>errors.push(e.message));
+  await expect(page.getByRole("button",{name:"Create your first team"})).toBeVisible({timeout:20000});
+  await page.screenshot({path:join(shots,"team-empty.png")});
+  await page.getByRole("button",{name:"Create your first team"}).click();
+  await page.getByRole("textbox",{name:"Team name",exact:true}).fill("desktop-team");
+  await page.getByRole("textbox",{name:"Project directory",exact:true}).fill(data.project);
+  await page.getByRole("button",{name:"Load",exact:true}).click();
+  await expect(page.getByText("Loaded",{exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Limits & verification",exact:true}).click();
+  await page.getByLabel(/^Verification command/).fill("python implemented.py");
+  await page.getByRole("button",{name:"Save team",exact:true}).click();
+  await expect(page.getByText("Team configuration saved.",{exact:false})).toBeVisible();
+  await page.getByRole("button",{name:"Roles",exact:true}).click();
+  await expect(page.locator(".role-editor .field.full select")).toHaveCount(4);
+  await page.screenshot({path:join(shots,"team-configuration.png"),fullPage:true});
+  await page.getByRole("button",{name:"Session",exact:true}).click();
+  await page.getByRole("button",{name:"Open session",exact:false}).click();
+  await expect(page.getByRole("textbox",{name:"Task for your team"})).toBeEnabled({timeout:15000});
+  await expect(page.getByRole("combobox",{name:"Session mode"})).toBeEnabled({timeout:15000});
+  await page.getByRole("textbox",{name:"Task for your team"}).fill("Implement the fixture");
+  await page.getByRole("button",{name:"Send task",exact:false}).click();
+  await expect(page.getByText("Builder and checker agree.",{exact:false}).first()).toBeVisible({timeout:45000});
+  await expect(page.getByRole("button",{name:"Undo last task",exact:true})).toBeEnabled({timeout:10000});
+  if(!existsSync(join(data.project,"implemented.py")))throw new Error("Builder output missing");
+  const run=readdirSync(join(data.home,"runs"),{withFileTypes:true}).find(entry=>entry.isDirectory()).name;
+  const record=JSON.parse(readFileSync(join(data.home,"runs",run,"session.json"),"utf8"));
+  if(record.repo.toLowerCase() !== data.project.toLowerCase())throw new Error("Session used a stale project path");
+  await expect(page.locator(".usage-total")).toContainText(/6[., ]400/);
+  await page.evaluate(()=>window.scrollTo(0,0));
+  await page.screenshot({path:join(shots,"team-session.png"),fullPage:true});
+  await page.locator(".app-nav").getByRole("button",{name:/Settings/}).click();
+  await page.locator(".legacy-content select").selectOption("ocean");
+  await page.getByRole("button",{name:"Save",exact:true}).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme","ocean");
+  await page.locator(".app-nav").getByRole("button",{name:/Teams/}).click();
+  await page.getByRole("textbox",{name:"Task for your team"}).fill("/mode auto");
+  await page.getByRole("button",{name:"Send task",exact:false}).click();
+  await expect(page.getByRole("button",{name:"Undo last task",exact:true})).toBeEnabled();
+  await expect(page.locator("html")).toHaveAttribute("data-theme","ocean");
+  await page.getByRole("button",{name:"Undo last task",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Redo task",exact:true})).toBeEnabled();
+  if(existsSync(join(data.project,"implemented.py")))throw new Error("Undo did not restore project");
+  await page.getByRole("button",{name:"Redo task",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Undo last task",exact:true})).toBeEnabled();
+  await page.getByRole("button",{name:"History",exact:true}).click();
+  await expect(page.getByText("completed",{exact:true}).first()).toBeVisible();
+  await page.screenshot({path:join(shots,"team-history.png"),fullPage:true});
+  await page.getByRole("button",{name:"Session",exact:true}).click();
+  await page.getByRole("button",{name:"Close session",exact:true}).click();
+  await page.getByRole("dialog").getByRole("button",{name:"Close session",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Open session",exact:false})).toBeVisible();
+  await page.getByRole("button",{name:"Set default",exact:true}).click();
+  await expect(page.getByText("desktop-team is now the default for ccx.",{exact:true})).toBeVisible();
+  await page.getByRole("button",{name:"Configuration",exact:true}).click();
+  await page.getByRole("button",{name:"Roles",exact:true}).click();
+  await page.getByRole("combobox",{name:"Builder CLI profile",exact:true}).selectOption("routed-work");
+  await page.getByRole("button",{name:"Save team",exact:true}).click();
+  await expect(page.getByText("Team configuration saved.",{exact:false})).toBeVisible();
+  await page.getByRole("button",{name:"Session",exact:true}).click();
+  await page.getByRole("button",{name:"Open session",exact:false}).click();
+  await expect(page.getByRole("combobox",{name:"Session mode"})).toBeEnabled();
+  await page.getByRole("textbox",{name:"Task for your team"}).fill("Implement with the routed builder");
+  await page.getByRole("button",{name:"Send task",exact:false}).click();
+  await page.getByRole("dialog",{name:"UNCOMMITTED CHANGES"}).getByRole("button",{name:/^Commit them as a WIP commit/}).click();
+  await expect(page.getByText("Builder and checker agree.",{exact:false}).first()).toBeVisible({timeout:45000});
+  await expect(page.getByRole("button",{name:"Undo last task",exact:true})).toBeEnabled({timeout:10000});
+  await page.getByRole("button",{name:"Close session",exact:true}).click();
+  await page.getByRole("dialog").getByRole("button",{name:"Close session",exact:true}).click();
+  await expect(page.getByRole("button",{name:"Open session",exact:false})).toBeVisible();
+  await page.getByRole("button",{name:"Configuration",exact:true}).click();
+  await page.getByRole("button",{name:"API checks",exact:true}).click();
+  await page.getByRole("button",{name:"+ Add check",exact:true}).click();
+  await page.getByRole("button",{name:"Save project API settings",exact:true}).click();
+  await expect(page.getByText("Project API checks saved.",{exact:true})).toBeVisible();
+  const checks=JSON.parse(readFileSync(join(data.project,".ccx/api-checks.json"),"utf8"));
+  if(checks.length!==1 || checks[0].expect_status!==200)throw new Error("API form did not persist its check");
+  await page.getByRole("button",{name:"Agents & skills",exact:true}).click();
+  await page.getByRole("button",{name:"+ New skill",exact:true}).click();
+  await page.getByRole("dialog").getByRole("textbox",{name:"Name",exact:true}).fill("desktop-skill");
+  await page.getByRole("dialog").getByRole("button",{name:"Save definition",exact:true}).click();
+  await expect(page.getByText("Skill saved to project definitions.",{exact:true})).toBeVisible();
+  if(!existsSync(join(data.project,".ccx/skills/desktop-skill.md")))throw new Error("Skill editor did not save");
+  await page.screenshot({path:join(shots,"team-agents.png"),fullPage:true});
+  await page.getByRole("button",{name:"Session",exact:true}).click();
+  await page.setViewportSize({width:800,height:900});
+  await page.screenshot({path:join(shots,"team-narrow.png"),fullPage:true});
+  const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth+2);
+  if(overflow)throw new Error("Narrow layout overflows horizontally");
+  await page.getByRole("button",{name:"Duplicate",exact:true}).click();
+  await expect(page.getByRole("textbox",{name:"Team name",exact:true})).toHaveValue("desktop-team-copy");
+  await page.getByRole("button",{name:"Save team",exact:true}).click();
+  await expect(page.getByText("Team configuration saved.",{exact:false})).toBeVisible();
+  await page.getByRole("button",{name:"Delete",exact:true}).click();
+  await page.getByRole("dialog").getByRole("button",{name:"Delete team",exact:true}).click();
+  await expect(page.getByText("Team removed. Run history was preserved.",{exact:true})).toBeVisible();
+  if(readFileSync(join(data.home,"default"),"utf8").trim() !== "desktop-team")throw new Error("Deleting the copy changed the default team");
+  if(errors.length)throw new Error(errors.join("\n"));
+  console.log(JSON.stringify({ok:true,fixture,screenshots:shots,checks:["create/save","project","roles","embedded workflow","verification","usage","appearance during session","undo/redo","history","close","default","routed builder","dirty checkout dialog","API editor","skill editor","narrow layout","duplicate/delete","no page errors"]},null,2));
+} catch(error) {
+  if(page){await page.screenshot({path:join(shots,"team-failure.png"),fullPage:true});console.error((await page.locator("body").innerText()).slice(0,6000));}
+  throw error;
+} finally {
+  if(browser)await browser.close();
+  try{execFileSync("taskkill.exe",["/PID",String(app.pid),"/T","/F"],{stdio:"ignore",windowsHide:true});}catch{}
+}

@@ -1,10 +1,4 @@
-"""Stage and build the Windows router without editing the Unix checkout.
-
-The current router baseline has two compile defects: a missing optional
-stream_options initializer and a test serializing Result instead of its value.
-Apply those compatibility repairs only to the disposable Windows build tree.
-All router implementation and conformance tests otherwise come from router/.
-"""
+"""Stage and build the shared router unchanged in the Windows build tree."""
 import argparse
 from pathlib import Path
 import shutil
@@ -20,16 +14,6 @@ def stage():
     source = ROOT / 'router'
     shutil.copytree(source, destination, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns('target', '.git'))
-    request = destination / 'src' / 'translate' / 'request.rs'
-    content = request.read_text(encoding='utf-8')
-    if 'stream_options:' not in content.split('fn validate', 1)[0]:
-        anchor = 'stream: Some(req.stream.unwrap_or(false)),'
-        if content.count(anchor) != 1:
-            raise ValueError('Router initializer changed; review the Windows build compatibility repair.')
-        content = content.replace(anchor, anchor + '\n        stream_options: req.stream.unwrap_or(false).then_some(StreamOptions { include_usage: true }),', 1)
-    content = content.replace('serde_json::to_value(to_openai(&req)).unwrap()',
-                              'serde_json::to_value(to_openai(&req).unwrap()).unwrap()')
-    request.write_text(content, encoding='utf-8', newline='\n')
     return destination
 
 

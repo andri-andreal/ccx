@@ -1,5 +1,6 @@
 """Build a native Windows GUI from a staged copy, leaving gui/ unchanged."""
 import argparse
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,24 @@ def stage():
     text = text.replace('use std::process::Command;\n', '')
     text = text.replace(anchor, 'let mut process = crate::launcher::ccx_command(&bin)?;')
     doctor.write_text(text, encoding='utf-8', newline='\n')
+    runtime = directory / 'src-tauri' / 'runtime'
+    for folder in ('lib', 'windows', 'bin', 'providers', 'agents', 'skills'):
+        shutil.copytree(ROOT / folder, runtime / folder, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns('.build', '__pycache__', '*.pyc', 'bin'))
+    # Keep routed Team profiles usable without a separate CLI installation when
+    # a locally built router is available. Do not download or build it implicitly.
+    for candidate in (ROOT / 'windows/bin/ccx-router.exe',
+                      ROOT / 'windows/.build/router/target/release/ccx-router.exe',
+                      ROOT / 'windows/.build/router/target/debug/ccx-router.exe'):
+        if candidate.is_file():
+            target = runtime / 'windows/bin/ccx-router.exe'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(candidate, target)
+            break
+    configuration = directory / 'src-tauri' / 'tauri.conf.json'
+    config = json.loads(configuration.read_text(encoding='utf-8'))
+    config['bundle']['resources'] = {'runtime/': 'runtime/'}
+    configuration.write_text(json.dumps(config, indent=2) + '\n', encoding='utf-8')
     return directory
 
 

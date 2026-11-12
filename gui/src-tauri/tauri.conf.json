@@ -11,7 +11,7 @@
   },
   "app": {
     "windows": [
-      { "label": "main", "title": "ccx", "width": 900, "height": 640 }
+      { "label": "main", "title": "ccx", "width": 1380, "height": 900, "minWidth": 760, "minHeight": 600 }
     ],
     "security": {
       "csp": {
@@ -40,6 +40,15 @@
     }
   },
   "bundle": {
+    "resources": {
+      "../../lib/*.py": "runtime/lib/",
+      "../../lib/*.sh": "runtime/lib/",
+      "../../windows/*.py": "runtime/windows/",
+      "../../bin/ccx": "runtime/bin/ccx",
+      "../../providers/": "runtime/providers/",
+      "../../agents/": "runtime/agents/",
+      "../../skills/": "runtime/skills/"
+    },
     "active": true,
     "targets": "all",
     "icon": ["icons/icon.png"]

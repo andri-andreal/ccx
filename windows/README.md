@@ -108,12 +108,9 @@ python windows\build_router.py --test
 python windows\build_router.py --release
 ```
 
-The build is staged in `windows\.build\router`. The current shared router
-baseline has a missing `stream_options` initializer and a test that serializes
-the `Result` rather than the translated request. The Windows staging script
-repairs these in its build copy only, including the expected streaming usage
-option. It runs the original router unit and HTTP conformance tests. The files
-under `router/` remain untouched.
+The build is staged in `windows\.build\router` using the shared source under
+`router/` without source patches. It runs the same router unit and HTTP
+conformance tests as the other platforms.
 
 Alternatively put a trusted Windows `ccx-router.exe` in `windows\bin`, put it on
 PATH, or set `CCX_ROUTER_BIN`. No binary is downloaded automatically.
@@ -136,6 +133,10 @@ python windows\build_gui.py --no-bundle
 ```
 
 The executable is `windows\.build\gui\target\release\ccx-gui.exe`.
+Open **Teams** to configure all four roles, limits, verification, API checks
+and agent/skill definitions, then choose a project and open an embedded session.
+Team conversations, approvals, activity, request records, recovery and history
+are available inside the desktop. See the [Team workspace guide](../gui/README.md#team-workspace).
 Omit `--no-bundle` to build the Tauri installer packages. `--dev` starts the
 development app. The CLI must already be on PATH for **Launch**, **Doctor** and
 **Certify**.
@@ -159,3 +160,16 @@ python -X utf8 windows\gui_smoke.py
 
 Integration tests use disposable configuration directories, fake AI CLIs and
 local HTTP fixtures. They do not call a paid model or modify your AI login.
+
+Desktop Team verification:
+
+```cmd
+python -X utf8 tests\test_gui_team.py -v
+cd gui
+npm ci
+npm run test:desktop
+```
+
+The desktop UI test drives the compiled Windows app through WebView2's local
+debugging transport and stores screenshots in `gui/test-results`. It uses a
+disposable configuration/project and fake model CLIs. Build the desktop first.

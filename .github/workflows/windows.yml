@@ -37,9 +37,15 @@ jobs:
         run: python -X utf8 windows/test_windows.py -v
       - name: Test Windows GUI core
         run: python -X utf8 windows/build_gui.py --test-core
+      - name: Test desktop Team transport and workflow gates
+        run: python -X utf8 tests/test_gui_team.py -v
       - name: Build Windows desktop
         if: matrix.python == '3.13'
         run: python -X utf8 windows/build_gui.py --no-bundle
       - name: Start the native desktop with an isolated configuration
         if: matrix.python == '3.13'
         run: python -X utf8 windows/gui_smoke.py
+      - name: Test Team UI in the native WebView2 desktop
+        if: matrix.python == '3.13'
+        working-directory: windows/.build/gui
+        run: npm run test:desktop

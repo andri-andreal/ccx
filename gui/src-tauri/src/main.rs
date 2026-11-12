@@ -7,7 +7,9 @@ use ccx_core::provider::{self, ProviderTemplate};
 use ccx_core::settings::{self, GuiSettings};
 use ccx_core::{config, doctor, launcher};
 use serde::Serialize;
+use tauri::Manager;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+mod team_host;
 
 fn home() -> PathBuf {
     config::ccx_home()
@@ -201,6 +203,12 @@ async fn certify_profile(
 
 fn main() {
     tauri::Builder::default()
+        .manage(team_host::TeamHost::default())
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                window.state::<team_host::TeamHost>().shutdown();
+            }
+        })
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             list_profiles,
@@ -215,7 +223,12 @@ fn main() {
             set_settings,
             detect_terminal,
             doctor_profile,
-            certify_profile
+            certify_profile,
+            team_host::team_request,
+            team_host::start_team_session,
+            team_host::send_team_input,
+            team_host::close_team_session,
+            team_host::pick_team_project
         ])
         .run(tauri::generate_context!())
         .expect("error while running ccx-gui");

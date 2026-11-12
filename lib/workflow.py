@@ -4123,7 +4123,7 @@ def execute(command, cwd, prompt, timeout, output, error, label='process', kind=
     terminal_state = None
     input_fd = None
     decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-    if team_ui and team_ui.enabled and sys.stdin.isatty():
+    if team_ui and team_ui.enabled and getattr(team_ui, 'terminal_input', True) and sys.stdin.isatty():
         input_fd = sys.stdin.fileno()
         terminal_state = termios.tcgetattr(input_fd)
         tty.setcbreak(input_fd)

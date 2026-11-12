@@ -23,6 +23,7 @@ def main():
     user.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
     with tempfile.TemporaryDirectory(prefix='ccx-gui-smoke-') as temporary:
         environment = {**os.environ, 'CCX_HOME': temporary,
+                       'WEBVIEW2_USER_DATA_FOLDER': str(Path(temporary) / 'webview'),
                        'PATH': str(directory) + os.pathsep + os.environ.get('PATH', '')}
         startup = subprocess.STARTUPINFO()
         startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
